@@ -138,28 +138,46 @@ pub fn build_draw(doc: &Document, plate: Vec3, selection: Selection) -> DrawList
 }
 
 fn push_object(tris: &mut Vec<f32>, obj: &crate::scene::Object, color: [f32; 3]) {
-    // Every triangle of the file. A coarser stand-in was merging the sculpt
-    // into a speckled shell. Faces smaller than a pixel are grown in the
-    // geometry shader so the rasterizer still hits them.
+    // Every triangle, with one normal shared by the corners that meet there.
+    // Flat shading on a dense sculpt reads as holes. This is the same
+    // area-weighted smooth normal a slicer uses for the solid view.
     push_transformed(tris, &obj.mesh, Document::matrix(obj), color);
 }
 
 fn push_transformed(tris: &mut Vec<f32>, mesh: &Mesh, mat: Mat4, color: [f32; 3]) {
+    let normals = smooth_world_normals(mesh, mat);
     for tri in mesh.indices.chunks_exact(3) {
-        let world = [
+        for &index in tri {
+            let i = index as usize;
+            let p = mat.transform_point3(Vec3::from_array(mesh.vertices[i]));
+            push_vert(tris, p.to_array(), normals[i], color);
+        }
+    }
+}
+
+fn smooth_world_normals(mesh: &Mesh, mat: Mat4) -> Vec<[f32; 3]> {
+    let mut acc = vec![Vec3::ZERO; mesh.vertices.len()];
+    for tri in mesh.indices.chunks_exact(3) {
+        let p = [
             mat.transform_point3(Vec3::from_array(mesh.vertices[tri[0] as usize])),
             mat.transform_point3(Vec3::from_array(mesh.vertices[tri[1] as usize])),
             mat.transform_point3(Vec3::from_array(mesh.vertices[tri[2] as usize])),
         ];
-        let n = safe_normal(crate::mesh::face_normal(
-            world[0].to_array(),
-            world[1].to_array(),
-            world[2].to_array(),
-        ));
-        for p in world {
-            push_vert(tris, p.to_array(), n, color);
+        let cross = (p[1] - p[0]).cross(p[2] - p[0]);
+        for &index in tri {
+            acc[index as usize] += cross;
         }
     }
+    acc.into_iter()
+        .map(|n| {
+            let len = n.length();
+            if len < 1e-8 {
+                [0.0, 0.0, 1.0]
+            } else {
+                (n / len).to_array()
+            }
+        })
+        .collect()
 }
 
 fn push_mesh_flat(tris: &mut Vec<f32>, mesh: &Mesh, color: [f32; 3]) {
@@ -273,6 +291,10 @@ fn drain_mesh(origin: Vec3, axis: Vec3, radius: f32, depth: f32) -> Mesh {
     })
 }
 
+// Solid shading follows the usual slicer path (PrusaSlicer / OrcaSlicer
+// gouraud): transform the real triangle, interpolate a smooth normal, and
+// let the depth buffer hide whatever is behind the shell. Two-sided so a
+// hollow still reads when you look into it.
 const VERT: &str = r#"
 layout(location = 0) in vec3 a_pos;
 layout(location = 1) in vec3 a_nrm;
@@ -280,178 +302,35 @@ layout(location = 2) in vec3 a_col;
 uniform mat4 u_mvp;
 out vec3 v_nrm;
 out vec3 v_col;
+out vec3 v_pos;
 void main() {
     v_nrm = a_nrm;
     v_col = a_col;
+    v_pos = a_pos;
     gl_Position = u_mvp * vec4(a_pos, 1.0);
 }
 "#;
 
 const FRAG: &str = r#"
-in vec3 g_nrm;
-in vec3 g_col;
-out vec4 out_color;
-uniform vec3 u_light;
-uniform vec3 u_fill;
-void main() {
-    float len2 = dot(g_nrm, g_nrm);
-    vec3 n = len2 > 1e-8 ? normalize(g_nrm) : vec3(0.0, 0.0, 1.0);
-    if (!gl_FrontFacing) { n = -n; }
-    float ndl = clamp(dot(n, normalize(u_light)), 0.0, 1.0);
-    float fill = clamp(dot(n, normalize(u_fill)), 0.0, 1.0);
-    float shade = 0.62 + 0.34 * ndl + 0.10 * fill;
-    out_color = vec4(g_col * shade, 1.0);
-}
-"#;
-
-// Same lighting, reading the vertex shader outputs. Used only when the
-// geometry shader will not link.
-const FRAG_DIRECT: &str = r#"
 in vec3 v_nrm;
 in vec3 v_col;
+in vec3 v_pos;
 out vec4 out_color;
 uniform vec3 u_light;
 uniform vec3 u_fill;
+uniform vec3 u_eye;
 void main() {
     float len2 = dot(v_nrm, v_nrm);
     vec3 n = len2 > 1e-8 ? normalize(v_nrm) : vec3(0.0, 0.0, 1.0);
     if (!gl_FrontFacing) { n = -n; }
-    float ndl = clamp(dot(n, normalize(u_light)), 0.0, 1.0);
+    vec3 light = normalize(u_light);
+    float ndl = clamp(dot(n, light), 0.0, 1.0);
     float fill = clamp(dot(n, normalize(u_fill)), 0.0, 1.0);
-    float shade = 0.62 + 0.34 * ndl + 0.10 * fill;
-    out_color = vec4(v_col * shade, 1.0);
-}
-"#;
-
-// A sculpt's faces are often thinner than one pixel, so the rasterizer
-// skips them and feathers look full of holes. A long sliver has a large
-// radius, so growing it from the center does not make it wider. Thin faces
-// are drawn as a short ribbon. Faces that already cover pixels only gain a
-// fraction of a pixel so shared edges do not crack.
-const GEOM: &str = r#"
-layout(triangles) in;
-layout(triangle_strip, max_vertices = 4) out;
-in vec3 v_nrm[];
-in vec3 v_col[];
-out vec3 g_nrm;
-out vec3 g_col;
-uniform vec2 u_viewport;
-
-vec2 screen_of(vec4 clip) {
-    return (clip.xy / clip.w) * (u_viewport * 0.5);
-}
-
-vec4 clip_from_screen(vec2 screen, vec4 clip) {
-    vec2 ndc = screen / (u_viewport * 0.5);
-    clip.xy = ndc * clip.w;
-    return clip;
-}
-
-vec2 outward(vec2 d) {
-    float len = length(d);
-    return len > 1e-4 ? d / len : vec2(1.0, 0.0);
-}
-
-void emit_at(int i, vec4 clip, vec2 screen) {
-    g_nrm = v_nrm[i];
-    g_col = v_col[i];
-    gl_Position = clip_from_screen(screen, clip);
-    EmitVertex();
-}
-
-void emit_raw(int i, vec4 clip) {
-    g_nrm = v_nrm[i];
-    g_col = v_col[i];
-    gl_Position = clip;
-    EmitVertex();
-}
-
-void emit_dot(vec2 center, vec4 clip) {
-    // A square covers the pixel under a face smaller than a pixel. An
-    // equilateral of the same radius leaves the corners of that pixel empty.
-    float h = 1.7;
-    emit_at(0, clip, center + vec2(-h, -h));
-    emit_at(0, clip, center + vec2( h, -h));
-    emit_at(0, clip, center + vec2(-h,  h));
-    emit_at(0, clip, center + vec2( h,  h));
-    EndPrimitive();
-}
-
-void emit_stroke(int ia, int ib, vec4 ca, vec4 cb, vec2 a, vec2 b, float span) {
-    vec2 dir = outward(b - a);
-    vec2 n = vec2(-dir.y, dir.x);
-    float ext = 1.0;
-    vec2 a2 = a - dir * ext;
-    vec2 b2 = b + dir * ext;
-    emit_at(ia, ca, a2 + n * span);
-    emit_at(ia, ca, a2 - n * span);
-    emit_at(ib, cb, b2 + n * span);
-    emit_at(ib, cb, b2 - n * span);
-    EndPrimitive();
-}
-
-vec2 push_corner(vec2 s, vec2 n0, vec2 n1) {
-    float pad = 0.9;
-    vec2 m = n0 + n1;
-    float ml = length(m);
-    if (ml < 1e-3) {
-        return s + n0 * pad;
-    }
-    m /= ml;
-    float denom = abs(dot(m, n0));
-    float mag = min(pad / max(denom, 0.35), pad * 3.0);
-    return s + m * mag;
-}
-
-void main() {
-    vec4 c0 = gl_in[0].gl_Position;
-    vec4 c1 = gl_in[1].gl_Position;
-    vec4 c2 = gl_in[2].gl_Position;
-    // A vertex behind the camera has a nonsense screen position. Let the
-    // clipper handle that triangle instead of exploding it.
-    if (c0.w <= 1e-4 || c1.w <= 1e-4 || c2.w <= 1e-4) {
-        emit_raw(0, c0);
-        emit_raw(1, c1);
-        emit_raw(2, c2);
-        EndPrimitive();
-    } else {
-        vec2 s0 = screen_of(c0);
-        vec2 s1 = screen_of(c1);
-        vec2 s2 = screen_of(c2);
-        vec2 e01 = s1 - s0;
-        vec2 e12 = s2 - s1;
-        vec2 e20 = s0 - s2;
-        float l01 = length(e01);
-        float l12 = length(e12);
-        float l20 = length(e20);
-        float longest = max(l01, max(l12, l20));
-        float crossz = e01.x * (s2.y - s0.y) - e01.y * (s2.x - s0.x);
-        float alt = abs(crossz) / max(longest, 1e-4);
-        // Half the ribbon has to reach the third vertex, or the tip of a
-        // skinny face is still a hole. Faces already a few pixels tall keep
-        // their real outline and only overlap their neighbors a little.
-        float halfw = max(1.85, alt + 0.55);
-        if (longest < 1.2) {
-            emit_dot((s0 + s1 + s2) / 3.0, c0);
-        } else if (alt < 2.4) {
-            if (l01 >= l12 && l01 >= l20) {
-                emit_stroke(0, 1, c0, c1, s0, s1, halfw);
-            } else if (l12 >= l20) {
-                emit_stroke(1, 2, c1, c2, s1, s2, halfw);
-            } else {
-                emit_stroke(2, 0, c2, c0, s2, s0, halfw);
-            }
-        } else {
-            float wind = crossz < 0.0 ? -1.0 : 1.0;
-            vec2 n01 = outward(vec2(e01.y, -e01.x) * wind);
-            vec2 n12 = outward(vec2(e12.y, -e12.x) * wind);
-            vec2 n20 = outward(vec2(e20.y, -e20.x) * wind);
-            emit_at(0, c0, push_corner(s0, n20, n01));
-            emit_at(1, c1, push_corner(s1, n01, n12));
-            emit_at(2, c2, push_corner(s2, n12, n20));
-            EndPrimitive();
-        }
-    }
+    float shade = 0.50 + 0.44 * ndl + 0.10 * fill;
+    vec3 view = normalize(u_eye - v_pos);
+    vec3 half_dir = normalize(light + view);
+    float spec = pow(clamp(dot(n, half_dir), 0.0, 1.0), 48.0);
+    out_color = vec4(v_col * shade + vec3(spec * 0.16), 1.0);
 }
 "#;
 
@@ -488,18 +367,12 @@ pub struct Renderer {
     line_vbo: glow::Buffer,
     line_verts: i32,
     generation: u64,
-    /// False when the driver rejected the geometry shader and faces smaller
-    /// than a pixel can still drop out.
-    pub covers_pixels: bool,
 }
 
 impl Renderer {
     pub fn new(gl: &glow::Context) -> Result<Self, String> {
         unsafe {
-            let (program, covers_pixels) = match link_with_geom(gl, VERT, GEOM, FRAG) {
-                Ok(program) => (program, true),
-                Err(_) => (link(gl, VERT, FRAG_DIRECT)?, false),
-            };
+            let program = link(gl, VERT, FRAG)?;
             let line_program = link(gl, LINE_VERT, LINE_FRAG)?;
             let line_vao = gl.create_vertex_array().map_err(|e| e.to_string())?;
             let line_vbo = gl.create_buffer().map_err(|e| e.to_string())?;
@@ -511,7 +384,6 @@ impl Renderer {
                 line_vbo,
                 line_verts: 0,
                 generation: 0,
-                covers_pixels,
             })
         }
     }
@@ -572,27 +444,28 @@ impl Renderer {
         self.line_verts = (draw.lines.len() / 6) as i32;
     }
 
-    pub fn paint(&self, gl: &glow::Context, camera: &Camera, aspect: f32, width: f32, height: f32) {
+    pub fn paint(&self, gl: &glow::Context, camera: &Camera, aspect: f32) {
         unsafe {
             let vp = camera.view_proj(aspect);
+            let eye = camera.eye();
             gl.disable(glow::CULL_FACE);
             gl.disable(glow::BLEND);
             gl.enable(glow::DEPTH_TEST);
             gl.depth_func(glow::LEQUAL);
             gl.depth_mask(true);
-            gl.disable(glow::POLYGON_OFFSET_FILL);
+            gl.clear_depth_f32(1.0);
             gl.front_face(glow::CCW);
             gl.clear_color(0.11, 0.12, 0.14, 1.0);
             gl.clear(glow::COLOR_BUFFER_BIT | glow::DEPTH_BUFFER_BIT);
             gl.use_program(Some(self.program));
             let loc = gl.get_uniform_location(self.program, "u_mvp");
             gl.uniform_matrix_4_f32_slice(loc.as_ref(), false, vp.as_ref());
-            let view_px = gl.get_uniform_location(self.program, "u_viewport");
-            gl.uniform_2_f32(view_px.as_ref(), width.max(1.0), height.max(1.0));
             let light = gl.get_uniform_location(self.program, "u_light");
             gl.uniform_3_f32(light.as_ref(), 0.35, -0.25, 0.90);
             let fill = gl.get_uniform_location(self.program, "u_fill");
             gl.uniform_3_f32(fill.as_ref(), -0.4, 0.6, 0.2);
+            let eye_loc = gl.get_uniform_location(self.program, "u_eye");
+            gl.uniform_3_f32(eye_loc.as_ref(), eye.x, eye.y, eye.z);
             for batch in &self.batches {
                 gl.bind_vertex_array(Some(batch.vao));
                 gl.draw_arrays(glow::TRIANGLES, 0, batch.count);
@@ -651,22 +524,6 @@ fn link(gl: &glow::Context, vert: &str, frag: &str) -> Result<glow::Program, Str
     )
 }
 
-fn link_with_geom(
-    gl: &glow::Context,
-    vert: &str,
-    geom: &str,
-    frag: &str,
-) -> Result<glow::Program, String> {
-    link_stages(
-        gl,
-        &[
-            (glow::VERTEX_SHADER, vert),
-            (glow::GEOMETRY_SHADER, geom),
-            (glow::FRAGMENT_SHADER, frag),
-        ],
-    )
-}
-
 fn link_stages(gl: &glow::Context, stages: &[(u32, &str)]) -> Result<glow::Program, String> {
     unsafe {
         let program = gl.create_program().map_err(|e| e.to_string())?;
@@ -690,3 +547,22 @@ fn link_stages(gl: &glow::Context, stages: &[(u32, &str)]) -> Result<glow::Progr
 }
 
 pub type SharedRenderer = Arc<std::sync::Mutex<Renderer>>;
+
+#[cfg(test)]
+mod tests {
+    use super::smooth_world_normals;
+    use glam::Mat4;
+
+    #[test]
+    fn a_cube_corner_normal_points_out_of_the_box() {
+        let mesh = crate::mesh::box_mesh([0.0, 0.0, 0.0], [10.0, 10.0, 10.0]);
+        let normals = smooth_world_normals(&mesh, Mat4::IDENTITY);
+        let corner = normals
+            .iter()
+            .zip(mesh.vertices.iter())
+            .find(|(_, v)| v[0] > 9.0 && v[1] > 9.0 && v[2] > 9.0)
+            .map(|(n, _)| *n)
+            .expect("top corner");
+        assert!(corner[0] > 0.4 && corner[1] > 0.4 && corner[2] > 0.4);
+    }
+}

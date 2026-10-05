@@ -584,49 +584,74 @@ fn anchor_index(supports: &[Support], group: &[usize]) -> usize {
 }
 
 fn trunk_braces(trunks: &[Trunk], max_dist: f32, radius: f32) -> Vec<Brace> {
+    // One horizontal rung layer at a time. At each height the links are a
+    // Euclidean minimum spanning tree, which cannot cross itself, instead of
+    // a nearest-neighbor web at a different height on every trunk.
+    if trunks.len() < 2 || max_dist < 0.5 || radius <= 0.0 {
+        return Vec::new();
+    }
+    let step = max_dist.clamp(3.0, 20.0);
+    let z_min = trunks.iter().map(|t| t.z_base).fold(f32::MAX, f32::min);
+    let z_max = trunks.iter().map(|t| t.z_top).fold(f32::MIN, f32::max);
     let mut out = Vec::new();
-    let mut used = vec![0u8; trunks.len()];
-    for i in 0..trunks.len() {
-        if used[i] >= 2 {
-            continue;
+    let mut z = z_min + step * 0.5;
+    for _ in 0..64 {
+        if z >= z_max - 0.5 {
+            break;
         }
-        let a = &trunks[i];
-        let mut best: Option<(usize, f32)> = None;
-        for j in (i + 1)..trunks.len() {
-            if used[j] >= 2 {
-                continue;
-            }
-            let b = &trunks[j];
-            let dx = a.x - b.x;
-            let dy = a.y - b.y;
-            let dist = (dx * dx + dy * dy).sqrt();
-            if dist < a.radius * 2.0 || dist > max_dist {
-                continue;
-            }
-            let overlap_top = a.z_top.min(b.z_top) - 2.0;
-            let overlap_bot = a.z_base.max(b.z_base) + 1.5;
-            if overlap_top - overlap_bot < 3.0 {
-                continue;
-            }
-            if best.map(|(_, d)| dist < d).unwrap_or(true) {
-                best = Some((j, dist));
-            }
-        }
-        if let Some((j, _)) = best {
-            used[i] += 1;
-            used[j] += 1;
-            let b = &trunks[j];
-            let z = ((a.z_base + a.z_top) * 0.5)
-                .min((b.z_base + b.z_top) * 0.5)
-                .clamp(a.z_base.max(b.z_base) + 1.2, a.z_top.min(b.z_top) - 1.5);
-            out.push(Brace {
-                a: Vec3::new(a.x, a.y, z),
-                b: Vec3::new(b.x, b.y, z),
-                radius,
-            });
-        }
+        add_rung(&mut out, trunks, z, max_dist, radius);
+        z += step;
     }
     out
+}
+
+fn add_rung(out: &mut Vec<Brace>, trunks: &[Trunk], z: f32, max_dist: f32, radius: f32) {
+    let nodes: Vec<usize> = trunks
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| t.z_base + 0.8 < z && z < t.z_top - 0.8)
+        .map(|(i, _)| i)
+        .collect();
+    if nodes.len() < 2 {
+        return;
+    }
+    let mut edges = Vec::new();
+    for a in 0..nodes.len() {
+        for b in (a + 1)..nodes.len() {
+            let ia = nodes[a];
+            let ib = nodes[b];
+            let dx = trunks[ia].x - trunks[ib].x;
+            let dy = trunks[ia].y - trunks[ib].y;
+            let dist = (dx * dx + dy * dy).sqrt();
+            let min_sep = (trunks[ia].radius + trunks[ib].radius) * 1.2;
+            if dist >= min_sep && dist <= max_dist {
+                edges.push((dist, ia, ib));
+            }
+        }
+    }
+    edges.sort_by(|p, q| p.0.total_cmp(&q.0));
+    let mut parent: Vec<usize> = (0..trunks.len()).collect();
+    for &(_, ia, ib) in &edges {
+        let ra = find_root(&mut parent, ia);
+        let rb = find_root(&mut parent, ib);
+        if ra == rb {
+            continue;
+        }
+        parent[ra] = rb;
+        out.push(Brace {
+            a: Vec3::new(trunks[ia].x, trunks[ia].y, z),
+            b: Vec3::new(trunks[ib].x, trunks[ib].y, z),
+            radius,
+        });
+    }
+}
+
+fn find_root(parent: &mut [usize], mut i: usize) -> usize {
+    while parent[i] != i {
+        parent[i] = parent[parent[i]];
+        i = parent[i];
+    }
+    i
 }
 
 pub fn raft_mesh(supports: &[Support], margin: f32, thickness: f32, reach: f32) -> Option<Mesh> {
@@ -785,5 +810,57 @@ mod tests {
             .iter()
             .any(|v| (v[0] - 3.2).abs() < 0.3 && v[2] > 18.0);
         assert!(reached, "expected a tip on the second contact");
+    }
+
+    #[test]
+    fn braces_are_level_rungs_without_diagonals() {
+        let trunks = [
+            Trunk {
+                x: 0.0,
+                y: 0.0,
+                z_base: 0.0,
+                z_top: 40.0,
+                radius: 0.6,
+            },
+            Trunk {
+                x: 10.0,
+                y: 0.0,
+                z_base: 0.0,
+                z_top: 40.0,
+                radius: 0.6,
+            },
+            Trunk {
+                x: 10.0,
+                y: 10.0,
+                z_base: 0.0,
+                z_top: 40.0,
+                radius: 0.6,
+            },
+            Trunk {
+                x: 0.0,
+                y: 10.0,
+                z_base: 0.0,
+                z_top: 40.0,
+                radius: 0.6,
+            },
+        ];
+        let braces = trunk_braces(&trunks, 12.0, 0.2);
+        let level: Vec<_> = braces
+            .iter()
+            .filter(|b| (b.a.z - 6.0).abs() < 0.01)
+            .collect();
+        assert_eq!(
+            level.len(),
+            3,
+            "a square of trunks keeps three sides, not both diagonals"
+        );
+        let mut heights = std::collections::BTreeSet::new();
+        for brace in &braces {
+            assert!((brace.a.z - brace.b.z).abs() < 1e-4, "rungs stay level");
+            let len = (brace.a - brace.b).length();
+            assert!(len < 11.0, "diagonal rung of length {len}");
+            heights.insert((brace.a.z * 10.0).round() as i32);
+        }
+        assert!(heights.len() >= 2, "rungs repeat up the trunks");
     }
 }

@@ -142,21 +142,16 @@ impl AmberApp {
             machine.name,
             catalog::PRINTERS.len()
         );
-        let renderer = cc.gl.as_ref().and_then(|gl| match Renderer::new(gl.as_ref()) {
-            Ok(renderer) => {
-                if !renderer.covers_pixels {
-                    gpu_note = Some(
-                        "This GPU would not grow tiny faces, so a dense sculpt can still look speckled."
-                            .to_string(),
-                    );
+        let renderer = cc
+            .gl
+            .as_ref()
+            .and_then(|gl| match Renderer::new(gl.as_ref()) {
+                Ok(renderer) => Some(Arc::new(Mutex::new(renderer))),
+                Err(err) => {
+                    gpu_note = Some(format!("OpenGL plate view failed to start: {err}"));
+                    None
                 }
-                Some(Arc::new(Mutex::new(renderer)))
-            }
-            Err(err) => {
-                gpu_note = Some(format!("OpenGL plate view failed to start: {err}"));
-                None
-            }
-        });
+            });
         Self {
             machine,
             settings,
@@ -1213,8 +1208,9 @@ impl AmberApp {
         let mut raft_changed = false;
         raft_changed |= ui.checkbox(&mut raft, "Raft").changed();
         raft_changed |= drag_f32(ui, "Raft thickness", &mut raft_mm, 0.05, 0.4, 3.0, "mm");
-        raft_changed |= ui.checkbox(&mut braces, "Cross bracing").changed();
+        raft_changed |= ui.checkbox(&mut braces, "Horizontal braces").changed();
         raft_changed |= drag_f32(ui, "Brace spacing", &mut brace_dist, 0.1, 2.0, 20.0, "mm");
+        ui.label("Braces are level rungs. Spacing is both the gap between rungs and the farthest two trunks a rung will join.");
         if raft_changed {
             self.doc.raft = raft;
             self.doc.raft_mm = raft_mm;
@@ -1673,13 +1669,7 @@ impl AmberApp {
                 if let Some(draw) = &draw {
                     gpu.sync(gl, draw, generation);
                 }
-                gpu.paint(
-                    gl,
-                    &camera,
-                    aspect,
-                    vp.width_px.max(1) as f32,
-                    vp.height_px.max(1) as f32,
-                );
+                gpu.paint(gl, &camera, aspect);
             })),
         };
         ui.painter().add(callback);
@@ -2061,7 +2051,11 @@ pub fn run() -> eframe::Result {
             .with_min_inner_size([1100.0, 700.0])
             .with_title("Amber"),
         renderer: eframe::Renderer::Glow,
-        // 0 keeps the window opening on software GL and on machines without MSAA.
+        // egui leaves this at 0, which draws every triangle on top of the
+        // last one, so you can see through the shell. 24 bits is what the
+        // glow 3D sample and the slicer viewports use.
+        depth_buffer: 24,
+        // Left at 0 so a machine without multisample still opens the window.
         multisampling: 0,
         ..Default::default()
     };
