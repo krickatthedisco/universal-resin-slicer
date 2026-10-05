@@ -7,6 +7,7 @@
 
 use crate::mesh::{face_normal, Mesh};
 use glam::Vec3;
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -24,7 +25,14 @@ pub struct SupportStyle {
     pub branch_deg: f32,
     pub cluster_mm: f32,
     pub foot_mm: f32,
+    /// Bottom diameter of a foot on the bed. 0 keeps a little over twice the trunk.
+    #[serde(default = "default_foot_diam")]
+    pub foot_diam_mm: f32,
     pub brace_mm: f32,
+}
+
+fn default_foot_diam() -> f32 {
+    0.0
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -49,6 +57,7 @@ pub const PRESETS: &[SupportPreset] = &[
             branch_deg: 40.0,
             cluster_mm: 5.5,
             foot_mm: 0.6,
+            foot_diam_mm: 1.9,
             brace_mm: 0.32,
         },
     },
@@ -67,6 +76,7 @@ pub const PRESETS: &[SupportPreset] = &[
             branch_deg: 45.0,
             cluster_mm: 7.0,
             foot_mm: 0.8,
+            foot_diam_mm: 2.5,
             brace_mm: 0.42,
         },
     },
@@ -85,6 +95,7 @@ pub const PRESETS: &[SupportPreset] = &[
             branch_deg: 50.0,
             cluster_mm: 9.0,
             foot_mm: 1.1,
+            foot_diam_mm: 3.6,
             brace_mm: 0.55,
         },
     },
@@ -103,6 +114,7 @@ pub const PRESETS: &[SupportPreset] = &[
             branch_deg: 35.0,
             cluster_mm: 3.5,
             foot_mm: 0.4,
+            foot_diam_mm: 1.05,
             brace_mm: 0.18,
         },
     },
@@ -127,6 +139,11 @@ impl SupportStyle {
             branch_deg: self.branch_deg.clamp(10.0, 75.0),
             cluster_mm: self.cluster_mm.clamp(1.5, 20.0),
             foot_mm: self.foot_mm.clamp(0.2, 3.0),
+            foot_diam_mm: if self.foot_diam_mm <= 0.05 {
+                0.0
+            } else {
+                self.foot_diam_mm.clamp(0.4, 12.0)
+            },
             brace_mm: self.brace_mm.clamp(0.1, 2.0),
         }
     }
@@ -231,6 +248,44 @@ impl<'a> TriGrid<'a> {
     }
 }
 
+fn face_samples(
+    a: [f32; 3],
+    b: [f32; 3],
+    c: [f32; 3],
+    spacing: f32,
+    overhang_deg: f32,
+) -> Vec<[f32; 3]> {
+    let n = face_normal(a, b, c);
+    if !needs_support(n, overhang_deg) {
+        return Vec::new();
+    }
+    let min_x = a[0].min(b[0]).min(c[0]);
+    let max_x = a[0].max(b[0]).max(c[0]);
+    let min_y = a[1].min(b[1]).min(c[1]);
+    let max_y = a[1].max(b[1]).max(c[1]);
+    let mut samples = vec![[
+        (a[0] + b[0] + c[0]) / 3.0,
+        (a[1] + b[1] + c[1]) / 3.0,
+        (a[2] + b[2] + c[2]) / 3.0,
+    ]];
+    let span = (max_x - min_x).max(max_y - min_y);
+    if span > spacing * 0.75 {
+        let mut x = (min_x / spacing).floor() * spacing;
+        while x <= max_x {
+            let mut y = (min_y / spacing).floor() * spacing;
+            while y <= max_y {
+                if let Some(z) = vertical_hit(x, y, a, b, c) {
+                    samples.push([x, y, z]);
+                }
+                y += spacing;
+            }
+            x += spacing;
+        }
+    }
+    samples.retain(|s| s[2] >= 0.4);
+    samples
+}
+
 fn vertical_hit(x: f32, y: f32, a: [f32; 3], b: [f32; 3], c: [f32; 3]) -> Option<f32> {
     let denom = (b[1] - c[1]) * (a[0] - c[0]) + (c[0] - b[0]) * (a[1] - c[1]);
     if denom.abs() < 1e-8 {
@@ -254,59 +309,42 @@ pub fn auto_supports(
 ) -> Vec<Support> {
     let style = style.sanitized();
     let grid = TriGrid::build(verts, indices);
-    let mut cells: HashMap<(i32, i32), [f32; 3]> = HashMap::new();
     let spacing = style.spacing_mm;
-    for tri in indices.chunks_exact(3) {
-        let a = verts[tri[0] as usize];
-        let b = verts[tri[1] as usize];
-        let c = verts[tri[2] as usize];
-        let n = face_normal(a, b, c);
-        if !needs_support(n, style.overhang_deg) {
-            continue;
-        }
-        let min_x = a[0].min(b[0]).min(c[0]);
-        let max_x = a[0].max(b[0]).max(c[0]);
-        let min_y = a[1].min(b[1]).min(c[1]);
-        let max_y = a[1].max(b[1]).max(c[1]);
-        let mut samples = vec![[
-            (a[0] + b[0] + c[0]) / 3.0,
-            (a[1] + b[1] + c[1]) / 3.0,
-            (a[2] + b[2] + c[2]) / 3.0,
-        ]];
-        let span = (max_x - min_x).max(max_y - min_y);
-        if span > spacing * 0.75 {
-            let x_start = (min_x / spacing).floor() * spacing;
-            let y_start = (min_y / spacing).floor() * spacing;
-            let mut x = x_start;
-            while x <= max_x {
-                let mut y = y_start;
-                while y <= max_y {
-                    if let Some(z) = vertical_hit(x, y, a, b, c) {
-                        samples.push([x, y, z]);
-                    }
-                    y += spacing;
-                }
-                x += spacing;
+    let overhang = style.overhang_deg;
+    let cells = indices
+        .par_chunks_exact(3)
+        .fold(HashMap::<(i32, i32), [f32; 3]>::new, |mut cells, tri| {
+            let a = verts[tri[0] as usize];
+            let b = verts[tri[1] as usize];
+            let c = verts[tri[2] as usize];
+            for sample in face_samples(a, b, c, spacing, overhang) {
+                let key = (
+                    (sample[0] / spacing).floor() as i32,
+                    (sample[1] / spacing).floor() as i32,
+                );
+                cells
+                    .entry(key)
+                    .and_modify(|old| {
+                        if sample[2] < old[2] {
+                            *old = sample;
+                        }
+                    })
+                    .or_insert(sample);
             }
-        }
-        for s in samples {
-            if s[2] < 0.4 {
-                continue;
-            }
-            let key = (
-                (s[0] / spacing).floor() as i32,
-                (s[1] / spacing).floor() as i32,
-            );
             cells
-                .entry(key)
-                .and_modify(|old| {
-                    if s[2] < old[2] {
-                        *old = s;
-                    }
-                })
-                .or_insert(s);
-        }
-    }
+        })
+        .reduce(HashMap::<(i32, i32), [f32; 3]>::new, |mut left, right| {
+            for (key, sample) in right {
+                left.entry(key)
+                    .and_modify(|old| {
+                        if sample[2] < old[2] {
+                            *old = sample;
+                        }
+                    })
+                    .or_insert(sample);
+            }
+            left
+        });
     let mut out = Vec::new();
     for s in cells.into_values() {
         let landed = if platform_only {
@@ -369,6 +407,7 @@ pub fn forest_mesh(
     raft_top: f32,
     braces_on: bool,
     brace_dist: f32,
+    brace_angle: f32,
 ) -> Mesh {
     let style = style.sanitized();
     let mut mesh = Mesh {
@@ -432,7 +471,7 @@ pub fn forest_mesh(
         }
     }
     if braces_on {
-        for brace in trunk_braces(&trunks, brace_dist, style.brace_mm * 0.5) {
+        for brace in trunk_braces(&trunks, brace_dist, style.brace_mm * 0.5, brace_angle) {
             mesh.append(&tapered(brace.a, brace.radius, brace.b, brace.radius, 6));
         }
     }
@@ -525,9 +564,14 @@ fn add_foot_and_shaft(
         ));
     }
     if on_bed && foot_h > 0.12 {
+        let foot_r = if style.foot_diam_mm > 0.05 {
+            style.foot_diam_mm * 0.5
+        } else {
+            trunk_r * 2.1
+        };
         mesh.append(&tapered(
             Vec3::new(x, y, z_base),
-            trunk_r * 2.1,
+            foot_r,
             Vec3::new(x, y, shaft_bottom),
             trunk_r,
             10,
@@ -583,10 +627,9 @@ fn anchor_index(supports: &[Support], group: &[usize]) -> usize {
         .unwrap_or(group[0])
 }
 
-fn trunk_braces(trunks: &[Trunk], max_dist: f32, radius: f32) -> Vec<Brace> {
-    // One horizontal rung layer at a time. At each height the links are a
-    // Euclidean minimum spanning tree, which cannot cross itself, instead of
-    // a nearest-neighbor web at a different height on every trunk.
+fn trunk_braces(trunks: &[Trunk], max_dist: f32, radius: f32, angle_deg: f32) -> Vec<Brace> {
+    // Same non-crossing links as before, but each one rises at 45° to the
+    // bed. Alternate layers lean the other way so the columns stay braced.
     if trunks.len() < 2 || max_dist < 0.5 || radius <= 0.0 {
         return Vec::new();
     }
@@ -595,21 +638,41 @@ fn trunk_braces(trunks: &[Trunk], max_dist: f32, radius: f32) -> Vec<Brace> {
     let z_max = trunks.iter().map(|t| t.z_top).fold(f32::MIN, f32::max);
     let mut out = Vec::new();
     let mut z = z_min + step * 0.5;
-    for _ in 0..64 {
-        if z >= z_max - 0.5 {
+    for level in 0..48 {
+        if z >= z_max - 1.0 {
             break;
         }
-        add_rung(&mut out, trunks, z, max_dist, radius);
+        add_rung(
+            &mut out,
+            trunks,
+            z,
+            max_dist,
+            radius,
+            level % 2 == 1,
+            angle_deg,
+        );
         z += step;
     }
     out
 }
 
-fn add_rung(out: &mut Vec<Brace>, trunks: &[Trunk], z: f32, max_dist: f32, radius: f32) {
+fn trunk_holds(trunk: &Trunk, z: f32) -> bool {
+    trunk.z_base + 0.6 < z && z < trunk.z_top - 0.6
+}
+
+fn add_rung(
+    out: &mut Vec<Brace>,
+    trunks: &[Trunk],
+    z: f32,
+    max_dist: f32,
+    radius: f32,
+    flip: bool,
+    angle_deg: f32,
+) {
     let nodes: Vec<usize> = trunks
         .iter()
         .enumerate()
-        .filter(|(_, t)| t.z_base + 0.8 < z && z < t.z_top - 0.8)
+        .filter(|(_, t)| t.z_base + 0.8 < z + max_dist && z < t.z_top - 0.8)
         .map(|(i, _)| i)
         .collect();
     if nodes.len() < 2 {
@@ -631,18 +694,25 @@ fn add_rung(out: &mut Vec<Brace>, trunks: &[Trunk], z: f32, max_dist: f32, radiu
     }
     edges.sort_by(|p, q| p.0.total_cmp(&q.0));
     let mut parent: Vec<usize> = (0..trunks.len()).collect();
-    for &(_, ia, ib) in &edges {
+    for &(dist, mut ia, mut ib) in &edges {
         let ra = find_root(&mut parent, ia);
         let rb = find_root(&mut parent, ib);
         if ra == rb {
             continue;
         }
         parent[ra] = rb;
-        out.push(Brace {
-            a: Vec3::new(trunks[ia].x, trunks[ia].y, z),
-            b: Vec3::new(trunks[ib].x, trunks[ib].y, z),
-            radius,
-        });
+        if (trunks[ib].x, trunks[ib].y) < (trunks[ia].x, trunks[ia].y) {
+            std::mem::swap(&mut ia, &mut ib);
+        }
+        let rise = dist * angle_deg.clamp(5.0, 80.0).to_radians().tan();
+        let (za, zb) = if flip { (z + rise, z) } else { (z, z + rise) };
+        if trunk_holds(&trunks[ia], za) && trunk_holds(&trunks[ib], zb) {
+            out.push(Brace {
+                a: Vec3::new(trunks[ia].x, trunks[ia].y, za),
+                b: Vec3::new(trunks[ib].x, trunks[ib].y, zb),
+                radius,
+            });
+        }
     }
 }
 
@@ -753,6 +823,312 @@ fn tapered(a: Vec3, ra: f32, b: Vec3, rb: f32, seg: usize) -> Mesh {
     Mesh { vertices, indices }
 }
 
+/// One skate raft for a part: the outline of the mesh, grown by `oversize`,
+/// with the outer wall leaning out. `angle_deg` is measured from vertical,
+/// so 45° makes the base wider than the top by the raft thickness.
+pub fn skate_raft(
+    vertices: &[[f32; 3]],
+    indices: &[u32],
+    thickness: f32,
+    oversize: f32,
+    angle_deg: f32,
+) -> Option<Mesh> {
+    let thickness = thickness.clamp(0.2, 5.0);
+    let oversize = oversize.clamp(0.0, 30.0);
+    let flare = thickness * angle_deg.clamp(0.0, 70.0).to_radians().tan();
+    if vertices.is_empty() || indices.len() < 3 {
+        return None;
+    }
+    let cell = 0.8_f32;
+    let mut min_x = f32::MAX;
+    let mut min_y = f32::MAX;
+    let mut max_x = f32::MIN;
+    let mut max_y = f32::MIN;
+    for v in vertices {
+        min_x = min_x.min(v[0]);
+        min_y = min_y.min(v[1]);
+        max_x = max_x.max(v[0]);
+        max_y = max_y.max(v[1]);
+    }
+    if !min_x.is_finite() {
+        return None;
+    }
+    let pad = oversize + flare + cell * 2.0;
+    let origin_x = min_x - pad;
+    let origin_y = min_y - pad;
+    let w = ((max_x - min_x + pad * 2.0) / cell).ceil() as usize + 1;
+    let h = ((max_y - min_y + pad * 2.0) / cell).ceil() as usize + 1;
+    if w < 2 || h < 2 || w.saturating_mul(h) > 2_000_000 {
+        return None;
+    }
+    let mut mask = vec![false; w * h];
+    for tri in indices.chunks_exact(3) {
+        stamp_tri(
+            &mut mask,
+            origin_x,
+            origin_y,
+            cell,
+            w,
+            h,
+            vertices[tri[0] as usize],
+            vertices[tri[1] as usize],
+            vertices[tri[2] as usize],
+        );
+    }
+    fill_silhouette_holes(&mut mask, w, h);
+    if !mask.iter().any(|bit| *bit) {
+        return None;
+    }
+    let dist = distance_outside(&mask, w, h, cell);
+    let mesh = heightfield(
+        origin_x, origin_y, cell, w, h, &dist, thickness, oversize, flare,
+    );
+    if mesh.triangle_count() == 0 {
+        None
+    } else {
+        Some(mesh)
+    }
+}
+
+fn stamp_tri(
+    mask: &mut [bool],
+    origin_x: f32,
+    origin_y: f32,
+    cell: f32,
+    w: usize,
+    h: usize,
+    a: [f32; 3],
+    b: [f32; 3],
+    c: [f32; 3],
+) {
+    let min_x = a[0].min(b[0]).min(c[0]);
+    let max_x = a[0].max(b[0]).max(c[0]);
+    let min_y = a[1].min(b[1]).min(c[1]);
+    let max_y = a[1].max(b[1]).max(c[1]);
+    let x0 = (((min_x - origin_x) / cell).floor() as isize).clamp(0, w as isize - 1) as usize;
+    let x1 = (((max_x - origin_x) / cell).ceil() as isize).clamp(0, w as isize - 1) as usize;
+    let y0 = (((min_y - origin_y) / cell).floor() as isize).clamp(0, h as isize - 1) as usize;
+    let y1 = (((max_y - origin_y) / cell).ceil() as isize).clamp(0, h as isize - 1) as usize;
+    for y in y0..=y1 {
+        for x in x0..=x1 {
+            let px = origin_x + (x as f32 + 0.5) * cell;
+            let py = origin_y + (y as f32 + 0.5) * cell;
+            if point_in_tri(px, py, a, b, c) {
+                mask[y * w + x] = true;
+            }
+        }
+    }
+}
+
+fn point_in_tri(px: f32, py: f32, a: [f32; 3], b: [f32; 3], c: [f32; 3]) -> bool {
+    let denom = (b[1] - c[1]) * (a[0] - c[0]) + (c[0] - b[0]) * (a[1] - c[1]);
+    if denom.abs() < 1e-8 {
+        return false;
+    }
+    let w0 = ((b[1] - c[1]) * (px - c[0]) + (c[0] - b[0]) * (py - c[1])) / denom;
+    let w1 = ((c[1] - a[1]) * (px - c[0]) + (a[0] - c[0]) * (py - c[1])) / denom;
+    let w2 = 1.0 - w0 - w1;
+    w0 >= -1e-3 && w1 >= -1e-3 && w2 >= -1e-3
+}
+
+fn fill_silhouette_holes(mask: &mut [bool], w: usize, h: usize) {
+    let mut outside = vec![false; mask.len()];
+    let mut stack = Vec::new();
+    for x in 0..w {
+        stack.push(x);
+        stack.push((h - 1) * w + x);
+    }
+    for y in 0..h {
+        stack.push(y * w);
+        stack.push(y * w + (w - 1));
+    }
+    while let Some(i) = stack.pop() {
+        if outside[i] || mask[i] {
+            continue;
+        }
+        outside[i] = true;
+        let x = i % w;
+        let y = i / w;
+        if x > 0 {
+            stack.push(i - 1);
+        }
+        if x + 1 < w {
+            stack.push(i + 1);
+        }
+        if y > 0 {
+            stack.push(i - w);
+        }
+        if y + 1 < h {
+            stack.push(i + w);
+        }
+    }
+    for (bit, out) in mask.iter_mut().zip(outside.iter()) {
+        if !out {
+            *bit = true;
+        }
+    }
+}
+
+fn distance_outside(mask: &[bool], w: usize, h: usize, cell: f32) -> Vec<f32> {
+    let diag = cell * std::f32::consts::SQRT_2;
+    let mut dist = vec![1.0e9_f32; w * h];
+    for (i, bit) in mask.iter().enumerate() {
+        if *bit {
+            dist[i] = 0.0;
+        }
+    }
+    for y in 0..h {
+        for x in 0..w {
+            let i = y * w + x;
+            let mut d = dist[i];
+            if x > 0 {
+                d = d.min(dist[i - 1] + cell);
+            }
+            if y > 0 {
+                d = d.min(dist[i - w] + cell);
+            }
+            if x > 0 && y > 0 {
+                d = d.min(dist[i - w - 1] + diag);
+            }
+            if x + 1 < w && y > 0 {
+                d = d.min(dist[i - w + 1] + diag);
+            }
+            dist[i] = d;
+        }
+    }
+    for y in (0..h).rev() {
+        for x in (0..w).rev() {
+            let i = y * w + x;
+            let mut d = dist[i];
+            if x + 1 < w {
+                d = d.min(dist[i + 1] + cell);
+            }
+            if y + 1 < h {
+                d = d.min(dist[i + w] + cell);
+            }
+            if x + 1 < w && y + 1 < h {
+                d = d.min(dist[i + w + 1] + diag);
+            }
+            if x > 0 && y + 1 < h {
+                d = d.min(dist[i + w - 1] + diag);
+            }
+            dist[i] = d;
+        }
+    }
+    dist
+}
+
+fn raft_height(dist: f32, thickness: f32, oversize: f32, flare: f32) -> f32 {
+    if dist <= oversize {
+        thickness
+    } else if flare < 0.05 || dist >= oversize + flare {
+        0.0
+    } else {
+        thickness * (1.0 - (dist - oversize) / flare)
+    }
+}
+
+fn heightfield(
+    origin_x: f32,
+    origin_y: f32,
+    cell: f32,
+    w: usize,
+    h: usize,
+    dist: &[f32],
+    thickness: f32,
+    oversize: f32,
+    flare: f32,
+) -> Mesh {
+    let mut vertices = Vec::new();
+    let mut indices = Vec::new();
+    let tri = |vertices: &mut Vec<[f32; 3]>, indices: &mut Vec<u32>, a, b, c| {
+        let base = vertices.len() as u32;
+        vertices.push(a);
+        vertices.push(b);
+        vertices.push(c);
+        indices.extend_from_slice(&[base, base + 1, base + 2]);
+    };
+    let height_at = |x: i32, y: i32| -> f32 {
+        if x < 0 || y < 0 || x >= w as i32 || y >= h as i32 {
+            0.0
+        } else {
+            raft_height(
+                dist[y as usize * w + x as usize],
+                thickness,
+                oversize,
+                flare,
+            )
+        }
+    };
+    for y in 0..h {
+        for x in 0..w {
+            let z = height_at(x as i32, y as i32);
+            if z < 0.02 {
+                continue;
+            }
+            let x0 = origin_x + x as f32 * cell;
+            let y0 = origin_y + y as f32 * cell;
+            let x1 = x0 + cell;
+            let y1 = y0 + cell;
+            tri(
+                &mut vertices,
+                &mut indices,
+                [x0, y0, z],
+                [x1, y0, z],
+                [x1, y1, z],
+            );
+            tri(
+                &mut vertices,
+                &mut indices,
+                [x0, y0, z],
+                [x1, y1, z],
+                [x0, y1, z],
+            );
+            tri(
+                &mut vertices,
+                &mut indices,
+                [x0, y0, 0.0],
+                [x1, y1, 0.0],
+                [x1, y0, 0.0],
+            );
+            tri(
+                &mut vertices,
+                &mut indices,
+                [x0, y0, 0.0],
+                [x0, y1, 0.0],
+                [x1, y1, 0.0],
+            );
+            let walls = [
+                (0, -1, [x0, y0], [x1, y0]),
+                (0, 1, [x1, y1], [x0, y1]),
+                (-1, 0, [x0, y1], [x0, y0]),
+                (1, 0, [x1, y0], [x1, y1]),
+            ];
+            for (dx, dy, p0, p1) in walls {
+                let zn = height_at(x as i32 + dx, y as i32 + dy);
+                if zn + 0.02 >= z {
+                    continue;
+                }
+                tri(
+                    &mut vertices,
+                    &mut indices,
+                    [p0[0], p0[1], z],
+                    [p0[0], p0[1], zn],
+                    [p1[0], p1[1], zn],
+                );
+                tri(
+                    &mut vertices,
+                    &mut indices,
+                    [p0[0], p0[1], z],
+                    [p1[0], p1[1], zn],
+                    [p1[0], p1[1], z],
+                );
+            }
+        }
+    }
+    Mesh { vertices, indices }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -798,7 +1174,7 @@ mod tests {
                 z_base: 0.0,
             },
         ];
-        let mesh = forest_mesh(&supports, &PRESETS[1].style, 0.0, true, 8.0);
+        let mesh = forest_mesh(&supports, &PRESETS[1].style, 0.0, true, 8.0, 45.0);
         assert!(mesh.triangle_count() > 40);
         let joint = mesh
             .vertices
@@ -813,7 +1189,34 @@ mod tests {
     }
 
     #[test]
-    fn braces_are_level_rungs_without_diagonals() {
+    fn skate_raft_follows_the_part_and_leans_out() {
+        let mesh = crate::mesh::box_mesh([0.0, 0.0, 0.0], [10.0, 10.0, 8.0]);
+        let raft = skate_raft(&mesh.vertices, &mesh.indices, 1.0, 2.0, 45.0).unwrap();
+        let (min, max) = raft.bounds().unwrap();
+        assert!(
+            min[0] < -1.5,
+            "oversize should pass the outline, min x {}",
+            min[0]
+        );
+        assert!(
+            max[0] > 11.5,
+            "oversize should pass the outline, max x {}",
+            max[0]
+        );
+        assert!(
+            raft.vertices.iter().any(|v| v[2] > 0.8),
+            "the top of the raft is the thickness"
+        );
+        assert!(
+            raft.vertices
+                .iter()
+                .any(|v| v[2] < 0.05 && (v[0] < -0.5 || v[0] > 10.5)),
+            "the leaned wall meets the bed outside the part"
+        );
+    }
+
+    #[test]
+    fn braces_rise_at_45_degrees() {
         let trunks = [
             Trunk {
                 x: 0.0,
@@ -844,23 +1247,28 @@ mod tests {
                 radius: 0.6,
             },
         ];
-        let braces = trunk_braces(&trunks, 12.0, 0.2);
+        let braces = trunk_braces(&trunks, 12.0, 0.2, 45.0);
         let level: Vec<_> = braces
             .iter()
-            .filter(|b| (b.a.z - 6.0).abs() < 0.01)
+            .filter(|b| {
+                let low = b.a.z.min(b.b.z);
+                low > 5.0 && low < 7.0
+            })
             .collect();
         assert_eq!(
             level.len(),
             3,
             "a square of trunks keeps three sides, not both diagonals"
         );
-        let mut heights = std::collections::BTreeSet::new();
+        assert!(braces.len() >= 6, "braces repeat up the trunks");
         for brace in &braces {
-            assert!((brace.a.z - brace.b.z).abs() < 1e-4, "rungs stay level");
-            let len = (brace.a - brace.b).length();
-            assert!(len < 11.0, "diagonal rung of length {len}");
-            heights.insert((brace.a.z * 10.0).round() as i32);
+            let horiz = ((brace.a.x - brace.b.x).powi(2) + (brace.a.y - brace.b.y).powi(2)).sqrt();
+            let rise = (brace.a.z - brace.b.z).abs();
+            let angle = rise.atan2(horiz).to_degrees();
+            assert!(
+                (angle - 45.0).abs() < 1.0,
+                "brace angle {angle}°, rise {rise}, run {horiz}"
+            );
         }
-        assert!(heights.len() >= 2, "rungs repeat up the trunks");
     }
 }

@@ -3,8 +3,9 @@
 use crate::mesh::Mesh;
 use crate::scene::{Document, Selection};
 use crate::supports;
-use glam::{Mat4, Vec3};
+use glam::{Mat3, Mat4, Vec3};
 use glow::HasContext;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 #[derive(Clone)]
@@ -64,94 +65,269 @@ impl Camera {
     }
 }
 
+/// One frame of the plate. Models stay in local space; a move only changes
+/// `model`. The support forest and the bed stay in `world` until the structure
+/// of the plate changes.
 #[derive(Clone)]
-pub struct DrawLists {
-    pub tris: Vec<f32>,
+pub struct PlateFrame {
+    pub world_gen: u64,
+    pub world: Arc<Vec<f32>>,
     pub lines: Vec<f32>,
+    pub line_gen: u64,
+    pub objects: Vec<ObjectFrame>,
+    pub rafts: Vec<RaftFrame>,
 }
 
-pub fn build_draw(doc: &Document, plate: Vec3, selection: Selection) -> DrawLists {
-    let mut tris = Vec::new();
-    let mut lines = Vec::new();
-    push_plate(&mut tris, &mut lines, plate);
-    let raft_top = doc.raft_top();
-    if raft_top > 0.0 {
-        if let Some(raft) = supports::raft_mesh(
-            &doc.supports,
-            doc.raft_margin,
-            doc.raft_mm,
-            doc.style.trunk_mm,
-        ) {
-            push_mesh_flat(&mut tris, &raft, [0.45, 0.38, 0.28]);
+#[derive(Clone)]
+pub struct ObjectFrame {
+    pub id: u64,
+    pub mesh_rev: u64,
+    pub model: Mat4,
+    pub color: [f32; 3],
+    pub local: Arc<Vec<f32>>,
+}
+
+#[derive(Clone)]
+pub struct RaftFrame {
+    pub id: u64,
+    pub key: u64,
+    pub model: Mat4,
+    pub tris: Arc<Vec<f32>>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct RaftKey {
+    mesh_rev: u64,
+    rot: [i32; 3],
+    scale: [i32; 3],
+    thick: i32,
+    margin: i32,
+    angle: i32,
+}
+
+pub struct ViewCache {
+    world_gen: u64,
+    world: Arc<Vec<f32>>,
+    grid_lines: Vec<f32>,
+    locals: HashMap<(u64, u64), Arc<Vec<f32>>>,
+    rafts: HashMap<u64, (RaftKey, Arc<Vec<f32>>)>,
+}
+
+impl ViewCache {
+    pub fn new() -> Self {
+        Self {
+            world_gen: u64::MAX,
+            world: Arc::new(Vec::new()),
+            grid_lines: Vec::new(),
+            locals: HashMap::new(),
+            rafts: HashMap::new(),
         }
     }
-    let forest = supports::forest_mesh(
-        &doc.supports,
-        &doc.style,
-        raft_top,
-        doc.braces_on,
-        doc.brace_dist,
-    );
-    push_mesh_flat(&mut tris, &forest, [0.22, 0.55, 0.52]);
-    if let Selection::Support(id) = selection {
-        if let Some(support) = doc.supports.iter().find(|s| s.id == id) {
-            push_mesh_flat(
-                &mut tris,
-                &supports::tip_marker(support, &doc.style),
-                [0.95, 0.78, 0.35],
+
+    pub fn frame(&mut self, doc: &Document, plate: Vec3, selection: Selection) -> PlateFrame {
+        let world_gen = world_stamp(doc.structure, plate, selection);
+        if world_gen != self.world_gen {
+            let mut tris = Vec::new();
+            let mut lines = Vec::new();
+            push_plate(&mut tris, &mut lines, plate);
+            let forest = supports::forest_mesh(
+                &doc.supports,
+                &doc.style,
+                doc.raft_top(),
+                doc.braces_on,
+                doc.brace_dist,
+                doc.brace_angle,
             );
+            push_mesh_flat(&mut tris, &forest, [0.22, 0.55, 0.52]);
+            if let Selection::Support(id) = selection {
+                if let Some(support) = doc.supports.iter().find(|s| s.id == id) {
+                    push_mesh_flat(
+                        &mut tris,
+                        &supports::tip_marker(support, &doc.style),
+                        [0.95, 0.78, 0.35],
+                    );
+                }
+            }
+            for drain in &doc.drains {
+                let mesh = drain_mesh(drain.origin, drain.axis, drain.radius_mm, drain.depth_mm);
+                let color = if selection == Selection::Drain(drain.id) {
+                    [0.95, 0.45, 0.30]
+                } else {
+                    [0.75, 0.28, 0.22]
+                };
+                push_mesh_flat(&mut tris, &mesh, color);
+            }
+            self.world = Arc::new(tris);
+            self.grid_lines = lines;
+            self.world_gen = world_gen;
         }
-    }
-    for drain in &doc.drains {
-        let mesh = drain_mesh(drain.origin, drain.axis, drain.radius_mm, drain.depth_mm);
-        let color = if selection == Selection::Drain(drain.id) {
-            [0.95, 0.45, 0.30]
-        } else {
-            [0.75, 0.28, 0.22]
-        };
-        push_mesh_flat(&mut tris, &mesh, color);
-    }
-    for obj in &doc.objects {
-        let selected = selection == Selection::Object(obj.id);
-        let outside = Document::world_bounds(obj).is_some_and(|(min, max)| {
-            min.x < -0.2
-                || min.y < -0.2
-                || max.x > plate.x + 0.2
-                || max.y > plate.y + 0.2
-                || max.z > plate.z + 0.2
-        });
-        let color = if outside {
-            [0.72, 0.32, 0.28]
-        } else if selected {
-            [0.93, 0.78, 0.52]
-        } else {
-            [0.76, 0.64, 0.46]
-        };
-        push_object(&mut tris, obj, color);
-        if selected {
-            if let Some((min, max)) = Document::world_bounds(obj) {
-                push_box_lines(&mut lines, min, max, [0.89, 0.63, 0.18]);
+
+        let mut lines = self.grid_lines.clone();
+        let mut objects = Vec::with_capacity(doc.objects.len());
+        let mut rafts = Vec::new();
+        let mut live_locals = HashSet::new();
+        let mut live_rafts = HashSet::new();
+        for obj in &doc.objects {
+            let selected = selection == Selection::Object(obj.id);
+            let outside = Document::display_bounds(obj).is_some_and(|(min, max)| {
+                min.x < -0.2
+                    || min.y < -0.2
+                    || max.x > plate.x + 0.2
+                    || max.y > plate.y + 0.2
+                    || max.z > plate.z + 0.2
+            });
+            let color = if outside {
+                [0.72, 0.32, 0.28]
+            } else if selected {
+                [0.93, 0.78, 0.52]
+            } else {
+                [0.76, 0.64, 0.46]
+            };
+            let local_key = (obj.id, obj.mesh_rev);
+            live_locals.insert(local_key);
+            let local = if let Some(buf) = self.locals.get(&local_key) {
+                buf.clone()
+            } else {
+                let buf = Arc::new(local_tris(&obj.mesh));
+                self.locals.insert(local_key, buf.clone());
+                buf
+            };
+            objects.push(ObjectFrame {
+                id: obj.id,
+                mesh_rev: obj.mesh_rev,
+                model: Document::matrix(obj),
+                color,
+                local,
+            });
+            if selected {
+                if let Some((min, max)) = Document::display_bounds(obj) {
+                    push_box_lines(&mut lines, min, max, [0.89, 0.63, 0.18]);
+                }
+            }
+            if doc.raft {
+                let raft_key = RaftKey {
+                    mesh_rev: obj.mesh_rev,
+                    rot: [
+                        quant(obj.rotation_deg.x),
+                        quant(obj.rotation_deg.y),
+                        quant(obj.rotation_deg.z),
+                    ],
+                    scale: [quant(obj.scale.x), quant(obj.scale.y), quant(obj.scale.z)],
+                    thick: quant(doc.raft_mm),
+                    margin: quant(doc.raft_margin),
+                    angle: quant(doc.raft_angle),
+                };
+                let stale = self
+                    .rafts
+                    .get(&obj.id)
+                    .map(|(key, _)| *key != raft_key)
+                    .unwrap_or(true);
+                if stale {
+                    if let Some(tris) = bake_raft(obj, doc) {
+                        self.rafts.insert(obj.id, (raft_key, Arc::new(tris)));
+                    } else {
+                        self.rafts.remove(&obj.id);
+                    }
+                }
+                if let Some((key, tris)) = self.rafts.get(&obj.id) {
+                    if *key == raft_key {
+                        live_rafts.insert(obj.id);
+                        rafts.push(RaftFrame {
+                            id: obj.id,
+                            key: raft_hash(&raft_key),
+                            model: Mat4::from_translation(Vec3::new(
+                                obj.position.x,
+                                obj.position.y,
+                                0.0,
+                            )),
+                            tris: tris.clone(),
+                        });
+                    }
+                }
             }
         }
+        self.locals.retain(|key, _| live_locals.contains(key));
+        self.rafts.retain(|id, _| live_rafts.contains(id));
+        PlateFrame {
+            world_gen,
+            world: self.world.clone(),
+            lines,
+            line_gen: doc.changed,
+            objects,
+            rafts,
+        }
     }
-    DrawLists { tris, lines }
 }
 
-fn push_object(tris: &mut Vec<f32>, obj: &crate::scene::Object, color: [f32; 3]) {
-    // Every triangle, with one normal shared by the corners that meet there.
-    // Flat shading on a dense sculpt reads as holes. This is the same
-    // area-weighted smooth normal a slicer uses for the solid view.
-    push_transformed(tris, &obj.mesh, Document::matrix(obj), color);
+fn quant(v: f32) -> i32 {
+    (v * 100.0).round() as i32
 }
 
-fn push_transformed(tris: &mut Vec<f32>, mesh: &Mesh, mat: Mat4, color: [f32; 3]) {
-    let normals = smooth_world_normals(mesh, mat);
+fn world_stamp(structure: u64, plate: Vec3, selection: Selection) -> u64 {
+    let sel = match selection {
+        Selection::Support(id) => id.wrapping_add(1),
+        Selection::Drain(id) => id.wrapping_add(0x1000_0001),
+        _ => 0,
+    };
+    let mut h = structure;
+    for n in [
+        quant(plate.x) as u64,
+        quant(plate.y) as u64,
+        quant(plate.z) as u64,
+        sel,
+    ] {
+        h = h.wrapping_mul(0x9E3779B1).wrapping_add(n);
+    }
+    h
+}
+
+fn raft_hash(key: &RaftKey) -> u64 {
+    let mut h = key.mesh_rev;
+    for n in key
+        .rot
+        .into_iter()
+        .chain(key.scale)
+        .chain([key.thick, key.margin, key.angle])
+    {
+        h = h.wrapping_mul(0x9E3779B1).wrapping_add(n as u32 as u64);
+    }
+    h
+}
+
+fn local_tris(mesh: &Mesh) -> Vec<f32> {
+    let normals = smooth_world_normals(mesh, Mat4::IDENTITY);
+    let mut tris = Vec::with_capacity(mesh.indices.len() * 9);
     for tri in mesh.indices.chunks_exact(3) {
         for &index in tri {
             let i = index as usize;
-            let p = mat.transform_point3(Vec3::from_array(mesh.vertices[i]));
-            push_vert(tris, p.to_array(), normals[i], color);
+            if i >= mesh.vertices.len() || i >= normals.len() {
+                continue;
+            }
+            push_vert(&mut tris, mesh.vertices[i], normals[i], [1.0, 1.0, 1.0]);
         }
+    }
+    tris
+}
+
+fn bake_raft(obj: &crate::scene::Object, doc: &Document) -> Option<Vec<f32>> {
+    let world = Document::world_mesh(obj);
+    let mut raft = supports::skate_raft(
+        &world.vertices,
+        &world.indices,
+        doc.raft_mm,
+        doc.raft_margin,
+        doc.raft_angle,
+    )?;
+    for v in &mut raft.vertices {
+        v[0] -= obj.position.x;
+        v[1] -= obj.position.y;
+    }
+    let mut tris = Vec::new();
+    push_mesh_flat(&mut tris, &raft, [0.45, 0.38, 0.28]);
+    if tris.is_empty() {
+        None
+    } else {
+        Some(tris)
     }
 }
 
@@ -300,13 +476,17 @@ layout(location = 0) in vec3 a_pos;
 layout(location = 1) in vec3 a_nrm;
 layout(location = 2) in vec3 a_col;
 uniform mat4 u_mvp;
+uniform mat4 u_model;
+uniform mat4 u_normal;
+uniform vec3 u_color;
+uniform float u_use_color;
 out vec3 v_nrm;
 out vec3 v_col;
 out vec3 v_pos;
 void main() {
-    v_nrm = a_nrm;
-    v_col = a_col;
-    v_pos = a_pos;
+    v_nrm = mat3(u_normal) * a_nrm;
+    v_col = mix(a_col, u_color, u_use_color);
+    v_pos = (u_model * vec4(a_pos, 1.0)).xyz;
     gl_Position = u_mvp * vec4(a_pos, 1.0);
 }
 "#;
@@ -359,14 +539,49 @@ struct Batch {
     count: i32,
 }
 
+struct MeshGpu {
+    batches: Vec<Batch>,
+}
+
+struct ObjectGpu {
+    id: u64,
+    mesh_rev: u64,
+    batches: Vec<Batch>,
+    model: Mat4,
+    color: [f32; 3],
+}
+
+struct RaftGpu {
+    id: u64,
+    key: u64,
+    batches: Vec<Batch>,
+    model: Mat4,
+}
+
+struct SolidLocs {
+    mvp: Option<glow::UniformLocation>,
+    model: Option<glow::UniformLocation>,
+    normal: Option<glow::UniformLocation>,
+    color: Option<glow::UniformLocation>,
+    use_color: Option<glow::UniformLocation>,
+    light: Option<glow::UniformLocation>,
+    fill: Option<glow::UniformLocation>,
+    eye: Option<glow::UniformLocation>,
+}
+
 pub struct Renderer {
     program: glow::Program,
     line_program: glow::Program,
-    batches: Vec<Batch>,
+    locs: SolidLocs,
+    line_mvp: Option<glow::UniformLocation>,
+    world: MeshGpu,
+    world_gen: u64,
+    objects: Vec<ObjectGpu>,
+    rafts: Vec<RaftGpu>,
     line_vao: glow::VertexArray,
     line_vbo: glow::Buffer,
     line_verts: i32,
-    generation: u64,
+    line_gen: u64,
 }
 
 impl Renderer {
@@ -374,74 +589,123 @@ impl Renderer {
         unsafe {
             let program = link(gl, VERT, FRAG)?;
             let line_program = link(gl, LINE_VERT, LINE_FRAG)?;
+            let locs = SolidLocs {
+                mvp: gl.get_uniform_location(program, "u_mvp"),
+                model: gl.get_uniform_location(program, "u_model"),
+                normal: gl.get_uniform_location(program, "u_normal"),
+                color: gl.get_uniform_location(program, "u_color"),
+                use_color: gl.get_uniform_location(program, "u_use_color"),
+                light: gl.get_uniform_location(program, "u_light"),
+                fill: gl.get_uniform_location(program, "u_fill"),
+                eye: gl.get_uniform_location(program, "u_eye"),
+            };
+            let line_mvp = gl.get_uniform_location(line_program, "u_mvp");
             let line_vao = gl.create_vertex_array().map_err(|e| e.to_string())?;
             let line_vbo = gl.create_buffer().map_err(|e| e.to_string())?;
             Ok(Self {
                 program,
                 line_program,
-                batches: Vec::new(),
+                locs,
+                line_mvp,
+                world: MeshGpu {
+                    batches: Vec::new(),
+                },
+                world_gen: u64::MAX,
+                objects: Vec::new(),
+                rafts: Vec::new(),
                 line_vao,
                 line_vbo,
                 line_verts: 0,
-                generation: 0,
+                line_gen: u64::MAX,
             })
         }
     }
 
-    pub fn sync(&mut self, gl: &glow::Context, draw: &DrawLists, generation: u64) {
-        if generation == self.generation && !self.batches.is_empty() {
-            return;
+    pub fn sync(&mut self, gl: &glow::Context, frame: &PlateFrame) {
+        if frame.world_gen != self.world_gen {
+            upload_mesh(gl, &mut self.world.batches, &frame.world);
+            self.world_gen = frame.world_gen;
         }
-        self.generation = generation;
-        // One huge buffer fails on some Windows drivers and the mesh comes
-        // back with holes. Keep each upload under about 25 MB.
-        const CHUNK_VERTS: usize = 600_000;
-        let vert_count = draw.tris.len() / 9;
-        let chunks = if vert_count == 0 {
-            0
-        } else {
-            vert_count.div_ceil(CHUNK_VERTS)
-        };
-        unsafe {
-            while self.batches.len() > chunks {
-                if let Some(batch) = self.batches.pop() {
-                    gl.delete_vertex_array(batch.vao);
-                    gl.delete_buffer(batch.vbo);
-                }
-            }
-            while self.batches.len() < chunks {
-                let Ok(vao) = gl.create_vertex_array() else {
-                    break;
-                };
-                let Ok(vbo) = gl.create_buffer() else {
-                    gl.delete_vertex_array(vao);
-                    break;
-                };
-                self.batches.push(Batch { vao, vbo, count: 0 });
-            }
-            for (i, batch) in self.batches.iter_mut().enumerate() {
-                let start = i * CHUNK_VERTS;
-                let end = ((i + 1) * CHUNK_VERTS).min(vert_count);
+        if frame.line_gen != self.line_gen {
+            unsafe {
                 upload_attrib(
                     gl,
-                    batch.vao,
-                    batch.vbo,
-                    &draw.tris[start * 9..end * 9],
-                    9,
-                    &[(0, 3, 0), (1, 3, 3), (2, 3, 6)],
+                    self.line_vao,
+                    self.line_vbo,
+                    &frame.lines,
+                    6,
+                    &[(0, 3, 0), (1, 3, 3)],
                 );
-                batch.count = (end - start) as i32;
             }
-            upload_attrib(
-                gl,
-                self.line_vao,
-                self.line_vbo,
-                &draw.lines,
-                6,
-                &[(0, 3, 0), (1, 3, 3)],
-            );
+            self.line_verts = (frame.lines.len() / 6) as i32;
+            self.line_gen = frame.line_gen;
         }
-        self.line_verts = (draw.lines.len() / 6) as i32;
+        self.sync_objects(gl, frame);
+        self.sync_rafts(gl, frame);
+    }
+
+    fn sync_objects(&mut self, gl: &glow::Context, frame: &PlateFrame) {
+        let mut next = Vec::with_capacity(frame.objects.len());
+        for obj in &frame.objects {
+            if obj.local.is_empty() {
+                continue;
+            }
+            if let Some(i) = self.objects.iter().position(|gpu| gpu.id == obj.id) {
+                let mut gpu = self.objects.swap_remove(i);
+                if gpu.mesh_rev != obj.mesh_rev {
+                    upload_mesh(gl, &mut gpu.batches, &obj.local);
+                    gpu.mesh_rev = obj.mesh_rev;
+                }
+                gpu.model = obj.model;
+                gpu.color = obj.color;
+                next.push(gpu);
+            } else {
+                let mut batches = Vec::new();
+                upload_mesh(gl, &mut batches, &obj.local);
+                next.push(ObjectGpu {
+                    id: obj.id,
+                    mesh_rev: obj.mesh_rev,
+                    batches,
+                    model: obj.model,
+                    color: obj.color,
+                });
+            }
+        }
+        for gpu in &self.objects {
+            drop_batches(gl, &gpu.batches);
+        }
+        self.objects = next;
+    }
+
+    fn sync_rafts(&mut self, gl: &glow::Context, frame: &PlateFrame) {
+        let mut next = Vec::with_capacity(frame.rafts.len());
+        for raft in &frame.rafts {
+            if raft.tris.is_empty() {
+                continue;
+            }
+            if let Some(i) = self.rafts.iter().position(|gpu| gpu.id == raft.id) {
+                let mut gpu = self.rafts.swap_remove(i);
+                if gpu.key != raft.key {
+                    upload_mesh(gl, &mut gpu.batches, &raft.tris);
+                    gpu.key = raft.key;
+                }
+                gpu.model = raft.model;
+                next.push(gpu);
+            } else {
+                let mut batches = Vec::new();
+                upload_mesh(gl, &mut batches, &raft.tris);
+                next.push(RaftGpu {
+                    id: raft.id,
+                    key: raft.key,
+                    batches,
+                    model: raft.model,
+                });
+            }
+        }
+        for gpu in &self.rafts {
+            drop_batches(gl, &gpu.batches);
+        }
+        self.rafts = next;
     }
 
     pub fn paint(&self, gl: &glow::Context, camera: &Camera, aspect: f32) {
@@ -458,22 +722,27 @@ impl Renderer {
             gl.clear_color(0.11, 0.12, 0.14, 1.0);
             gl.clear(glow::COLOR_BUFFER_BIT | glow::DEPTH_BUFFER_BIT);
             gl.use_program(Some(self.program));
-            let loc = gl.get_uniform_location(self.program, "u_mvp");
-            gl.uniform_matrix_4_f32_slice(loc.as_ref(), false, vp.as_ref());
-            let light = gl.get_uniform_location(self.program, "u_light");
-            gl.uniform_3_f32(light.as_ref(), 0.35, -0.25, 0.90);
-            let fill = gl.get_uniform_location(self.program, "u_fill");
-            gl.uniform_3_f32(fill.as_ref(), -0.4, 0.6, 0.2);
-            let eye_loc = gl.get_uniform_location(self.program, "u_eye");
-            gl.uniform_3_f32(eye_loc.as_ref(), eye.x, eye.y, eye.z);
-            for batch in &self.batches {
-                gl.bind_vertex_array(Some(batch.vao));
-                gl.draw_arrays(glow::TRIANGLES, 0, batch.count);
+            gl.uniform_3_f32(self.locs.light.as_ref(), 0.35, -0.25, 0.90);
+            gl.uniform_3_f32(self.locs.fill.as_ref(), -0.4, 0.6, 0.2);
+            gl.uniform_3_f32(self.locs.eye.as_ref(), eye.x, eye.y, eye.z);
+            self.draw_solid(
+                gl,
+                &self.world.batches,
+                Mat4::IDENTITY,
+                [1.0, 1.0, 1.0],
+                0.0,
+                vp,
+            );
+            let raft_color = [0.45, 0.38, 0.28];
+            for raft in &self.rafts {
+                self.draw_solid(gl, &raft.batches, raft.model, raft_color, 0.0, vp);
+            }
+            for obj in &self.objects {
+                self.draw_solid(gl, &obj.batches, obj.model, obj.color, 1.0, vp);
             }
 
             gl.use_program(Some(self.line_program));
-            let loc = gl.get_uniform_location(self.line_program, "u_mvp");
-            gl.uniform_matrix_4_f32_slice(loc.as_ref(), false, vp.as_ref());
+            gl.uniform_matrix_4_f32_slice(self.line_mvp.as_ref(), false, vp.as_ref());
             gl.bind_vertex_array(Some(self.line_vao));
             gl.draw_arrays(glow::LINES, 0, self.line_verts);
             gl.bind_vertex_array(None);
@@ -481,16 +750,102 @@ impl Renderer {
         }
     }
 
+    fn draw_solid(
+        &self,
+        gl: &glow::Context,
+        batches: &[Batch],
+        model: Mat4,
+        color: [f32; 3],
+        use_color: f32,
+        vp: Mat4,
+    ) {
+        unsafe {
+            let mvp = vp * model;
+            let normal = normal_matrix(model);
+            gl.uniform_matrix_4_f32_slice(self.locs.mvp.as_ref(), false, mvp.as_ref());
+            gl.uniform_matrix_4_f32_slice(self.locs.model.as_ref(), false, model.as_ref());
+            gl.uniform_matrix_4_f32_slice(self.locs.normal.as_ref(), false, normal.as_ref());
+            gl.uniform_3_f32(self.locs.color.as_ref(), color[0], color[1], color[2]);
+            gl.uniform_1_f32(self.locs.use_color.as_ref(), use_color);
+            for batch in batches {
+                gl.bind_vertex_array(Some(batch.vao));
+                gl.draw_arrays(glow::TRIANGLES, 0, batch.count);
+            }
+        }
+    }
+
     pub fn destroy(&self, gl: &glow::Context) {
         unsafe {
             gl.delete_program(self.program);
             gl.delete_program(self.line_program);
-            for batch in &self.batches {
-                gl.delete_vertex_array(batch.vao);
-                gl.delete_buffer(batch.vbo);
+            drop_batches(gl, &self.world.batches);
+            for obj in &self.objects {
+                drop_batches(gl, &obj.batches);
+            }
+            for raft in &self.rafts {
+                drop_batches(gl, &raft.batches);
             }
             gl.delete_vertex_array(self.line_vao);
             gl.delete_buffer(self.line_vbo);
+        }
+    }
+}
+
+fn normal_matrix(model: Mat4) -> Mat4 {
+    let m = Mat3::from_mat4(model);
+    if m.determinant().abs() < 1e-8 {
+        return Mat4::IDENTITY;
+    }
+    Mat4::from_mat3(m.inverse().transpose())
+}
+
+const CHUNK_VERTS: usize = 600_000;
+
+fn upload_mesh(gl: &glow::Context, batches: &mut Vec<Batch>, data: &[f32]) {
+    let vert_count = data.len() / 9;
+    let chunks = if vert_count == 0 {
+        0
+    } else {
+        vert_count.div_ceil(CHUNK_VERTS)
+    };
+    unsafe {
+        while batches.len() > chunks {
+            if let Some(batch) = batches.pop() {
+                gl.delete_vertex_array(batch.vao);
+                gl.delete_buffer(batch.vbo);
+            }
+        }
+        while batches.len() < chunks {
+            let Ok(vao) = gl.create_vertex_array() else {
+                break;
+            };
+            let Ok(vbo) = gl.create_buffer() else {
+                gl.delete_vertex_array(vao);
+                break;
+            };
+            batches.push(Batch { vao, vbo, count: 0 });
+        }
+        for (i, batch) in batches.iter_mut().enumerate() {
+            let start = i * CHUNK_VERTS;
+            let end = ((i + 1) * CHUNK_VERTS).min(vert_count);
+            upload_attrib(
+                gl,
+                batch.vao,
+                batch.vbo,
+                &data[start * 9..end * 9],
+                9,
+                &[(0, 3, 0), (1, 3, 3), (2, 3, 6)],
+            );
+            batch.count = (end - start) as i32;
+        }
+    }
+}
+
+fn drop_batches(gl: &glow::Context, batches: &[Batch]) {
+    unsafe {
+        for batch in batches {
+            gl.delete_vertex_array(batch.vao);
+            gl.delete_buffer(batch.vbo);
         }
     }
 }

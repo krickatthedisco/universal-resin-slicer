@@ -23,6 +23,12 @@ pub struct Object {
     pub infill_gyroid: bool,
     pub infill_spacing_mm: f32,
     pub infill_thickness_mm: f32,
+    /// Bumped when the mesh data itself changes, so the plate view can keep
+    /// the vertex buffer and only resend it then.
+    pub mesh_rev: u64,
+    /// Local-space bounding box, cached so a move does not scan the sculpt.
+    pub bounds_min: [f32; 3],
+    pub bounds_max: [f32; 3],
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -49,7 +55,11 @@ enum Undo {
         rotation_deg: Vec3,
         scale: Vec3,
     },
-    Supports(Vec<Support>),
+    Supports {
+        list: Vec<Support>,
+        /// Positions from before a support pass lifted these models.
+        lifted: Vec<(u64, Vec3)>,
+    },
     Drains(Vec<DrainHole>),
     Deleted(Object),
     Added(u64),
@@ -65,12 +75,20 @@ pub struct Document {
     pub raft_margin: f32,
     pub braces_on: bool,
     pub brace_dist: f32,
+    /// Lean of a cross-brace above the bed. 45° is the usual resin brace.
+    pub brace_angle: f32,
     pub preset: usize,
     pub style: SupportStyle,
     pub platform_only: bool,
+    /// How far above the bed a part sits after supports are added.
+    pub support_lift_mm: f32,
+    /// Skate-raft wall, measured from vertical. 0 is a straight edge.
+    pub raft_angle: f32,
     next_id: u64,
     undo: Vec<Undo>,
     pub changed: u64,
+    /// Bumped for supports, meshes, and raft settings. A plain move does not.
+    pub structure: u64,
 }
 
 impl Document {
@@ -85,16 +103,26 @@ impl Document {
             raft_margin: 2.0,
             braces_on: true,
             brace_dist: 8.0,
+            brace_angle: 45.0,
             preset: 1,
             style: supports::PRESETS[1].style,
             platform_only: false,
+            support_lift_mm: 5.0,
+            raft_angle: 30.0,
             next_id: 1,
             undo: Vec::new(),
             changed: 1,
+            structure: 1,
         }
     }
 
     pub fn touch(&mut self) {
+        self.changed = self.changed.wrapping_add(1);
+        self.structure = self.structure.wrapping_add(1);
+    }
+
+    /// A move, rotate, or scale. The sculpt's vertex buffer can stay put.
+    pub fn touch_xform(&mut self) {
         self.changed = self.changed.wrapping_add(1);
     }
 
@@ -127,7 +155,13 @@ impl Document {
             infill_gyroid: false,
             infill_spacing_mm: 4.0,
             infill_thickness_mm: 0.6,
+            mesh_rev: 1,
+            bounds_min: [0.0; 3],
+            bounds_max: [0.0; 3],
         });
+        if let Some(obj) = self.objects.last_mut() {
+            cache_bounds(obj);
+        }
         self.undo.push(Undo::Added(id));
         self.selection = Selection::Object(id);
         self.touch();
@@ -192,6 +226,33 @@ impl Document {
         Some((Vec3::from_array(min), Vec3::from_array(max)))
     }
 
+    /// Eight corners of the cached local bounds, after the transform.
+    pub fn display_bounds(obj: &Object) -> Option<(Vec3, Vec3)> {
+        if obj.mesh.vertices.is_empty() {
+            return None;
+        }
+        let min = obj.bounds_min;
+        let max = obj.bounds_max;
+        let mat = Self::matrix(obj);
+        let mut lo = Vec3::splat(f32::MAX);
+        let mut hi = Vec3::splat(f32::MIN);
+        for ix in 0..2 {
+            for iy in 0..2 {
+                for iz in 0..2 {
+                    let p = Vec3::new(
+                        if ix == 0 { min[0] } else { max[0] },
+                        if iy == 0 { min[1] } else { max[1] },
+                        if iz == 0 { min[2] } else { max[2] },
+                    );
+                    let w = mat.transform_point3(p);
+                    lo = lo.min(w);
+                    hi = hi.max(w);
+                }
+            }
+        }
+        Some((lo, hi))
+    }
+
     pub fn push_xform_undo(&mut self, id: u64) {
         if let Some(obj) = self.object(id) {
             self.remember_xform(id, obj.position, obj.rotation_deg, obj.scale);
@@ -227,7 +288,14 @@ impl Document {
                     obj.scale = scale;
                 }
             }
-            Undo::Supports(list) => self.supports = list,
+            Undo::Supports { list, lifted } => {
+                self.supports = list;
+                for (id, position) in lifted {
+                    if let Some(obj) = self.object_mut(id) {
+                        obj.position = position;
+                    }
+                }
+            }
             Undo::Drains(list) => self.drains = list,
             Undo::Deleted(obj) => {
                 self.selection = Selection::Object(obj.id);
@@ -250,7 +318,7 @@ impl Document {
         if let Some(obj) = self.object_mut(id) {
             obj.position.z -= min.z;
         }
-        self.touch();
+        self.touch_xform();
     }
 
     pub fn center_object(&mut self, id: u64) {
@@ -272,7 +340,7 @@ impl Document {
             obj.position.x += dx;
             obj.position.y += dy;
         }
-        self.touch();
+        self.touch_xform();
     }
 
     pub fn duplicate(&mut self, id: u64) -> Option<u64> {
@@ -300,7 +368,10 @@ impl Document {
                 }
             }
             Selection::Support(id) => {
-                self.undo.push(Undo::Supports(self.supports.clone()));
+                self.undo.push(Undo::Supports {
+                    list: self.supports.clone(),
+                    lifted: Vec::new(),
+                });
                 self.supports.retain(|s| s.id != id);
                 self.selection = Selection::None;
                 self.touch();
@@ -318,6 +389,7 @@ impl Document {
     pub fn flip_normals(&mut self, id: u64) {
         if let Some(obj) = self.object_mut(id) {
             obj.mesh.flip_winding();
+            obj.mesh_rev = obj.mesh_rev.wrapping_add(1);
         }
         self.touch();
     }
@@ -331,7 +403,7 @@ impl Document {
                 _ => obj.scale.z = -obj.scale.z,
             }
         }
-        self.touch();
+        self.touch_xform();
     }
 
     pub fn place_on_largest_face(&mut self, id: u64) {
@@ -350,6 +422,8 @@ impl Document {
     pub fn repair(&mut self, id: u64) {
         if let Some(obj) = self.object_mut(id) {
             obj.mesh.repair();
+            obj.mesh_rev = obj.mesh_rev.wrapping_add(1);
+            cache_bounds(obj);
         }
         self.touch();
     }
@@ -458,7 +532,7 @@ impl Document {
         if let Some(obj) = self.object_mut(id) {
             obj.rotation_deg = Vec3::new(x.to_degrees(), y.to_degrees(), z.to_degrees());
         }
-        self.touch();
+        self.touch_xform();
     }
 
     pub fn auto_layout(&mut self, plate_x: f32, plate_y: f32) {
@@ -503,12 +577,12 @@ impl Document {
             row_h = row_h.max(h);
             let _ = plate_y;
         }
-        self.touch();
+        self.touch_xform();
     }
 
     pub fn outside_plate(&self, plate: Vec3) -> bool {
         self.objects.iter().any(|obj| {
-            Self::world_bounds(obj).is_some_and(|(min, max)| {
+            Self::display_bounds(obj).is_some_and(|(min, max)| {
                 min.x < -0.05
                     || min.y < -0.05
                     || max.x > plate.x + 0.05
@@ -520,16 +594,21 @@ impl Document {
     }
 
     pub fn add_auto_supports(&mut self, only_selected: bool) {
-        self.undo.push(Undo::Supports(self.supports.clone()));
         let style = self.style;
         let platform_only = self.platform_only;
+        let lift = self.support_lift_mm.max(0.0);
         let ids: Vec<u64> = if only_selected {
             self.selected_object().map(|o| o.id).into_iter().collect()
         } else {
             self.objects.iter().map(|o| o.id).collect()
         };
+        let list = self.supports.clone();
+        let mut lifted = Vec::new();
         for id in ids {
-            let Some(obj) = self.object(id) else { continue };
+            let previous = self.raise_bottom(id, lift);
+            let Some(obj) = self.object(id) else {
+                continue;
+            };
             let world = Self::world_mesh(obj);
             let mut id_gen = self.next_id;
             let found = supports::auto_supports(
@@ -540,7 +619,21 @@ impl Document {
                 &mut id_gen,
             );
             self.next_id = id_gen;
+            if found.is_empty() {
+                if let Some(position) = previous {
+                    if let Some(obj) = self.object_mut(id) {
+                        obj.position = position;
+                    }
+                }
+                continue;
+            }
+            if let Some(position) = previous {
+                lifted.push((id, position));
+            }
             self.supports.extend(found);
+        }
+        if self.supports.len() != list.len() || !lifted.is_empty() {
+            self.undo.push(Undo::Supports { list, lifted });
         }
         self.touch();
     }
@@ -550,7 +643,10 @@ impl Document {
             return;
         };
         let world = Self::world_mesh(obj);
-        self.undo.push(Undo::Supports(self.supports.clone()));
+        self.undo.push(Undo::Supports {
+            list: self.supports.clone(),
+            lifted: Vec::new(),
+        });
         let id = self.alloc();
         let support = supports::manual_support(
             point.x,
@@ -570,7 +666,10 @@ impl Document {
         if islands.is_empty() {
             return;
         }
-        self.undo.push(Undo::Supports(self.supports.clone()));
+        self.undo.push(Undo::Supports {
+            list: self.supports.clone(),
+            lifted: Vec::new(),
+        });
         let platform_only = self.platform_only;
         // Hit-testing the whole scene is enough to land the foot.
         let mut verts = Vec::new();
@@ -600,9 +699,29 @@ impl Document {
         if self.supports.is_empty() {
             return;
         }
-        self.undo.push(Undo::Supports(self.supports.clone()));
+        self.undo.push(Undo::Supports {
+            list: self.supports.clone(),
+            lifted: Vec::new(),
+        });
         self.supports.clear();
         self.touch();
+    }
+
+    /// Raise the part until its lowest point is `lift` above the bed.
+    /// A second support pass does not stack another lift on top.
+    fn raise_bottom(&mut self, id: u64, lift: f32) -> Option<Vec3> {
+        if lift <= 0.05 {
+            return None;
+        }
+        let (min, _) = Self::world_bounds(self.object(id)?)?;
+        let gap = lift - min.z;
+        if gap <= 0.05 {
+            return None;
+        }
+        let obj = self.object_mut(id)?;
+        let previous = obj.position;
+        obj.position.z += gap;
+        Some(previous)
     }
 
     pub fn add_drain(&mut self, origin: Vec3, into_model: Vec3) {
@@ -625,8 +744,8 @@ impl Document {
     }
 
     pub fn raft_top(&self) -> f32 {
-        if self.raft && self.supports.iter().any(|s| s.z_base <= 0.2) {
-            self.raft_mm
+        if self.raft && !self.objects.is_empty() {
+            self.raft_mm.max(0.2)
         } else {
             0.0
         }
@@ -655,6 +774,21 @@ impl Document {
             } else {
                 None
             };
+            if self.raft {
+                if let Some(raft) = supports::skate_raft(
+                    &world.vertices,
+                    &world.indices,
+                    self.raft_mm,
+                    self.raft_margin,
+                    self.raft_angle,
+                ) {
+                    solids.push(Solid {
+                        vertices: raft.vertices,
+                        indices: raft.indices,
+                        hollow: None,
+                    });
+                }
+            }
             solids.push(Solid {
                 vertices: world.vertices,
                 indices: world.indices,
@@ -662,26 +796,13 @@ impl Document {
             });
         }
         let raft_top = self.raft_top();
-        if raft_top > 0.0 {
-            if let Some(raft) = supports::raft_mesh(
-                &self.supports,
-                self.raft_margin,
-                self.raft_mm,
-                self.style.trunk_mm,
-            ) {
-                solids.push(Solid {
-                    vertices: raft.vertices,
-                    indices: raft.indices,
-                    hollow: None,
-                });
-            }
-        }
         let forest = supports::forest_mesh(
             &self.supports,
             &self.style,
             raft_top,
             self.braces_on,
             self.brace_dist,
+            self.brace_angle,
         );
         if forest.triangle_count() > 0 {
             solids.push(Solid {
@@ -728,6 +849,13 @@ impl Document {
 impl Default for Document {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+fn cache_bounds(obj: &mut Object) {
+    if let Some((min, max)) = obj.mesh.bounds() {
+        obj.bounds_min = min;
+        obj.bounds_max = max;
     }
 }
 
@@ -818,5 +946,22 @@ mod tests {
         let added = doc.fill_bed(id, 100.0, 50.0).unwrap();
         assert_eq!(added, 7);
         assert_eq!(doc.objects.len(), 8);
+    }
+
+    #[test]
+    fn supporting_a_part_lifts_it_once() {
+        let mut doc = Document::new();
+        let id = doc.add_mesh("box".into(), box_mesh([0.0, 0.0, 0.0], [10.0, 10.0, 4.0]));
+        doc.support_lift_mm = 5.0;
+        doc.add_auto_supports(true);
+        let (min, _) = Document::world_bounds(doc.object(id).unwrap()).unwrap();
+        assert!(min.z >= 4.9 && min.z <= 5.2, "bottom at {}", min.z);
+        doc.add_auto_supports(true);
+        let (again, _) = Document::world_bounds(doc.object(id).unwrap()).unwrap();
+        assert!(again.z <= 5.2, "second pass stacked to {}", again.z);
+        doc.undo();
+        doc.undo();
+        let (back, _) = Document::world_bounds(doc.object(id).unwrap()).unwrap();
+        assert!(back.z < 0.2, "undo should drop it back, {}", back.z);
     }
 }

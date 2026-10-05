@@ -10,7 +10,7 @@ use crate::scene::{Document, Selection};
 use crate::sl1::write_sl1;
 use crate::slice::{self, Slice};
 use crate::supports::PRESETS;
-use crate::viewport::{self, Camera, DrawLists, Renderer};
+use crate::viewport::{self, Camera, PlateFrame, Renderer, ViewCache};
 use eframe::egui;
 use glam::Vec3;
 use glow::HasContext;
@@ -54,6 +54,30 @@ fn default_true() -> bool {
     true
 }
 
+fn default_lift() -> f32 {
+    5.0
+}
+
+fn default_raft_mm() -> f32 {
+    1.0
+}
+
+fn default_raft_margin() -> f32 {
+    2.0
+}
+
+fn default_raft_angle() -> f32 {
+    30.0
+}
+
+fn default_brace_angle() -> f32 {
+    45.0
+}
+
+fn default_brace_dist() -> f32 {
+    8.0
+}
+
 #[derive(Serialize, Deserialize)]
 struct Persist {
     settings: PrintSettings,
@@ -62,6 +86,20 @@ struct Persist {
     mirror_y: bool,
     preset: usize,
     raft: bool,
+    #[serde(default = "default_raft_mm")]
+    raft_mm: f32,
+    #[serde(default = "default_raft_margin")]
+    raft_margin: f32,
+    #[serde(default = "default_raft_angle")]
+    raft_angle: f32,
+    #[serde(default = "default_true")]
+    braces_on: bool,
+    #[serde(default = "default_brace_dist")]
+    brace_dist: f32,
+    #[serde(default = "default_brace_angle")]
+    brace_angle: f32,
+    #[serde(default = "default_lift")]
+    support_lift_mm: f32,
     #[serde(default)]
     style: Option<crate::supports::SupportStyle>,
     #[serde(default)]
@@ -82,7 +120,8 @@ pub struct AmberApp {
     tool: Tool,
     view: View,
     renderer: Option<viewport::SharedRenderer>,
-    draw: Option<Arc<DrawLists>>,
+    view_cache: ViewCache,
+    frame: Option<PlateFrame>,
     draw_gen: u64,
     status: String,
     job: Option<Job>,
@@ -107,6 +146,13 @@ impl AmberApp {
         let mut settings = PrintSettings::default();
         let mut preset = 1usize;
         let mut raft = true;
+        let mut raft_mm = 1.0;
+        let mut raft_margin = 2.0;
+        let mut raft_angle = 30.0;
+        let mut braces_on = true;
+        let mut brace_dist = 8.0;
+        let mut brace_angle = 45.0;
+        let mut support_lift_mm = 5.0;
         let mut saved_style = None;
         let mut platform_only = false;
         let mut only_profiled = true;
@@ -122,6 +168,13 @@ impl AmberApp {
                     machine.mirror_y = saved.mirror_y;
                     preset = saved.preset;
                     raft = saved.raft;
+                    raft_mm = saved.raft_mm;
+                    raft_margin = saved.raft_margin;
+                    raft_angle = saved.raft_angle;
+                    braces_on = saved.braces_on;
+                    brace_dist = saved.brace_dist;
+                    brace_angle = saved.brace_angle;
+                    support_lift_mm = saved.support_lift_mm;
                     saved_style = saved.style;
                     platform_only = saved.platform_only;
                     only_profiled = saved.only_profiled;
@@ -134,6 +187,13 @@ impl AmberApp {
             doc.style = style.sanitized();
         }
         doc.raft = raft;
+        doc.raft_mm = raft_mm;
+        doc.raft_margin = raft_margin;
+        doc.raft_angle = raft_angle;
+        doc.braces_on = braces_on;
+        doc.brace_dist = brace_dist;
+        doc.brace_angle = brace_angle;
+        doc.support_lift_mm = support_lift_mm;
         doc.platform_only = platform_only;
         let plate = Vec3::new(machine.size_x, machine.size_y, machine.size_z);
         let mut gpu_note = None;
@@ -160,7 +220,8 @@ impl AmberApp {
             tool: Tool::Select,
             view: View::Prepare,
             renderer,
-            draw: None,
+            view_cache: ViewCache::new(),
+            frame: None,
             draw_gen: 0,
             status: gpu_note.unwrap_or(startup),
             job: None,
@@ -468,6 +529,13 @@ impl eframe::App for AmberApp {
             mirror_y: self.machine.mirror_y,
             preset: self.doc.preset,
             raft: self.doc.raft,
+            raft_mm: self.doc.raft_mm,
+            raft_margin: self.doc.raft_margin,
+            raft_angle: self.doc.raft_angle,
+            braces_on: self.doc.braces_on,
+            brace_dist: self.doc.brace_dist,
+            brace_angle: self.doc.brace_angle,
+            support_lift_mm: self.doc.support_lift_mm,
             style: Some(self.doc.style),
             platform_only: self.doc.platform_only,
             machine_id: self.machine.id.to_string(),
@@ -496,12 +564,11 @@ impl eframe::App for AmberApp {
         for file in ctx.input(|i| i.raw.dropped_files.clone()) {
             self.import_path(file.path().to_path_buf());
         }
-        if self.draw_gen != self.doc.changed || self.draw.is_none() {
-            self.draw = Some(Arc::new(viewport::build_draw(
-                &self.doc,
-                self.plate(),
-                self.doc.selection,
-            )));
+        if self.draw_gen != self.doc.changed || self.frame.is_none() {
+            self.frame = Some(
+                self.view_cache
+                    .frame(&self.doc, self.plate(), self.doc.selection),
+            );
             self.draw_gen = self.doc.changed;
         }
 
@@ -652,7 +719,7 @@ impl AmberApp {
             (
                 Tool::Select,
                 "Select",
-                "Click a model. Right-drag orbits: drag right to turn the plate right. Shift-drag or middle-drag pans.",
+                "Click a model. Left-drag moves it in X and Y. Right-drag orbits: drag right turns the plate right. Shift-drag or middle-drag pans.",
             ),
             (
                 Tool::Move,
@@ -735,7 +802,7 @@ impl AmberApp {
         }
         if let Some(sel) = select {
             self.doc.selection = sel;
-            self.doc.touch();
+            self.doc.touch_xform();
         }
         if !self.doc.supports.is_empty() {
             ui.add_space(4.0);
@@ -801,13 +868,14 @@ impl AmberApp {
                     }
                 }
             }
-            self.doc.touch();
+            self.doc.touch_xform();
             self.invalidate_slice();
         }
     }
 
     fn select_ui(&mut self, ui: &mut egui::Ui) {
         ui.heading("Select");
+        ui.label("Left-drag moves the selected model in X and Y. Right-drag orbits the plate.");
         let Selection::Object(id) = self.doc.selection else {
             ui.label("Click a model on the plate, or pick one in the list.");
             self.arrange_ui(ui);
@@ -902,7 +970,7 @@ impl AmberApp {
             if let Some(obj) = self.doc.object_mut(id) {
                 obj.scale = Vec3::ONE;
             }
-            self.doc.touch();
+            self.doc.touch_xform();
             self.invalidate_slice();
         }
         self.size_label(ui, id);
@@ -1038,7 +1106,7 @@ impl AmberApp {
         });
         ui.label("Drain tool punches a hole through the shell. Place one near the lowest point of a cup.");
         if changed {
-            self.doc.touch();
+            self.doc.touch_xform();
             self.invalidate_slice();
         }
     }
@@ -1158,6 +1226,15 @@ impl AmberApp {
             "mm",
         );
         changed |= drag_f32(ui, "Foot height", &mut style.foot_mm, 0.02, 0.2, 3.0, "mm");
+        let mut foot_diam = if style.foot_diam_mm > 0.05 {
+            style.foot_diam_mm
+        } else {
+            style.trunk_mm * 2.1
+        };
+        if drag_f32(ui, "Foot diameter", &mut foot_diam, 0.02, 0.4, 8.0, "mm") {
+            style.foot_diam_mm = foot_diam;
+            changed = true;
+        }
         changed |= drag_f32(
             ui,
             "Brace diameter",
@@ -1201,21 +1278,36 @@ impl AmberApp {
                 self.invalidate_slice();
             }
         });
+        let mut lift = self.doc.support_lift_mm;
+        if drag_f32(ui, "Lift above bed", &mut lift, 0.05, 0.0, 40.0, "mm") {
+            self.doc.support_lift_mm = lift;
+        }
+        ui.label("Adding supports raises the part until its lowest point is this far above the bed. A second pass does not stack another lift. 0 leaves it where it is.");
         let mut raft = self.doc.raft;
         let mut braces = self.doc.braces_on;
         let mut raft_mm = self.doc.raft_mm;
+        let mut raft_margin = self.doc.raft_margin;
+        let mut raft_angle = self.doc.raft_angle;
         let mut brace_dist = self.doc.brace_dist;
+        let mut brace_angle = self.doc.brace_angle;
         let mut raft_changed = false;
-        raft_changed |= ui.checkbox(&mut raft, "Raft").changed();
-        raft_changed |= drag_f32(ui, "Raft thickness", &mut raft_mm, 0.05, 0.4, 3.0, "mm");
-        raft_changed |= ui.checkbox(&mut braces, "Horizontal braces").changed();
+        raft_changed |= ui.checkbox(&mut raft, "Skate raft").changed();
+        raft_changed |= drag_f32(ui, "Raft thickness", &mut raft_mm, 0.05, 0.2, 5.0, "mm");
+        raft_changed |= drag_f32(ui, "Raft oversize", &mut raft_margin, 0.05, 0.0, 20.0, "mm");
+        raft_changed |= drag_f32(ui, "Raft wall angle", &mut raft_angle, 0.5, 0.0, 70.0, "°");
+        ui.label("Each part gets its own skate in the shape of its outline. Oversize grows that outline. The wall leans out from vertical by the angle, so the base is wider than the top.");
+        raft_changed |= ui.checkbox(&mut braces, "Diagonal braces").changed();
+        raft_changed |= drag_f32(ui, "Brace angle", &mut brace_angle, 0.5, 15.0, 75.0, "°");
         raft_changed |= drag_f32(ui, "Brace spacing", &mut brace_dist, 0.1, 2.0, 20.0, "mm");
-        ui.label("Braces are level rungs. Spacing is both the gap between rungs and the farthest two trunks a rung will join.");
+        ui.label("Braces join nearby trunks and rise at this angle to the bed. 45° is the usual lean. Spacing is the gap between brace layers and the farthest two trunks a brace will join.");
         if raft_changed {
             self.doc.raft = raft;
             self.doc.raft_mm = raft_mm;
+            self.doc.raft_margin = raft_margin;
+            self.doc.raft_angle = raft_angle;
             self.doc.braces_on = braces;
             self.doc.brace_dist = brace_dist;
+            self.doc.brace_angle = brace_angle;
             self.doc.touch();
             self.invalidate_slice();
         }
@@ -1599,8 +1691,16 @@ impl AmberApp {
                     (self.camera.distance * (-scroll * 0.0015).exp()).clamp(30.0, 2500.0);
             }
         }
+        let shift = ui.input(|i| i.modifiers.shift);
+        let select_move = self.tool == Tool::Select
+            && matches!(self.doc.selection, Selection::Object(_))
+            && response.dragged_by(egui::PointerButton::Primary)
+            && !shift;
         if response.dragged_by(egui::PointerButton::Secondary)
-            || (response.dragged_by(egui::PointerButton::Primary) && self.tool == Tool::Select)
+            || (response.dragged_by(egui::PointerButton::Primary)
+                && self.tool == Tool::Select
+                && !select_move
+                && !shift)
         {
             let d = response.drag_delta();
             // Dragging right turns the plate to the right, the same way a
@@ -1610,14 +1710,14 @@ impl AmberApp {
         }
         if response.dragged_by(egui::PointerButton::Middle)
             || (response.dragged_by(egui::PointerButton::Primary)
-                && ui.input(|i| i.modifiers.shift)
+                && shift
                 && self.tool == Tool::Select)
         {
             let d = response.drag_delta();
             self.camera.pan(d.x, d.y);
         }
         if response.dragged_by(egui::PointerButton::Primary)
-            && matches!(self.tool, Tool::Move | Tool::Rotate | Tool::Scale)
+            && (matches!(self.tool, Tool::Move | Tool::Rotate | Tool::Scale) || select_move)
         {
             self.drag_transform(&response);
         }
@@ -1646,9 +1746,8 @@ impl AmberApp {
             );
             return;
         };
-        let draw = self.draw.clone();
+        let frame = self.frame.clone();
         let camera = self.camera.clone();
-        let generation = self.draw_gen;
         let aspect = (rect.width() / rect.height().max(1.0)).clamp(0.2, 5.0);
         let callback = egui::PaintCallback {
             rect,
@@ -1666,8 +1765,8 @@ impl AmberApp {
                 let Ok(mut gpu) = renderer.lock() else {
                     return;
                 };
-                if let Some(draw) = &draw {
-                    gpu.sync(gl, draw, generation);
+                if let Some(frame) = &frame {
+                    gpu.sync(gl, frame);
                 }
                 gpu.paint(gl, &camera, aspect);
             })),
@@ -1695,7 +1794,7 @@ impl AmberApp {
         }
         let aspect = (response.rect.width() / response.rect.height().max(1.0)).clamp(0.2, 5.0);
         match self.tool {
-            Tool::Move => {
+            Tool::Move | Tool::Select => {
                 let shift = response.ctx.input(|i| i.modifiers.shift);
                 if shift {
                     if let Some(obj) = self.doc.object_mut(id) {
@@ -1737,7 +1836,7 @@ impl AmberApp {
             }
             _ => {}
         }
-        self.doc.touch();
+        self.doc.touch_xform();
         self.invalidate_slice();
     }
 
@@ -1768,7 +1867,7 @@ impl AmberApp {
                 } else {
                     self.doc.selection = Selection::None;
                 }
-                self.doc.touch();
+                self.doc.touch_xform();
             }
         }
     }
