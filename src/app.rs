@@ -140,6 +140,8 @@ pub struct AmberApp {
     resin_filter: String,
     profile_note: String,
     only_profiled: bool,
+    part_menu: Option<egui::Pos2>,
+    part_menu_fresh: bool,
 }
 
 impl AmberApp {
@@ -240,6 +242,8 @@ impl AmberApp {
             resin_filter: String::new(),
             profile_note: String::new(),
             only_profiled,
+            part_menu: None,
+            part_menu_fresh: false,
         }
     }
 
@@ -579,13 +583,14 @@ impl eframe::App for AmberApp {
         egui::Panel::bottom("status").show(ui, |ui| self.status_bar(ui));
         egui::Panel::left("tools")
             .resizable(false)
-            .exact_size(76.0)
+            .exact_size(104.0)
             .show(ui, |ui| self.tool_rail(ui));
         egui::Panel::right("props")
             .resizable(true)
             .default_size(332.0)
             .show(ui, |ui| self.props_panel(ui));
         egui::CentralPanel::default().show(ui, |ui| self.center(ui));
+        self.show_part_menu(&ctx);
     }
 }
 
@@ -641,6 +646,10 @@ impl AmberApp {
                 if ui.button("Front").clicked() {
                     self.camera.pitch = 8.0;
                     self.camera.yaw = 0.0;
+                    ui.close();
+                }
+                if ui.button("Below the bed").clicked() {
+                    self.camera.pitch = -55.0;
                     ui.close();
                 }
                 if ui.button("Right").clicked() {
@@ -722,7 +731,7 @@ impl AmberApp {
             (
                 Tool::Select,
                 "Select",
-                "Click a model. Left-drag moves it in X and Y. Right-drag orbits: drag right turns the plate right. Shift-drag or middle-drag pans.",
+                "Click a model. Left-drag moves it in X and Y. Right-drag orbits, including under the bed. A right-click opens the model menu. Shift-drag or middle-drag pans.",
             ),
             (
                 Tool::Move,
@@ -739,7 +748,7 @@ impl AmberApp {
             (
                 Tool::Hollow,
                 "Hollow",
-                "Shell the selected model when it slices.",
+                "Hollow the selected model. The inside stays empty so resin can drain.",
             ),
             (
                 Tool::Drain,
@@ -749,11 +758,11 @@ impl AmberApp {
             (
                 Tool::Support,
                 "Support",
-                "Click an underside to plant a tree support.",
+                "Click an underside to plant a support on that model. Orbit under the bed and the plate turns clear.",
             ),
         ] {
             let on = self.tool == tool;
-            let button = egui::Button::new(label).min_size(egui::vec2(64.0, 32.0));
+            let button = egui::Button::new(label).min_size(egui::vec2(88.0, 32.0));
             let response = ui.add(if on {
                 button.fill(egui::Color32::from_rgb(176, 92, 32))
             } else {
@@ -799,7 +808,18 @@ impl AmberApp {
         let mut select = None;
         for obj in &self.doc.objects {
             let selected = self.doc.selection == Selection::Object(obj.id);
-            if ui.selectable_label(selected, &obj.name).clicked() {
+            let n = self
+                .doc
+                .supports
+                .iter()
+                .filter(|s| s.object_id == obj.id)
+                .count();
+            let label = if n > 0 {
+                format!("{}  ·  {n}", obj.name)
+            } else {
+                obj.name.clone()
+            };
+            if ui.selectable_label(selected, label).clicked() {
                 select = Some(Selection::Object(obj.id));
             }
         }
@@ -807,9 +827,68 @@ impl AmberApp {
             self.doc.selection = sel;
             self.doc.touch_xform();
         }
-        if !self.doc.supports.is_empty() {
-            ui.add_space(4.0);
-            ui.label(format!("Supports {}", self.doc.supports.len()));
+        ui.add_space(6.0);
+        self.model_actions(ui);
+    }
+
+    fn model_actions(&mut self, ui: &mut egui::Ui) {
+        let Some(id) = self.doc.edit_target() else {
+            ui.label("Select a model. Hollow, holes, supports, and size changes apply only to it. Right-click a model for the full menu.");
+            return;
+        };
+        let hollow = self.doc.object(id).is_some_and(|obj| obj.hollow);
+        ui.horizontal_wrapped(|ui| {
+            if ui
+                .button(if hollow { "Make solid" } else { "Hollow" })
+                .clicked()
+            {
+                self.toggle_hollow(id);
+            }
+            if ui.button("Punch hole").clicked() {
+                self.punch_hole(id);
+            }
+            if ui.button("Add supports").clicked() {
+                self.grow_supports(false);
+            }
+        });
+    }
+
+    fn toggle_hollow(&mut self, id: u64) {
+        let Some(obj) = self.doc.object_mut(id) else {
+            return;
+        };
+        obj.hollow = !obj.hollow;
+        let on = obj.hollow;
+        self.doc.touch_xform();
+        self.invalidate_slice();
+        self.status = if on {
+            "This model will be hollowed when you slice. Punch a hole so resin can drain.".into()
+        } else {
+            "This model will print solid.".into()
+        };
+    }
+
+    fn punch_hole(&mut self, id: u64) {
+        self.doc.punch_bottom_drain(id);
+        self.tool = Tool::Drain;
+        self.invalidate_slice();
+        self.status = "Punched a drain at the bottom of this model. Click the shell to place another.".into();
+    }
+
+    fn grow_supports(&mut self, platform_only: bool) {
+        let Some(id) = self.doc.edit_target() else {
+            self.status = "Select a model first. Supports are added only to that model.".into();
+            return;
+        };
+        if let Some(obj) = self.doc.object_mut(id) {
+            obj.support.platform_only = platform_only;
+        }
+        self.doc.sync_defaults_from(id);
+        if self.doc.add_auto_supports() {
+            self.invalidate_slice();
+            self.status = "Supports added to the selected model.".into();
+        } else {
+            self.status = "No overhangs on the selected model needed a support.".into();
         }
     }
 
@@ -878,7 +957,7 @@ impl AmberApp {
 
     fn select_ui(&mut self, ui: &mut egui::Ui) {
         ui.heading("Select");
-        ui.label("Left-drag moves the selected model in X and Y. Right-drag orbits the plate.");
+        ui.label("Left-drag moves the selected model in X and Y. Right-drag orbits, and can swing under the bed. Right-click the model for hollow, holes, supports, and the rest.");
         let Selection::Object(id) = self.doc.selection else {
             ui.label("Click a model on the plate, or pick one in the list.");
             self.arrange_ui(ui);
@@ -953,10 +1032,6 @@ impl AmberApp {
                 self.doc.place_on_largest_face(id);
                 self.invalidate_slice();
             }
-            if ui.button("Orient all").clicked() {
-                self.doc.auto_orient_all();
-                self.invalidate_slice();
-            }
         });
     }
 
@@ -1014,9 +1089,16 @@ impl AmberApp {
     }
 
     fn drain_ui(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Dig hole");
+        ui.heading("Hole");
         ui.label("Click the outside of a hollow. The hole points inward so resin can drain and air can enter.");
         ui.label("Put at least one hole near the lowest point of a cup, or the layer that seals it will suction onto the film.");
+        if ui.button("Punch hole at the bottom").clicked() {
+            if let Some(id) = self.doc.edit_target() {
+                self.punch_hole(id);
+            } else {
+                self.status = "Select the model you want a drain in.".into();
+            }
+        }
     }
 
     fn size_label(&self, ui: &mut egui::Ui, id: u64) {
@@ -1063,10 +1145,15 @@ impl AmberApp {
 
     fn hollow_ui(&mut self, ui: &mut egui::Ui) {
         ui.heading("Hollow");
-        let Selection::Object(id) = self.doc.selection else {
-            ui.label("Hollowing is per model, applied when you slice.");
+        ui.label("The inside stays empty. Resin infill is not offered: it traps resin and blows out the print.");
+        let Some(id) = self.doc.edit_target() else {
+            ui.label("Select a model. Hollowing applies only to it.");
             return;
         };
+        if ui.button("Punch hole at the bottom").clicked() {
+            self.punch_hole(id);
+            return;
+        }
         let Some(obj) = self.doc.object_mut(id) else {
             return;
         };
@@ -1084,40 +1171,33 @@ impl AmberApp {
                 "mm",
             );
             changed |= drag_f32(ui, "Top cap", &mut obj.top_cap_mm, 0.05, 0.0, 20.0, "mm");
-            changed |= ui.checkbox(&mut obj.infill, "Lattice infill").changed();
-            changed |= ui
-                .checkbox(&mut obj.infill_gyroid, "Gyroid instead of a grid")
-                .changed();
-            changed |= drag_f32(
-                ui,
-                "Infill spacing",
-                &mut obj.infill_spacing_mm,
-                0.1,
-                1.0,
-                20.0,
-                "mm",
-            );
-            changed |= drag_f32(
-                ui,
-                "Infill thickness",
-                &mut obj.infill_thickness_mm,
-                0.05,
-                0.2,
-                2.0,
-                "mm",
-            );
         });
-        ui.label("Drain tool punches a hole through the shell. Place one near the lowest point of a cup.");
+        ui.label("Hole, in the tool list, clicks more drains through the shell. Put one near the lowest point of a cup.");
         if changed {
             self.doc.touch_xform();
             self.invalidate_slice();
         }
     }
 
+    fn write_support(&mut self, id: u64, profile: crate::scene::ModelSupport) {
+        if let Some(obj) = self.doc.object_mut(id) {
+            obj.support = profile;
+        }
+        self.doc.sync_defaults_from(id);
+        self.doc.touch();
+    }
+
     fn support_ui(&mut self, ui: &mut egui::Ui) {
         ui.heading("Support");
-        ui.label("Tips branch into a shared trunk. Click an underside to add one by hand.");
-        let mut preset = self.doc.preset.min(PRESETS.len() - 1);
+        ui.label("Tips branch into a shared trunk. Click an underside to add one by hand. Every control here applies only to the selected model.");
+        let Some(id) = self.doc.edit_target() else {
+            ui.label("Select a model first.");
+            return;
+        };
+        let Some(mut profile) = self.doc.object(id).map(|obj| obj.support) else {
+            return;
+        };
+        let mut preset = profile.preset.min(PRESETS.len() - 1);
         let before = preset;
         egui::ComboBox::from_label("Preset")
             .selected_text(PRESETS[preset].name)
@@ -1127,10 +1207,12 @@ impl AmberApp {
                 }
             });
         if preset != before {
-            self.doc.set_preset(preset);
+            profile.preset = preset;
+            profile.style = PRESETS[preset].style;
+            self.write_support(id, profile);
             self.invalidate_slice();
         }
-        let mut style = self.doc.style;
+        let mut style = profile.style;
         let mut changed = false;
         changed |= drag_f32(
             ui,
@@ -1247,71 +1329,65 @@ impl AmberApp {
             2.0,
             "mm",
         );
-        let mut platform_only = self.doc.platform_only;
-        if ui
+        let mut platform_only = profile.platform_only;
+        changed |= ui
             .checkbox(&mut platform_only, "To the platform only")
-            .changed()
-        {
-            self.doc.platform_only = platform_only;
-            self.doc.touch();
-        }
+            .changed();
         ui.label("Branch angle is the lean off vertical. Trunk spacing is how far apart tips must be before they get their own trunk.");
         if changed {
-            self.doc.style = style.sanitized();
-            self.doc.touch();
+            profile.style = style.sanitized();
+            profile.platform_only = platform_only;
+            self.write_support(id, profile);
             self.invalidate_slice();
         }
         ui.horizontal_wrapped(|ui| {
-            if ui.button("+ All").clicked() {
-                self.doc.platform_only = false;
-                self.doc.add_auto_supports(true);
-                self.invalidate_slice();
+            if ui.button("Add supports").clicked() {
+                self.grow_supports(false);
             }
-            if ui.button("+ Platform").clicked() {
-                self.doc.platform_only = true;
-                self.doc.add_auto_supports(true);
-                self.invalidate_slice();
-            }
-            if ui.button("+ Everything").clicked() {
-                self.doc.add_auto_supports(false);
-                self.invalidate_slice();
+            if ui.button("To the bed").clicked() {
+                self.grow_supports(true);
             }
             if ui.button("Clear").clicked() {
-                self.doc.clear_supports();
-                self.invalidate_slice();
+                if self.doc.clear_supports() {
+                    self.invalidate_slice();
+                    self.status = "Cleared supports on the selected model.".into();
+                } else {
+                    self.status = "That model has no supports.".into();
+                }
             }
         });
-        let mut lift = self.doc.support_lift_mm;
+        let mut lift = profile.lift_mm;
         if drag_f32(ui, "Lift above bed", &mut lift, 0.05, 0.0, 40.0, "mm") {
-            self.doc.support_lift_mm = lift;
+            profile.lift_mm = lift;
+            self.write_support(id, profile);
         }
-        ui.label("Adding supports raises the part until its lowest point is this far above the bed. A second pass does not stack another lift. 0 leaves it where it is.");
-        let mut raft = self.doc.raft;
-        let mut braces = self.doc.braces_on;
-        let mut raft_mm = self.doc.raft_mm;
-        let mut raft_margin = self.doc.raft_margin;
-        let mut raft_angle = self.doc.raft_angle;
-        let mut brace_dist = self.doc.brace_dist;
-        let mut brace_angle = self.doc.brace_angle;
+        ui.label("Adding supports raises this model until its lowest point is this far above the bed. A second pass does not stack another lift. 0 leaves it where it is.");
+        let mut raft = profile.raft;
+        let mut braces = profile.braces_on;
+        let mut raft_mm = profile.raft_mm;
+        let mut raft_margin = profile.raft_margin;
+        let mut raft_angle = profile.raft_angle;
+        let mut brace_dist = profile.brace_dist;
+        let mut brace_angle = profile.brace_angle;
         let mut raft_changed = false;
         raft_changed |= ui.checkbox(&mut raft, "Skate raft").changed();
         raft_changed |= drag_f32(ui, "Raft thickness", &mut raft_mm, 0.05, 0.2, 5.0, "mm");
         raft_changed |= drag_f32(ui, "Raft oversize", &mut raft_margin, 0.05, 0.0, 20.0, "mm");
         raft_changed |= drag_f32(ui, "Raft wall angle", &mut raft_angle, 0.5, 0.0, 70.0, "°");
-        ui.label("Off until you turn it on, and only under supports that reach the bed. Each of those pillars gets a square pad. Nearby pads join into one skate about the shape of the supported area. Oversize grows the pads. The wall leans out from vertical, so the base is wider than the top.");
+        ui.label("Off until you turn it on, and only under this model's supports that reach the bed. Each pillar gets a square pad. Nearby pads join into one skate. The top overhangs the plate so a scraper can get under the lip.");
         raft_changed |= ui.checkbox(&mut braces, "Diagonal braces").changed();
         raft_changed |= drag_f32(ui, "Brace angle", &mut brace_angle, 0.5, 15.0, 75.0, "°");
         raft_changed |= drag_f32(ui, "Brace spacing", &mut brace_dist, 0.1, 2.0, 20.0, "mm");
         ui.label("Braces join nearby trunks and rise at this angle to the bed. 45° is the usual lean. Spacing is the gap between brace layers and the farthest two trunks a brace will join.");
         if raft_changed {
-            self.doc.raft = raft;
-            self.doc.raft_mm = raft_mm;
-            self.doc.raft_margin = raft_margin;
-            self.doc.raft_angle = raft_angle;
-            self.doc.braces_on = braces;
-            self.doc.brace_dist = brace_dist;
-            self.doc.brace_angle = brace_angle;
-            self.doc.touch();
+            profile.raft = raft;
+            profile.raft_mm = raft_mm;
+            profile.raft_margin = raft_margin;
+            profile.raft_angle = raft_angle;
+            profile.braces_on = braces;
+            profile.brace_dist = brace_dist;
+            profile.brace_angle = brace_angle;
+            self.write_support(id, profile);
             self.invalidate_slice();
         }
         if ui.button("Support islands from last slice").clicked() {
@@ -1326,10 +1402,13 @@ impl AmberApp {
                             .map(|island| (island.x_mm, island.y_mm, island.z_mm))
                     })
                     .collect();
-                let n = points.len();
-                self.doc.add_island_supports(&points);
+                let n = self.doc.add_island_supports(&points);
                 self.invalidate_slice();
-                self.status = format!("Added {n} supports under islands. Slice again.");
+                self.status = if n == 0 {
+                    "No islands from the last slice sit under the selected model.".into()
+                } else {
+                    format!("Added {n} supports under this model's islands. Slice again.")
+                };
                 self.view = View::Prepare;
             } else {
                 self.status = "Slice once so Amber can see the islands.".into();
@@ -1713,7 +1792,8 @@ impl AmberApp {
             // Dragging right turns the plate to the right, the same way a
             // grabbed model moves in Chitubox.
             self.camera.yaw -= d.x * 0.4;
-            self.camera.pitch = (self.camera.pitch + d.y * 0.3).clamp(4.0, 89.0);
+            self.camera.pitch = (self.camera.pitch + d.y * 0.3).clamp(-80.0, 89.0);
+            self.part_menu = None;
         }
         if response.dragged_by(egui::PointerButton::Middle)
             || (response.dragged_by(egui::PointerButton::Primary)
@@ -1728,6 +1808,9 @@ impl AmberApp {
         {
             self.drag_transform(&response);
         }
+        if response.clicked_by(egui::PointerButton::Secondary) {
+            self.open_part_menu(&response);
+        }
         if response.clicked_by(egui::PointerButton::Primary)
             && matches!(
                 self.tool,
@@ -1741,6 +1824,7 @@ impl AmberApp {
                     | Tool::Hollow
             )
         {
+            self.part_menu = None;
             self.click_plate(&response);
         }
         let Some(renderer) = self.renderer.clone() else {
@@ -1845,6 +1929,186 @@ impl AmberApp {
         }
         self.doc.touch_xform();
         self.invalidate_slice();
+    }
+
+    fn open_part_menu(&mut self, response: &egui::Response) {
+        let Some(pointer) = response.interact_pointer_pos() else {
+            return;
+        };
+        let rel_x = (pointer.x - response.rect.left()) / response.rect.width().max(1.0);
+        let rel_y = (pointer.y - response.rect.top()) / response.rect.height().max(1.0);
+        let aspect = (response.rect.width() / response.rect.height().max(1.0)).clamp(0.2, 5.0);
+        let (origin, dir) = self.camera.ray(rel_x, rel_y, aspect);
+        if let Some((id, _, _)) = self.doc.raycast(origin, dir) {
+            self.doc.selection = Selection::Object(id);
+            self.doc.touch_xform();
+            self.part_menu = Some(pointer);
+            self.part_menu_fresh = true;
+        }
+    }
+
+    fn show_part_menu(&mut self, ctx: &egui::Context) {
+        let Some(pos) = self.part_menu else {
+            return;
+        };
+        let Some(id) = self.doc.edit_target() else {
+            self.part_menu = None;
+            return;
+        };
+        let name = self
+            .doc
+            .object(id)
+            .map(|obj| obj.name.clone())
+            .unwrap_or_else(|| "Model".into());
+        let mut close = false;
+        let mut menu_rect = egui::Rect::NOTHING;
+        egui::Area::new(egui::Id::new("amber_part_menu"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(pos)
+            .show(ctx, |ui| {
+                let frame = egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    ui.set_min_width(220.0);
+                    ui.label(egui::RichText::new(name).strong());
+                    ui.separator();
+                    close |= self.part_menu_buttons(ui, id);
+                });
+                menu_rect = frame.response.rect;
+            });
+        let outside = ctx.input(|i| {
+            i.key_pressed(egui::Key::Escape)
+                || (i.pointer.any_click()
+                    && i.pointer
+                        .interact_pos()
+                        .is_some_and(|p| !menu_rect.contains(p)))
+        });
+        if outside && !self.part_menu_fresh {
+            close = true;
+        }
+        self.part_menu_fresh = false;
+        if close {
+            self.part_menu = None;
+        }
+    }
+
+    fn part_menu_buttons(&mut self, ui: &mut egui::Ui, id: u64) -> bool {
+        let mut close = false;
+        let click = |ui: &mut egui::Ui, label: &str| ui.button(label).clicked();
+        if click(ui, "Drop to bed") {
+            self.doc.push_xform_undo(id);
+            self.doc.drop_object(id);
+            self.invalidate_slice();
+            close = true;
+        }
+        if click(ui, "Center on plate") {
+            self.doc.push_xform_undo(id);
+            self.doc
+                .center_on_plate(id, self.machine.size_x, self.machine.size_y);
+            self.invalidate_slice();
+            close = true;
+        }
+        if click(ui, "Auto orient") {
+            self.doc.auto_orient(id);
+            self.invalidate_slice();
+            self.status = "Oriented to cut overhangs, then dropped to the bed.".into();
+            close = true;
+        }
+        if click(ui, "Largest face down") {
+            self.doc.place_on_largest_face(id);
+            self.invalidate_slice();
+            close = true;
+        }
+        if click(ui, "Reset scale to 100%") {
+            self.doc.push_xform_undo(id);
+            if let Some(obj) = self.doc.object_mut(id) {
+                obj.scale = Vec3::ONE;
+            }
+            self.doc.touch_xform();
+            self.invalidate_slice();
+            close = true;
+        }
+        ui.separator();
+        if click(ui, "Mirror X") {
+            self.apply_mirror(id, 0);
+            close = true;
+        }
+        if click(ui, "Mirror Y") {
+            self.apply_mirror(id, 1);
+            close = true;
+        }
+        if click(ui, "Mirror Z") {
+            self.apply_mirror(id, 2);
+            close = true;
+        }
+        ui.separator();
+        let hollow = self.doc.object(id).is_some_and(|obj| obj.hollow);
+        if click(ui, if hollow { "Make solid" } else { "Hollow" }) {
+            self.toggle_hollow(id);
+            close = true;
+        }
+        if click(ui, "Punch hole at the bottom") {
+            self.punch_hole(id);
+            close = true;
+        }
+        if click(ui, "Place holes by clicking") {
+            self.tool = Tool::Drain;
+            self.status = "Click the shell to punch a drain. Orbit under the bed if you need the underside.".into();
+            close = true;
+        }
+        ui.separator();
+        if click(ui, "Add supports") {
+            self.grow_supports(false);
+            close = true;
+        }
+        if click(ui, "Supports to the bed") {
+            self.grow_supports(true);
+            close = true;
+        }
+        if click(ui, "Clear supports") {
+            if self.doc.clear_supports() {
+                self.invalidate_slice();
+            }
+            close = true;
+        }
+        let raft = self.doc.object(id).is_some_and(|obj| obj.support.raft);
+        if click(
+            ui,
+            if raft {
+                "Turn skate raft off"
+            } else {
+                "Turn skate raft on"
+            },
+        ) {
+            if let Some(obj) = self.doc.object_mut(id) {
+                obj.support.raft = !raft;
+            }
+            self.doc.sync_defaults_from(id);
+            self.doc.touch();
+            self.invalidate_slice();
+            close = true;
+        }
+        ui.separator();
+        if click(ui, "Duplicate") {
+            self.doc.duplicate(id);
+            self.invalidate_slice();
+            close = true;
+        }
+        if click(ui, "Repair") {
+            self.doc.repair(id);
+            self.invalidate_slice();
+            self.status = "Welded duplicate corners and flipped the shell if it was inside out.".into();
+            close = true;
+        }
+        if click(ui, "Flip normals") {
+            self.doc.flip_normals(id);
+            self.invalidate_slice();
+            close = true;
+        }
+        if click(ui, "Delete") {
+            self.doc.delete_selection();
+            self.invalidate_slice();
+            close = true;
+        }
+        close
     }
 
     fn click_plate(&mut self, response: &egui::Response) {

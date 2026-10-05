@@ -74,7 +74,7 @@ pub fn run(args: &[String]) -> Result<()> {
             }
         };
         doc.set_preset(index);
-        doc.add_auto_supports(true);
+        doc.add_auto_supports();
     }
     let mut settings = PrintSettings::default();
     settings.layer_mm = layer;

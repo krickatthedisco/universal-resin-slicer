@@ -27,7 +27,7 @@ impl Camera {
     }
 
     pub fn eye(&self) -> Vec3 {
-        let pitch = self.pitch.clamp(4.0, 89.0).to_radians();
+        let pitch = self.pitch.clamp(-80.0, 89.0).to_radians();
         let yaw = self.yaw.to_radians();
         let cp = pitch.cos();
         let offset = Vec3::new(
@@ -55,6 +55,12 @@ impl Camera {
         (near, (far - near).normalize())
     }
 
+    /// True when the eye has swung under the plate. The bed is drawn clear
+    /// then, so an underside can be clicked for a manual support.
+    pub fn under_bed(&self) -> bool {
+        self.eye().z < 0.0
+    }
+
     pub fn pan(&mut self, dx_px: f32, dy_px: f32) {
         let eye = self.eye();
         let forward = (self.target - eye).normalize();
@@ -72,6 +78,7 @@ impl Camera {
 pub struct PlateFrame {
     pub world_gen: u64,
     pub world: Arc<Vec<f32>>,
+    pub bed: Arc<Vec<f32>>,
     pub lines: Vec<f32>,
     pub line_gen: u64,
     pub objects: Vec<ObjectFrame>,
@@ -98,6 +105,7 @@ pub struct RaftFrame {
 pub struct ViewCache {
     world_gen: u64,
     world: Arc<Vec<f32>>,
+    bed: Arc<Vec<f32>>,
     grid_lines: Vec<f32>,
     locals: HashMap<(u64, u64), Arc<Vec<f32>>>,
 }
@@ -107,6 +115,7 @@ impl ViewCache {
         Self {
             world_gen: u64::MAX,
             world: Arc::new(Vec::new()),
+            bed: Arc::new(Vec::new()),
             grid_lines: Vec::new(),
             locals: HashMap::new(),
         }
@@ -117,37 +126,23 @@ impl ViewCache {
         if world_gen != self.world_gen {
             let mut tris = Vec::new();
             let mut lines = Vec::new();
-            push_plate(&mut tris, &mut lines, plate);
-            if doc.raft {
-                let foot = if doc.style.foot_diam_mm > 0.05 {
-                    doc.style.foot_diam_mm
-                } else {
-                    doc.style.trunk_mm * 2.1
-                };
-                if let Some(raft) = supports::support_raft(
-                    &doc.supports,
-                    foot,
-                    doc.raft_mm,
-                    doc.raft_margin,
-                    doc.raft_angle,
-                ) {
-                    push_mesh_flat(&mut tris, &raft, [0.45, 0.38, 0.28]);
-                }
+            let mut bed = Vec::new();
+            push_bed(&mut bed, plate);
+            push_plate_lines(&mut lines, plate);
+            let (rafts, forest) = doc.baked_supports();
+            for raft in &rafts {
+                push_mesh_flat(&mut tris, raft, [0.45, 0.38, 0.28]);
             }
-            let forest = supports::forest_mesh(
-                &doc.supports,
-                &doc.style,
-                doc.raft_top(),
-                doc.braces_on,
-                doc.brace_dist,
-                doc.brace_angle,
-            );
             push_mesh_flat(&mut tris, &forest, [0.22, 0.55, 0.52]);
             if let Selection::Support(id) = selection {
                 if let Some(support) = doc.supports.iter().find(|s| s.id == id) {
+                    let style = doc
+                        .object(support.object_id)
+                        .map(|obj| obj.support.style)
+                        .unwrap_or(doc.style);
                     push_mesh_flat(
                         &mut tris,
-                        &supports::tip_marker(support, &doc.style),
+                        &supports::tip_marker(support, &style),
                         [0.95, 0.78, 0.35],
                     );
                 }
@@ -162,6 +157,7 @@ impl ViewCache {
                 push_mesh_flat(&mut tris, &mesh, color);
             }
             self.world = Arc::new(tris);
+            self.bed = Arc::new(bed);
             self.grid_lines = lines;
             self.world_gen = world_gen;
         }
@@ -211,6 +207,7 @@ impl ViewCache {
         PlateFrame {
             world_gen,
             world: self.world.clone(),
+            bed: self.bed.clone(),
             lines,
             line_gen: doc.changed,
             objects,
@@ -306,7 +303,7 @@ fn push_vert(buf: &mut Vec<f32>, p: [f32; 3], n: [f32; 3], c: [f32; 3]) {
     buf.extend_from_slice(&[p[0], p[1], p[2], n[0], n[1], n[2], c[0], c[1], c[2]]);
 }
 
-fn push_plate(tris: &mut Vec<f32>, lines: &mut Vec<f32>, plate: Vec3) {
+fn push_bed(tris: &mut Vec<f32>, plate: Vec3) {
     let z = -0.04;
     let color = [0.16, 0.18, 0.21];
     let n = [0.0, 0.0, 1.0];
@@ -319,6 +316,9 @@ fn push_plate(tris: &mut Vec<f32>, lines: &mut Vec<f32>, plate: Vec3) {
     for id in [0, 1, 2, 0, 2, 3] {
         push_vert(tris, corners[id], n, color);
     }
+}
+
+fn push_plate_lines(lines: &mut Vec<f32>, plate: Vec3) {
     let grid = [0.28, 0.30, 0.33];
     let major = [0.42, 0.36, 0.24];
     let mut x = 0.0;
@@ -424,6 +424,7 @@ out vec4 out_color;
 uniform vec3 u_light;
 uniform vec3 u_fill;
 uniform vec3 u_eye;
+uniform float u_alpha;
 void main() {
     float len2 = dot(v_nrm, v_nrm);
     vec3 n = len2 > 1e-8 ? normalize(v_nrm) : vec3(0.0, 0.0, 1.0);
@@ -435,7 +436,7 @@ void main() {
     vec3 view = normalize(u_eye - v_pos);
     vec3 half_dir = normalize(light + view);
     float spec = pow(clamp(dot(n, half_dir), 0.0, 1.0), 48.0);
-    out_color = vec4(v_col * shade + vec3(spec * 0.16), 1.0);
+    out_color = vec4(v_col * shade + vec3(spec * 0.16), u_alpha);
 }
 "#;
 
@@ -492,6 +493,7 @@ struct SolidLocs {
     light: Option<glow::UniformLocation>,
     fill: Option<glow::UniformLocation>,
     eye: Option<glow::UniformLocation>,
+    alpha: Option<glow::UniformLocation>,
 }
 
 pub struct Renderer {
@@ -500,6 +502,7 @@ pub struct Renderer {
     locs: SolidLocs,
     line_mvp: Option<glow::UniformLocation>,
     world: MeshGpu,
+    bed: MeshGpu,
     world_gen: u64,
     objects: Vec<ObjectGpu>,
     rafts: Vec<RaftGpu>,
@@ -523,6 +526,7 @@ impl Renderer {
                 light: gl.get_uniform_location(program, "u_light"),
                 fill: gl.get_uniform_location(program, "u_fill"),
                 eye: gl.get_uniform_location(program, "u_eye"),
+                alpha: gl.get_uniform_location(program, "u_alpha"),
             };
             let line_mvp = gl.get_uniform_location(line_program, "u_mvp");
             let line_vao = gl.create_vertex_array().map_err(|e| e.to_string())?;
@@ -533,6 +537,9 @@ impl Renderer {
                 locs,
                 line_mvp,
                 world: MeshGpu {
+                    batches: Vec::new(),
+                },
+                bed: MeshGpu {
                     batches: Vec::new(),
                 },
                 world_gen: u64::MAX,
@@ -549,6 +556,7 @@ impl Renderer {
     pub fn sync(&mut self, gl: &glow::Context, frame: &PlateFrame) {
         if frame.world_gen != self.world_gen {
             upload_mesh(gl, &mut self.world.batches, &frame.world);
+            upload_mesh(gl, &mut self.bed.batches, &frame.bed);
             self.world_gen = frame.world_gen;
         }
         if frame.line_gen != self.line_gen {
@@ -650,20 +658,49 @@ impl Renderer {
             gl.uniform_3_f32(self.locs.light.as_ref(), 0.35, -0.25, 0.90);
             gl.uniform_3_f32(self.locs.fill.as_ref(), -0.4, 0.6, 0.2);
             gl.uniform_3_f32(self.locs.eye.as_ref(), eye.x, eye.y, eye.z);
+            let under = camera.under_bed();
+            if !under {
+                self.draw_solid(
+                    gl,
+                    &self.bed.batches,
+                    Mat4::IDENTITY,
+                    [1.0, 1.0, 1.0],
+                    0.0,
+                    1.0,
+                    vp,
+                );
+            }
             self.draw_solid(
                 gl,
                 &self.world.batches,
                 Mat4::IDENTITY,
                 [1.0, 1.0, 1.0],
                 0.0,
+                1.0,
                 vp,
             );
             let raft_color = [0.45, 0.38, 0.28];
             for raft in &self.rafts {
-                self.draw_solid(gl, &raft.batches, raft.model, raft_color, 0.0, vp);
+                self.draw_solid(gl, &raft.batches, raft.model, raft_color, 0.0, 1.0, vp);
             }
             for obj in &self.objects {
-                self.draw_solid(gl, &obj.batches, obj.model, obj.color, 1.0, vp);
+                self.draw_solid(gl, &obj.batches, obj.model, obj.color, 1.0, 1.0, vp);
+            }
+            if under {
+                gl.enable(glow::BLEND);
+                gl.blend_func(glow::SRC_ALPHA, glow::ONE_MINUS_SRC_ALPHA);
+                gl.depth_mask(false);
+                self.draw_solid(
+                    gl,
+                    &self.bed.batches,
+                    Mat4::IDENTITY,
+                    [1.0, 1.0, 1.0],
+                    0.0,
+                    0.16,
+                    vp,
+                );
+                gl.depth_mask(true);
+                gl.disable(glow::BLEND);
             }
 
             gl.use_program(Some(self.line_program));
@@ -682,6 +719,7 @@ impl Renderer {
         model: Mat4,
         color: [f32; 3],
         use_color: f32,
+        alpha: f32,
         vp: Mat4,
     ) {
         unsafe {
@@ -692,6 +730,7 @@ impl Renderer {
             gl.uniform_matrix_4_f32_slice(self.locs.normal.as_ref(), false, normal.as_ref());
             gl.uniform_3_f32(self.locs.color.as_ref(), color[0], color[1], color[2]);
             gl.uniform_1_f32(self.locs.use_color.as_ref(), use_color);
+            gl.uniform_1_f32(self.locs.alpha.as_ref(), alpha);
             for batch in batches {
                 gl.bind_vertex_array(Some(batch.vao));
                 gl.draw_arrays(glow::TRIANGLES, 0, batch.count);
@@ -704,6 +743,7 @@ impl Renderer {
             gl.delete_program(self.program);
             gl.delete_program(self.line_program);
             drop_batches(gl, &self.world.batches);
+            drop_batches(gl, &self.bed.batches);
             for obj in &self.objects {
                 drop_batches(gl, &obj.batches);
             }
@@ -830,8 +870,16 @@ pub type SharedRenderer = Arc<std::sync::Mutex<Renderer>>;
 
 #[cfg(test)]
 mod tests {
-    use super::smooth_world_normals;
-    use glam::Mat4;
+    use super::{smooth_world_normals, Camera};
+    use glam::{Mat4, Vec3};
+
+    #[test]
+    fn orbit_can_drop_below_the_bed() {
+        let mut cam = Camera::looking_at_plate(Vec3::new(200.0, 120.0, 200.0));
+        assert!(!cam.under_bed());
+        cam.pitch = -35.0;
+        assert!(cam.under_bed(), "eye {}", cam.eye().z);
+    }
 
     #[test]
     fn a_cube_corner_normal_points_out_of_the_box() {

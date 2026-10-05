@@ -695,8 +695,7 @@ fn fill_segments(segs: &[([f32; 2], [f32; 2])], machine: Machine, aa: u8) -> Ima
         //
         // Only exact duplicate hits are merged. A wider merge was collapsing
         // two real walls into one crossing and leaving the rest of that
-        // scanline blank. An odd leftover is a numerical double: drop the
-        // tighter of the two until the row pairs up.
+        // scanline blank.
         let mut crossings: Vec<f32> = Vec::with_capacity(hits.len());
         for (x, _) in hits {
             if let Some(prev) = crossings.last() {
@@ -706,18 +705,11 @@ fn fill_segments(segs: &[([f32; 2], [f32; 2])], machine: Machine, aa: u8) -> Ima
             }
             crossings.push(x);
         }
-        while crossings.len() % 2 == 1 && crossings.len() >= 3 {
-            let mut best_i = 0usize;
-            let mut best_d = f32::MAX;
-            for i in 0..crossings.len() - 1 {
-                let d = crossings[i + 1] - crossings[i];
-                if d < best_d {
-                    best_d = d;
-                    best_i = i;
-                }
-            }
-            crossings.remove(best_i + 1);
-        }
+        // An odd count is a tangent or a cracked edge, not a license to
+        // pair this shape with the next one. A near-duplicate is dropped.
+        // Anything else, the most isolated hit is the stray, and removing
+        // a real wall instead would paint a line across the gap.
+        repair_odd_crossings(&mut crossings);
         if crossings.len() < 2 {
             continue;
         }
@@ -792,6 +784,49 @@ fn seal_hairlines(pixels: &mut [u8], width: i32, height: i32) {
         if pixels[i] < v {
             pixels[i] = v;
         }
+    }
+}
+
+fn repair_odd_crossings(crossings: &mut Vec<f32>) {
+    const DUP: f32 = 0.75;
+    while crossings.len() % 2 == 1 && !crossings.is_empty() {
+        if crossings.len() == 1 {
+            crossings.clear();
+            return;
+        }
+        let mut close_i = 0usize;
+        let mut close_d = f32::MAX;
+        for i in 0..crossings.len() - 1 {
+            let d = crossings[i + 1] - crossings[i];
+            if d < close_d {
+                close_d = d;
+                close_i = i;
+            }
+        }
+        if close_d < DUP {
+            crossings.remove(close_i + 1);
+            continue;
+        }
+        let mut lone_i = 0usize;
+        let mut lone_d = -1.0f32;
+        for i in 0..crossings.len() {
+            let left = if i == 0 {
+                f32::MAX
+            } else {
+                crossings[i] - crossings[i - 1]
+            };
+            let right = if i + 1 == crossings.len() {
+                f32::MAX
+            } else {
+                crossings[i + 1] - crossings[i]
+            };
+            let near = left.min(right);
+            if near > lone_d {
+                lone_d = near;
+                lone_i = i;
+            }
+        }
+        crossings.remove(lone_i);
     }
 }
 
@@ -1697,6 +1732,26 @@ mod tests {
         let mut m = Machine::photon_m3_max();
         m.rotate_180 = false;
         m
+    }
+
+    #[test]
+    fn separate_shapes_do_not_grow_a_line_between_them() {
+        let machine = machine_no_flip();
+        let wall = |x0: f32, x1: f32, y0: f32, y1: f32| {
+            vec![
+                ([x0, y0], [x0, y1]),
+                ([x1, y0], [x1, y1]),
+            ]
+        };
+        let mut segs = wall(10.0, 30.0, 10.0, 40.0);
+        segs.extend(wall(80.0, 100.0, 10.0, 40.0));
+        // One leftover edge, as a tangent or a cracked contour leaves behind.
+        segs.push(([55.0, 10.0], [55.0, 40.0]));
+        let img = fill_segments(&segs, machine, 1);
+        assert!(img.get(20, 25) > 0, "first shape missing");
+        assert!(img.get(90, 25) > 0, "second shape missing");
+        assert_eq!(img.get(42, 25), 0, "filled the gap up to the stray edge");
+        assert_eq!(img.get(68, 25), 0, "filled the gap past the stray edge");
     }
 
     #[test]

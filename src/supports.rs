@@ -152,6 +152,8 @@ impl SupportStyle {
 #[derive(Clone, Copy, Debug)]
 pub struct Support {
     pub id: u64,
+    /// Model this pillar was grown for. Later edits stay on that model.
+    pub object_id: u64,
     pub x: f32,
     pub y: f32,
     pub z_top: f32,
@@ -359,6 +361,7 @@ pub fn auto_supports(
         *next_id += 1;
         out.push(Support {
             id,
+            object_id: 0,
             x: s[0],
             y: s[1],
             z_top: s[2],
@@ -385,6 +388,7 @@ pub fn manual_support(
     };
     Support {
         id,
+        object_id: 0,
         x,
         y,
         z_top: z,
@@ -826,7 +830,8 @@ fn tapered(a: Vec3, ra: f32, b: Vec3, rb: f32, seg: usize) -> Mesh {
 /// Skate under the supports that reach the bed. Each pillar gets a square pad.
 /// Pads that sit near each other are joined, so the outline follows the
 /// supports instead of the whole part. `oversize` grows each square.
-/// `angle_deg` is the wall measured from vertical: the base is wider than the top.
+/// `angle_deg` is the wall measured from vertical. The top is wider than the
+/// bed contact, so the lip overhangs and a scraper can get under it.
 pub fn support_raft(
     supports: &[Support],
     foot_diam_mm: f32,
@@ -1108,22 +1113,24 @@ fn extrude_skates(loops: &[Vec<[f32; 2]>], thickness: f32, flare: f32) -> Mesh {
         if top.len() < 3 {
             continue;
         }
-        let bot = offset_polygon(top, flare);
-        if bot.len() != top.len() {
+        // The traced loop is the bed footprint. Offset the top outward so
+        // the skate overhangs the plate instead of wedging onto it.
+        let lip = offset_polygon(top, flare);
+        if lip.len() != top.len() {
             continue;
         }
         let top_i = vertices.len() as u32;
-        for p in top {
+        for p in &lip {
             vertices.push([p[0], p[1], thickness]);
         }
         let bot_i = vertices.len() as u32;
-        for p in &bot {
+        for p in top {
             vertices.push([p[0], p[1], 0.0]);
         }
-        for tri in triangulate(top) {
+        for tri in triangulate(&lip) {
             indices.extend_from_slice(&[top_i + tri[0], top_i + tri[1], top_i + tri[2]]);
         }
-        for tri in triangulate(&bot) {
+        for tri in triangulate(top) {
             indices.extend_from_slice(&[bot_i + tri[0], bot_i + tri[2], bot_i + tri[1]]);
         }
         let n = top.len() as u32;
@@ -1270,6 +1277,7 @@ mod tests {
         let supports = [
             Support {
                 id: 1,
+                object_id: 0,
                 x: 0.0,
                 y: 0.0,
                 z_top: 22.0,
@@ -1277,6 +1285,7 @@ mod tests {
             },
             Support {
                 id: 2,
+                object_id: 0,
                 x: 3.2,
                 y: 0.4,
                 z_top: 20.0,
@@ -1302,6 +1311,7 @@ mod tests {
         let supports = [
             Support {
                 id: 1,
+                object_id: 0,
                 x: 0.0,
                 y: 0.0,
                 z_top: 12.0,
@@ -1309,6 +1319,7 @@ mod tests {
             },
             Support {
                 id: 2,
+                object_id: 0,
                 x: 8.0,
                 y: 0.0,
                 z_top: 12.0,
@@ -1316,6 +1327,7 @@ mod tests {
             },
             Support {
                 id: 3,
+                object_id: 0,
                 x: 8.0,
                 y: 8.0,
                 z_top: 12.0,
@@ -1323,6 +1335,7 @@ mod tests {
             },
             Support {
                 id: 4,
+                object_id: 0,
                 x: 0.0,
                 y: 8.0,
                 z_top: 12.0,
@@ -1341,6 +1354,7 @@ mod tests {
         );
         let far = [Support {
             id: 5,
+            object_id: 0,
             x: 80.0,
             y: 80.0,
             z_top: 12.0,
@@ -1367,12 +1381,13 @@ mod tests {
             .map(|v| v[0])
             .fold(f32::MAX, f32::min);
         assert!(
-            bed_min < top_min - 0.4,
-            "45° wall should land outside the top, bed {bed_min} top {top_min}"
+            top_min < bed_min - 0.4,
+            "45° wall should overhang the bed so a scraper can get under it, top {top_min} bed {bed_min}"
         );
         assert!(support_raft(
             &[Support {
                 id: 9,
+                object_id: 0,
                 x: 0.0,
                 y: 0.0,
                 z_top: 20.0,

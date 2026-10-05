@@ -7,6 +7,23 @@ use anyhow::Result;
 use glam::{EulerRot, Mat4, Quat, Vec3};
 use std::path::Path;
 
+/// Support and raft settings that belong to one model. Changing them does
+/// not reshape the supports on any other model.
+#[derive(Clone, Copy, Debug)]
+pub struct ModelSupport {
+    pub preset: usize,
+    pub style: SupportStyle,
+    pub platform_only: bool,
+    pub lift_mm: f32,
+    pub raft: bool,
+    pub raft_mm: f32,
+    pub raft_margin: f32,
+    pub raft_angle: f32,
+    pub braces_on: bool,
+    pub brace_dist: f32,
+    pub brace_angle: f32,
+}
+
 #[derive(Clone, Debug)]
 pub struct Object {
     pub id: u64,
@@ -19,10 +36,7 @@ pub struct Object {
     pub wall_mm: f32,
     pub bottom_cap_mm: f32,
     pub top_cap_mm: f32,
-    pub infill: bool,
-    pub infill_gyroid: bool,
-    pub infill_spacing_mm: f32,
-    pub infill_thickness_mm: f32,
+    pub support: ModelSupport,
     /// Bumped when the mesh data itself changes, so the plate view can keep
     /// the vertex buffer and only resend it then.
     pub mesh_rev: u64,
@@ -61,7 +75,10 @@ enum Undo {
         lifted: Vec<(u64, Vec3)>,
     },
     Drains(Vec<DrainHole>),
-    Deleted(Object),
+    Deleted {
+        object: Object,
+        supports: Vec<Support>,
+    },
     Added(u64),
 }
 
@@ -135,11 +152,70 @@ impl Document {
     pub fn set_preset(&mut self, index: usize) {
         self.preset = index.min(supports::PRESETS.len() - 1);
         self.style = supports::PRESETS[self.preset].style;
+        let preset = self.preset;
+        let style = self.style;
+        if let Some(id) = self.edit_target() {
+            if let Some(obj) = self.object_mut(id) {
+                obj.support.preset = preset;
+                obj.support.style = style;
+            }
+        }
         self.touch();
+    }
+
+    fn profile(&self) -> ModelSupport {
+        ModelSupport {
+            preset: self.preset,
+            style: self.style,
+            platform_only: self.platform_only,
+            lift_mm: self.support_lift_mm,
+            raft: self.raft,
+            raft_mm: self.raft_mm,
+            raft_margin: self.raft_margin,
+            raft_angle: self.raft_angle,
+            braces_on: self.braces_on,
+            brace_dist: self.brace_dist,
+            brace_angle: self.brace_angle,
+        }
+    }
+
+    /// Remember this model's support setup as the starting point for the next one.
+    pub fn sync_defaults_from(&mut self, id: u64) {
+        let Some(support) = self.object(id).map(|obj| obj.support) else {
+            return;
+        };
+        self.preset = support.preset;
+        self.style = support.style;
+        self.platform_only = support.platform_only;
+        self.support_lift_mm = support.lift_mm;
+        self.raft = support.raft;
+        self.raft_mm = support.raft_mm;
+        self.raft_margin = support.raft_margin;
+        self.raft_angle = support.raft_angle;
+        self.braces_on = support.braces_on;
+        self.brace_dist = support.brace_dist;
+        self.brace_angle = support.brace_angle;
+    }
+
+    /// The model an edit should land on: the selected model, or the model
+    /// that owns the selected support.
+    pub fn edit_target(&self) -> Option<u64> {
+        let id = match self.selection {
+            Selection::Object(id) => id,
+            Selection::Support(sid) => {
+                self.supports
+                    .iter()
+                    .find(|s| s.id == sid)
+                    .map(|s| s.object_id)?
+            }
+            Selection::Drain(_) | Selection::None => return None,
+        };
+        self.object(id).map(|obj| obj.id)
     }
 
     pub fn add_mesh(&mut self, name: String, mesh: Mesh) -> u64 {
         let id = self.alloc();
+        let support = self.profile();
         self.objects.push(Object {
             id,
             name,
@@ -151,10 +227,7 @@ impl Document {
             wall_mm: 2.0,
             bottom_cap_mm: 1.5,
             top_cap_mm: 1.5,
-            infill: false,
-            infill_gyroid: false,
-            infill_spacing_mm: 4.0,
-            infill_thickness_mm: 0.6,
+            support,
             mesh_rev: 1,
             bounds_min: [0.0; 3],
             bounds_max: [0.0; 3],
@@ -297,9 +370,10 @@ impl Document {
                 }
             }
             Undo::Drains(list) => self.drains = list,
-            Undo::Deleted(obj) => {
-                self.selection = Selection::Object(obj.id);
-                self.objects.push(obj);
+            Undo::Deleted { object, supports } => {
+                self.selection = Selection::Object(object.id);
+                self.supports.extend(supports);
+                self.objects.push(object);
             }
             Undo::Added(id) => {
                 self.objects.retain(|o| o.id != id);
@@ -361,8 +435,15 @@ impl Document {
         match self.selection {
             Selection::Object(id) => {
                 if let Some(i) = self.objects.iter().position(|o| o.id == id) {
-                    let obj = self.objects.remove(i);
-                    self.undo.push(Undo::Deleted(obj));
+                    let object = self.objects.remove(i);
+                    let supports: Vec<Support> = self
+                        .supports
+                        .iter()
+                        .copied()
+                        .filter(|s| s.object_id == id)
+                        .collect();
+                    self.supports.retain(|s| s.object_id != id);
+                    self.undo.push(Undo::Deleted { object, supports });
                     self.selection = Selection::None;
                     self.touch();
                 }
@@ -593,117 +674,176 @@ impl Document {
         })
     }
 
-    pub fn add_auto_supports(&mut self, only_selected: bool) {
-        let style = self.style;
-        let platform_only = self.platform_only;
-        let lift = self.support_lift_mm.max(0.0);
-        let ids: Vec<u64> = if only_selected {
-            self.selected_object().map(|o| o.id).into_iter().collect()
-        } else {
-            self.objects.iter().map(|o| o.id).collect()
+    /// Grow supports on the selected model only. Returns false when nothing
+    /// is selected, so another model on the plate is left alone.
+    pub fn add_auto_supports(&mut self) -> bool {
+        let Some(id) = self.edit_target() else {
+            return false;
+        };
+        let Some(profile) = self.object(id).map(|obj| obj.support) else {
+            return false;
         };
         let list = self.supports.clone();
         let mut lifted = Vec::new();
-        for id in ids {
-            let previous = self.raise_bottom(id, lift);
-            let Some(obj) = self.object(id) else {
-                continue;
-            };
-            let world = Self::world_mesh(obj);
-            let mut id_gen = self.next_id;
-            let found = supports::auto_supports(
-                &world.vertices,
-                &world.indices,
-                &style,
-                platform_only,
-                &mut id_gen,
-            );
-            self.next_id = id_gen;
-            if found.is_empty() {
-                if let Some(position) = previous {
-                    if let Some(obj) = self.object_mut(id) {
-                        obj.position = position;
-                    }
-                }
-                continue;
-            }
+        let previous = self.raise_bottom(id, profile.lift_mm.max(0.0));
+        let Some(obj) = self.object(id) else {
+            return false;
+        };
+        let world = Self::world_mesh(obj);
+        let mut id_gen = self.next_id;
+        let mut found = supports::auto_supports(
+            &world.vertices,
+            &world.indices,
+            &profile.style,
+            profile.platform_only,
+            &mut id_gen,
+        );
+        self.next_id = id_gen;
+        if found.is_empty() {
             if let Some(position) = previous {
-                lifted.push((id, position));
+                if let Some(obj) = self.object_mut(id) {
+                    obj.position = position;
+                }
             }
-            self.supports.extend(found);
+            return false;
         }
-        if self.supports.len() != list.len() || !lifted.is_empty() {
-            self.undo.push(Undo::Supports { list, lifted });
+        for support in &mut found {
+            support.object_id = id;
         }
+        if let Some(position) = previous {
+            lifted.push((id, position));
+        }
+        self.supports.retain(|s| s.object_id != id);
+        self.supports.extend(found);
+        self.undo.push(Undo::Supports { list, lifted });
         self.touch();
+        true
     }
 
     pub fn add_support_at(&mut self, point: Vec3, object_id: u64) {
         let Some(obj) = self.object(object_id) else {
             return;
         };
+        let platform_only = obj.support.platform_only;
         let world = Self::world_mesh(obj);
         self.undo.push(Undo::Supports {
             list: self.supports.clone(),
             lifted: Vec::new(),
         });
         let id = self.alloc();
-        let support = supports::manual_support(
+        let mut support = supports::manual_support(
             point.x,
             point.y,
             point.z,
             &world.vertices,
             &world.indices,
-            self.platform_only,
+            platform_only,
             id,
         );
+        support.object_id = object_id;
         self.supports.push(support);
         self.selection = Selection::Support(id);
         self.touch();
     }
 
-    pub fn add_island_supports(&mut self, islands: &[(f32, f32, f32)]) {
-        if islands.is_empty() {
-            return;
+    /// Plant supports under islands that belong to the selected model.
+    /// Returns how many were added.
+    pub fn add_island_supports(&mut self, islands: &[(f32, f32, f32)]) -> usize {
+        let Some(object_id) = self.edit_target() else {
+            return 0;
+        };
+        let Some((min, max)) = self.object(object_id).and_then(Self::world_bounds) else {
+            return 0;
+        };
+        let mine: Vec<(f32, f32, f32)> = islands
+            .iter()
+            .copied()
+            .filter(|(x, y, _)| {
+                *x >= min.x - 2.0 && *x <= max.x + 2.0 && *y >= min.y - 2.0 && *y <= max.y + 2.0
+            })
+            .collect();
+        if mine.is_empty() {
+            return 0;
         }
+        let platform_only = self
+            .object(object_id)
+            .map(|obj| obj.support.platform_only)
+            .unwrap_or(false);
+        let world = self
+            .object(object_id)
+            .map(Self::world_mesh)
+            .unwrap_or(Mesh {
+                vertices: Vec::new(),
+                indices: Vec::new(),
+            });
         self.undo.push(Undo::Supports {
             list: self.supports.clone(),
             lifted: Vec::new(),
         });
-        let platform_only = self.platform_only;
-        // Hit-testing the whole scene is enough to land the foot.
-        let mut verts = Vec::new();
-        let mut indices = Vec::new();
-        for obj in &self.objects {
-            let world = Self::world_mesh(obj);
-            let base = verts.len() as u32;
-            verts.extend(world.vertices);
-            indices.extend(world.indices.iter().map(|i| i + base));
-        }
-        for (x, y, z) in islands {
+        for (x, y, z) in &mine {
             let id = self.alloc();
-            self.supports.push(supports::manual_support(
+            let mut support = supports::manual_support(
                 *x,
                 *y,
                 *z,
-                &verts,
-                &indices,
+                &world.vertices,
+                &world.indices,
                 platform_only,
                 id,
-            ));
+            );
+            support.object_id = object_id;
+            self.supports.push(support);
         }
         self.touch();
+        mine.len()
     }
 
-    pub fn clear_supports(&mut self) {
-        if self.supports.is_empty() {
-            return;
+    /// Remove supports that belong to the selected model.
+    pub fn clear_supports(&mut self) -> bool {
+        let Some(id) = self.edit_target() else {
+            return false;
+        };
+        if !self.supports.iter().any(|s| s.object_id == id) {
+            return false;
         }
         self.undo.push(Undo::Supports {
             list: self.supports.clone(),
             lifted: Vec::new(),
         });
-        self.supports.clear();
+        self.supports.retain(|s| s.object_id != id);
+        if let Selection::Support(sid) = self.selection {
+            if !self.supports.iter().any(|s| s.id == sid) {
+                self.selection = Selection::Object(id);
+            }
+        }
+        self.touch();
+        true
+    }
+
+    /// A drain through the bottom center, aimed up into the part.
+    pub fn punch_bottom_drain(&mut self, id: u64) {
+        let Some(obj) = self.object(id) else {
+            return;
+        };
+        let Some((min, max)) = Self::world_bounds(obj) else {
+            return;
+        };
+        let depth = (obj.bottom_cap_mm + obj.wall_mm + 4.0).clamp(6.0, 30.0);
+        let origin = Vec3::new(
+            (min.x + max.x) * 0.5,
+            (min.y + max.y) * 0.5,
+            min.z + 0.3,
+        );
+        self.undo.push(Undo::Drains(self.drains.clone()));
+        let drain_id = self.alloc();
+        self.drains.push(DrainHole {
+            id: drain_id,
+            origin,
+            axis: Vec3::Z,
+            radius_mm: 1.2,
+            depth_mm: depth,
+        });
+        self.selection = Selection::Drain(drain_id);
         self.touch();
     }
 
@@ -743,15 +883,6 @@ impl Document {
         self.touch();
     }
 
-    pub fn raft_top(&self) -> f32 {
-        let on_bed = self.supports.iter().any(|s| s.z_base <= 0.45);
-        if self.raft && on_bed {
-            self.raft_mm.max(0.2)
-        } else {
-            0.0
-        }
-    }
-
     pub fn solids(&self) -> Vec<Solid> {
         let mut solids = Vec::new();
         for obj in &self.objects {
@@ -762,13 +893,9 @@ impl Document {
                     wall_mm: obj.wall_mm,
                     bottom_cap_mm: obj.bottom_cap_mm,
                     top_cap_mm: obj.top_cap_mm,
-                    infill_spacing_mm: if obj.infill {
-                        obj.infill_spacing_mm
-                    } else {
-                        0.0
-                    },
-                    infill_thickness_mm: obj.infill_thickness_mm,
-                    gyroid: obj.infill_gyroid,
+                    infill_spacing_mm: 0.0,
+                    infill_thickness_mm: 0.0,
+                    gyroid: false,
                     z_min: min[2],
                     z_max: max[2],
                 })
@@ -781,35 +908,14 @@ impl Document {
                 hollow,
             });
         }
-        if self.raft {
-            let foot = if self.style.foot_diam_mm > 0.05 {
-                self.style.foot_diam_mm
-            } else {
-                self.style.trunk_mm * 2.1
-            };
-            if let Some(raft) = supports::support_raft(
-                &self.supports,
-                foot,
-                self.raft_mm,
-                self.raft_margin,
-                self.raft_angle,
-            ) {
-                solids.push(Solid {
-                    vertices: raft.vertices,
-                    indices: raft.indices,
-                    hollow: None,
-                });
-            }
+        let (rafts, forest) = self.baked_supports();
+        for raft in rafts {
+            solids.push(Solid {
+                vertices: raft.vertices,
+                indices: raft.indices,
+                hollow: None,
+            });
         }
-        let raft_top = self.raft_top();
-        let forest = supports::forest_mesh(
-            &self.supports,
-            &self.style,
-            raft_top,
-            self.braces_on,
-            self.brace_dist,
-            self.brace_angle,
-        );
         if forest.triangle_count() > 0 {
             solids.push(Solid {
                 vertices: forest.vertices,
@@ -818,6 +924,58 @@ impl Document {
             });
         }
         solids
+    }
+
+    /// Rafts and the support forest, each model with its own settings.
+    pub fn baked_supports(&self) -> (Vec<Mesh>, Mesh) {
+        let mut rafts = Vec::new();
+        let mut forest = Mesh {
+            vertices: Vec::new(),
+            indices: Vec::new(),
+        };
+        for obj in &self.objects {
+            let mine: Vec<Support> = self
+                .supports
+                .iter()
+                .copied()
+                .filter(|s| s.object_id == obj.id)
+                .collect();
+            if mine.is_empty() {
+                continue;
+            }
+            let style = &obj.support.style;
+            let foot = if style.foot_diam_mm > 0.05 {
+                style.foot_diam_mm
+            } else {
+                style.trunk_mm * 2.1
+            };
+            let on_bed = mine.iter().any(|s| s.z_base <= 0.45);
+            if obj.support.raft && on_bed {
+                if let Some(raft) = supports::support_raft(
+                    &mine,
+                    foot,
+                    obj.support.raft_mm,
+                    obj.support.raft_margin,
+                    obj.support.raft_angle,
+                ) {
+                    rafts.push(raft);
+                }
+            }
+            let raft_top = if obj.support.raft && on_bed {
+                obj.support.raft_mm.max(0.2)
+            } else {
+                0.0
+            };
+            forest.append(&supports::forest_mesh(
+                &mine,
+                style,
+                raft_top,
+                obj.support.braces_on,
+                obj.support.brace_dist,
+                obj.support.brace_angle,
+            ));
+        }
+        (rafts, forest)
     }
 
     pub fn drain_inputs(&self) -> Vec<Drain> {
@@ -959,15 +1117,50 @@ mod tests {
         let mut doc = Document::new();
         let id = doc.add_mesh("box".into(), box_mesh([0.0, 0.0, 0.0], [10.0, 10.0, 4.0]));
         doc.support_lift_mm = 5.0;
-        doc.add_auto_supports(true);
+        if let Some(obj) = doc.object_mut(id) {
+            obj.support.lift_mm = 5.0;
+        }
+        assert!(doc.add_auto_supports());
         let (min, _) = Document::world_bounds(doc.object(id).unwrap()).unwrap();
         assert!(min.z >= 4.9 && min.z <= 5.2, "bottom at {}", min.z);
-        doc.add_auto_supports(true);
+        assert!(doc.add_auto_supports());
         let (again, _) = Document::world_bounds(doc.object(id).unwrap()).unwrap();
         assert!(again.z <= 5.2, "second pass stacked to {}", again.z);
         doc.undo();
         doc.undo();
         let (back, _) = Document::world_bounds(doc.object(id).unwrap()).unwrap();
         assert!(back.z < 0.2, "undo should drop it back, {}", back.z);
+    }
+
+    #[test]
+    fn edits_stay_on_the_selected_model() {
+        let mut doc = Document::new();
+        let a = doc.add_mesh("a".into(), box_mesh([0.0, 0.0, 0.0], [10.0, 10.0, 4.0]));
+        let b = doc.add_mesh("b".into(), box_mesh([40.0, 0.0, 0.0], [50.0, 10.0, 4.0]));
+        doc.selection = Selection::Object(a);
+        if let Some(obj) = doc.object_mut(a) {
+            obj.support.lift_mm = 5.0;
+            obj.support.style.trunk_mm = 2.4;
+            obj.scale = Vec3::splat(1.5);
+        }
+        assert!(doc.add_auto_supports());
+        assert!(doc.supports.iter().all(|s| s.object_id == a));
+        let (min_b, _) = Document::world_bounds(doc.object(b).unwrap()).unwrap();
+        assert!(min_b.z < 0.2, "the other model was lifted to {}", min_b.z);
+        assert!(
+            (doc.object(b).unwrap().support.style.trunk_mm - 2.4).abs() > 0.5,
+            "trunk size leaked onto the other model"
+        );
+        assert_eq!(doc.object(b).unwrap().scale, Vec3::ONE);
+        doc.selection = Selection::Object(b);
+        if let Some(obj) = doc.object_mut(b) {
+            obj.support.lift_mm = 0.0;
+        }
+        let _ = doc.add_auto_supports();
+        let b_count = doc.supports.iter().filter(|s| s.object_id == b).count();
+        doc.selection = Selection::Object(a);
+        assert!(doc.clear_supports());
+        assert!(doc.supports.iter().all(|s| s.object_id == b));
+        assert_eq!(doc.supports.len(), b_count);
     }
 }
