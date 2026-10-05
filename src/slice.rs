@@ -1405,6 +1405,18 @@ fn splat_thumb(thumb: &mut [u8], img: &Image, machine: Machine) {
 }
 
 pub(crate) fn encode_rle(img: &Image, plate_w: i32, plate_h: i32) -> (Vec<u8>, u32, f64) {
+    let content = img.width as i64 * img.height as i64;
+    // A full-plate layer is tens of millions of pixels. Rows do not depend on
+    // each other, so those layers split across cores. Smaller layers stay on
+    // one core and keep a single run across empty rows.
+    if content >= 250_000 && plate_w > 0 && plate_h > 0 {
+        encode_rle_rows(img, plate_w, plate_h)
+    } else {
+        encode_rle_serial(img, plate_w, plate_h)
+    }
+}
+
+fn encode_rle_serial(img: &Image, plate_w: i32, plate_h: i32) -> (Vec<u8>, u32, f64) {
     let mut out = Vec::new();
     let mut nonzero = 0u32;
     let mut coverage = 0.0f64;
@@ -1444,6 +1456,77 @@ pub(crate) fn encode_rle(img: &Image, plate_w: i32, plate_h: i32) -> (Vec<u8>, u
         }
         emit(&mut out, &mut run_color, &mut run_len, 0, plate_w - right);
     }
+    if run_color >= 0 && run_len > 0 {
+        push_pw0(&mut out, run_color as u8, run_len as usize);
+    }
+    (out, nonzero, coverage)
+}
+
+fn encode_rle_rows(img: &Image, plate_w: i32, plate_h: i32) -> (Vec<u8>, u32, f64) {
+    let y_start = img.y0.clamp(0, plate_h);
+    let y_end = (img.y0 + img.height).clamp(y_start, plate_h);
+    let mut out = Vec::new();
+    push_pw0(
+        &mut out,
+        0,
+        (y_start as usize).saturating_mul(plate_w as usize),
+    );
+    let rows: Vec<(Vec<u8>, u32, f64)> = (y_start..y_end)
+        .into_par_iter()
+        .map(|y| encode_one_row(img, plate_w, y))
+        .collect();
+    let mut nonzero = 0u32;
+    let mut coverage = 0.0f64;
+    for (bytes, nz, cov) in rows {
+        out.extend_from_slice(&bytes);
+        nonzero += nz;
+        coverage += cov;
+    }
+    push_pw0(
+        &mut out,
+        0,
+        ((plate_h - y_end) as usize).saturating_mul(plate_w as usize),
+    );
+    (out, nonzero, coverage)
+}
+
+fn encode_one_row(img: &Image, plate_w: i32, y: i32) -> (Vec<u8>, u32, f64) {
+    let mut out = Vec::new();
+    let mut nonzero = 0u32;
+    let mut coverage = 0.0f64;
+    let mut run_color: i32 = -1;
+    let mut run_len = 0i32;
+    let emit = |out: &mut Vec<u8>, run_color: &mut i32, run_len: &mut i32, color: i32, len: i32| {
+        if len <= 0 {
+            return;
+        }
+        if color == *run_color {
+            *run_len += len;
+            return;
+        }
+        if *run_color >= 0 && *run_len > 0 {
+            push_pw0(out, *run_color as u8, *run_len as usize);
+        }
+        *run_color = color;
+        *run_len = len;
+    };
+    let left = img.x0.clamp(0, plate_w);
+    let right = (img.x0 + img.width).clamp(0, plate_w);
+    emit(&mut out, &mut run_color, &mut run_len, 0, left);
+    if img.height > 0 && y >= img.y0 && y < img.y0 + img.height {
+        let row = (y - img.y0) as usize * img.width as usize;
+        for x in left..right {
+            let v = img.pixels[row + (x - img.x0) as usize];
+            if v > 0 {
+                nonzero += 1;
+                coverage += v as f64 / 255.0;
+            }
+            emit(&mut out, &mut run_color, &mut run_len, (v >> 4) as i32, 1);
+        }
+    } else if right > left {
+        emit(&mut out, &mut run_color, &mut run_len, 0, right - left);
+    }
+    emit(&mut out, &mut run_color, &mut run_len, 0, plate_w - right);
     if run_color >= 0 && run_len > 0 {
         push_pw0(&mut out, run_color as u8, run_len as usize);
     }
@@ -1905,5 +1988,30 @@ mod tests {
             assert_eq!(a >> 4, b >> 4, "nibble mismatch {a} vs {b}");
         }
         img.pixels[2] = 0;
+    }
+
+    #[test]
+    fn large_layer_rle_roundtrips_a_block() {
+        let width = 800i32;
+        let height = 400i32;
+        let mut pixels = vec![0u8; (width * height) as usize];
+        for y in 40..120 {
+            for x in 50..200 {
+                pixels[(y * width + x) as usize] = 255;
+            }
+        }
+        let img = Image {
+            x0: 10,
+            y0: 20,
+            width,
+            height,
+            pixels,
+        };
+        let (rle, nonzero, _) = encode_rle(&img, 900, 500);
+        assert_eq!(nonzero, 80 * 150);
+        let back = decode_rle(&rle, 900, 500).unwrap();
+        assert_eq!(back[60 * 900 + 60], 255);
+        assert_eq!(back[0], 0);
+        assert_eq!(back.iter().filter(|p| **p > 0).count(), nonzero as usize);
     }
 }
