@@ -1688,7 +1688,7 @@ impl AmberApp {
         changed |= ui
             .checkbox(&mut s.fill_voids, "Fill enclosed voids")
             .changed();
-        ui.label("Cures closed holes in each layer, the same pockets the suction check finds. A hollow interior is filled too. Drain holes are cut after the fill, so a drain still opens.");
+        ui.label("Heals speckled gaps and cures closed pockets in each layer. A model you hollowed stays empty. Drain holes are cut after, so a drain still opens.");
         ui.collapsing("Compensation and cost", |ui| {
             changed |= drag_f32(ui, "XY offset", &mut s.xy_offset_mm, 0.01, -0.5, 0.5, "mm");
             changed |= drag_f32(

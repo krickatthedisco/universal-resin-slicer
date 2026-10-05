@@ -231,6 +231,14 @@ pub fn slice(req: Request<'_>) -> Result<Slice, String> {
         for (solid, sweep) in solids.iter().zip(sweeps.iter_mut()) {
             let active = sweep.activate(z);
             let mut part = raster_solid(solid, z, machine, settings.anti_alias, active);
+            // Heal and fill before hollowing. The hollow is cut from the
+            // repaired solid, so a model you hollowed stays empty while
+            // speckled mesh gaps and accidental pockets become solid resin.
+            if settings.fill_voids {
+                let radius = (0.75 / machine.pixel_mm()).round().clamp(2.0, 24.0) as i32;
+                heal_speckles(&mut part, radius);
+                fill_enclosed(&mut part);
+            }
             if let Some(hollow) = solid.hollow {
                 let cap = z <= hollow.z_min + hollow.bottom_cap_mm
                     || z >= hollow.z_max - hollow.top_cap_mm;
@@ -243,9 +251,6 @@ pub fn slice(req: Request<'_>) -> Result<Slice, String> {
         offset_image(&mut image, settings.xy_offset_mm, machine);
         if index < settings.bottom_layers {
             offset_image(&mut image, -settings.elephant_foot_mm, machine);
-        }
-        if settings.fill_voids {
-            fill_enclosed(&mut image);
         }
         apply_drains(&mut image, req.drains, z, machine);
         let (exposure, lift, lift_speed, retract) = layer_motion(&settings, index);
@@ -317,7 +322,7 @@ pub fn slice(req: Request<'_>) -> Result<Slice, String> {
     let cavity_ml = (cavity_px_layers * pixel_area * h as f64 / 1000.0) as f32;
     if sealed_layers > 0 {
         warnings.push(format!(
-            "{sealed_layers} layers seal an interior pocket ({cavity_ml:.2} ml of air in the slice). Turn on Fill enclosed voids, or add a drain at the bottom of a cup, or it can suction onto the film."
+            "{sealed_layers} layers seal an interior pocket ({cavity_ml:.2} ml of air in the slice). Add a drain at the bottom of a hollow, or it can suction onto the film. Fill enclosed voids closes accidental pockets and leaves a model you hollowed empty."
         ));
     }
     Ok(Slice {
@@ -1342,9 +1347,93 @@ fn find_islands(img: &Image, prev: &Bits, machine: Machine, z: f32) -> Vec<Islan
     islands
 }
 
+/// Close small gaps, then paint the interior solid. Gray speckles and
+/// pinholes up to about twice `radius` become 255. A cavity much larger
+/// than that, such as a hollow, is left alone. The outer anti-aliased
+/// fringe stays, because only the inside of the healed shape is forced.
+fn heal_speckles(img: &mut Image, radius: i32) {
+    let radius = radius.max(1);
+    let w = img.width;
+    let h = img.height;
+    if w < 3 || h < 3 || img.pixels.len() < (w * h) as usize {
+        return;
+    }
+    let r = radius as usize;
+    let pw = w as usize + r * 2;
+    let ph = h as usize + r * 2;
+    let mut solid = vec![false; pw * ph];
+    for y in 0..h as usize {
+        for x in 0..w as usize {
+            if img.pixels[y * w as usize + x] > 0 {
+                solid[(y + r) * pw + (x + r)] = true;
+            }
+        }
+    }
+    let closed = morph_close(&solid, pw, ph, radius);
+    let interior = erode_mask(&closed, pw, ph, 1);
+    for y in 0..h as usize {
+        for x in 0..w as usize {
+            let i = y * w as usize + x;
+            let p = (y + r) * pw + (x + r);
+            if interior[p] || (closed[p] && img.pixels[i] == 0) {
+                img.pixels[i] = 255;
+            }
+        }
+    }
+}
+
+fn morph_close(solid: &[bool], w: usize, h: usize, radius: i32) -> Vec<bool> {
+    let dilated = dilate_mask(solid, w, h, radius);
+    erode_mask(&dilated, w, h, radius)
+}
+
+fn dilate_mask(solid: &[bool], w: usize, h: usize, radius: i32) -> Vec<bool> {
+    window_any(solid, w, h, radius, true)
+}
+
+fn erode_mask(solid: &[bool], w: usize, h: usize, radius: i32) -> Vec<bool> {
+    window_any(solid, w, h, radius, false)
+}
+
+/// `any` keeps a pixel when the window contains one solid pixel (dilate).
+/// Otherwise the whole window must be solid and in-bounds (erode).
+fn window_any(solid: &[bool], w: usize, h: usize, radius: i32, any: bool) -> Vec<bool> {
+    let stride = w + 1;
+    let mut integral = vec![0u32; stride * (h + 1)];
+    for y in 0..h {
+        let mut row = 0u32;
+        for x in 0..w {
+            row += u32::from(solid[y * w + x]);
+            integral[(y + 1) * stride + (x + 1)] = integral[y * stride + (x + 1)] + row;
+        }
+    }
+    let mut out = vec![false; w * h];
+    let r = radius.max(0) as i32;
+    let full = (r as u32 * 2) + 1;
+    let full_area = full * full;
+    for y in 0..h as i32 {
+        for x in 0..w as i32 {
+            let x0 = (x - r).max(0) as usize;
+            let y0 = (y - r).max(0) as usize;
+            let x1 = (x + r + 1).min(w as i32) as usize;
+            let y1 = (y + r + 1).min(h as i32) as usize;
+            let sum = integral[y1 * stride + x1] + integral[y0 * stride + x0]
+                - integral[y0 * stride + x1]
+                - integral[y1 * stride + x0];
+            let span = ((x1 - x0) * (y1 - y0)) as u32;
+            out[y as usize * w + x as usize] = if any {
+                sum > 0
+            } else {
+                sum == span && span == full_area
+            };
+        }
+    }
+    out
+}
+
 /// Paint empty pixels that cannot reach the border of this layer. Those are
-/// the same closed holes the suction check reports. Drains run after this,
-/// so a drain still opens.
+/// the same closed holes the suction check reports. Call this before
+/// hollowing so the carved cavity is not painted back in.
 fn fill_enclosed(img: &mut Image) {
     if img.width <= 0 || img.height <= 0 {
         return;
@@ -1988,7 +2077,44 @@ mod tests {
     }
 
     #[test]
-    fn fill_voids_closes_a_capped_hollow() {
+    fn heal_speckles_fills_noise_and_leaves_a_large_hole() {
+        let mut pixels = vec![0u8; 48 * 48];
+        for y in 8..40 {
+            for x in 8..40 {
+                let noisy = (15..28).contains(&x) && (15..28).contains(&y);
+                pixels[(y * 48 + x) as usize] = if noisy {
+                    if (x + y) % 3 == 0 {
+                        0
+                    } else {
+                        40
+                    }
+                } else {
+                    255
+                };
+            }
+        }
+        // A wide notch open to the right. Closing a couple of pixels must not pack it.
+        for y in 20..30 {
+            for x in 30..40 {
+                pixels[(y * 48 + x) as usize] = 0;
+            }
+        }
+        let mut img = Image {
+            x0: 0,
+            y0: 0,
+            width: 48,
+            height: 48,
+            pixels,
+        };
+        heal_speckles(&mut img, 2);
+        assert_eq!(img.get(20, 20), 255, "speckled interior stayed gray");
+        assert_eq!(img.get(15, 15), 255, "a gap in the speckle stayed open");
+        assert_eq!(img.get(34, 24), 0, "a wide notch was packed solid");
+        assert_eq!(img.get(2, 2), 0, "the outside of the part was filled");
+    }
+
+    #[test]
+    fn fill_voids_keeps_a_hollow_empty() {
         let mesh = box_mesh([40.0, 40.0, 0.0], [60.0, 60.0, 10.0]);
         let hollowed = Solid {
             vertices: mesh.vertices,
@@ -2029,9 +2155,11 @@ mod tests {
             plain.sealed_layers,
             plain.cavity_ml
         );
-        assert_eq!(
-            filled.sealed_layers, 0,
-            "filled voids are not empty pockets"
+        assert!(
+            filled.sealed_layers > 0,
+            "the hollow should stay an empty pocket, sealed {} cavity {:.3} ml",
+            filled.sealed_layers,
+            filled.cavity_ml
         );
         let mid = |slice: &Slice| {
             slice
@@ -2041,11 +2169,15 @@ mod tests {
                 .map(|l| l.nonzero)
                 .unwrap_or(0)
         };
+        let plain_mid = mid(&plain);
+        let filled_mid = mid(&filled);
         assert!(
-            mid(&filled) > mid(&plain) * 2,
-            "filled {} plain {}",
-            mid(&filled),
-            mid(&plain)
+            filled_mid < plain_mid + plain_mid / 5 + 200,
+            "hollow was packed, filled {filled_mid} plain {plain_mid}"
+        );
+        assert!(
+            filled_mid + 200 > plain_mid / 2,
+            "shell collapsed, filled {filled_mid} plain {plain_mid}"
         );
     }
 
