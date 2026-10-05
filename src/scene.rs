@@ -80,6 +80,10 @@ enum Undo {
         supports: Vec<Support>,
     },
     Added(u64),
+    Cut {
+        original: Object,
+        added: u64,
+    },
 }
 
 pub struct Document {
@@ -99,6 +103,9 @@ pub struct Document {
     pub platform_only: bool,
     /// How far above the bed a part sits after supports are added.
     pub support_lift_mm: f32,
+    /// Diameter and depth used by a new drain hole.
+    pub drain_diameter_mm: f32,
+    pub drain_depth_mm: f32,
     /// Skate-raft wall, measured from vertical. 0 is a straight edge.
     pub raft_angle: f32,
     next_id: u64,
@@ -125,6 +132,8 @@ impl Document {
             style: supports::PRESETS[1].style,
             platform_only: false,
             support_lift_mm: 5.0,
+            drain_diameter_mm: 2.4,
+            drain_depth_mm: 8.0,
             raft_angle: 30.0,
             next_id: 1,
             undo: Vec::new(),
@@ -202,12 +211,11 @@ impl Document {
     pub fn edit_target(&self) -> Option<u64> {
         let id = match self.selection {
             Selection::Object(id) => id,
-            Selection::Support(sid) => {
-                self.supports
-                    .iter()
-                    .find(|s| s.id == sid)
-                    .map(|s| s.object_id)?
-            }
+            Selection::Support(sid) => self
+                .supports
+                .iter()
+                .find(|s| s.id == sid)
+                .map(|s| s.object_id)?,
             Selection::Drain(_) | Selection::None => return None,
         };
         self.object(id).map(|obj| obj.id)
@@ -381,6 +389,16 @@ impl Document {
                     self.selection = Selection::None;
                 }
             }
+            Undo::Cut { original, added } => {
+                self.objects.retain(|o| o.id != added);
+                let id = original.id;
+                if let Some(pos) = self.objects.iter().position(|o| o.id == id) {
+                    self.objects[pos] = original;
+                } else {
+                    self.objects.push(original);
+                }
+                self.selection = Selection::Object(id);
+            }
         }
         self.touch();
     }
@@ -429,6 +447,137 @@ impl Document {
         self.selection = Selection::Object(new_id);
         self.touch();
         Some(new_id)
+    }
+
+    /// Place `extra` copies of one model, stepping by the part size plus `gap`.
+    pub fn duplicate_copies(
+        &mut self,
+        id: u64,
+        extra: u32,
+        gap: f32,
+        plate_x: f32,
+        plate_y: f32,
+    ) -> Result<usize, &'static str> {
+        let extra = extra.clamp(1, 40) as usize;
+        let gap = gap.clamp(0.0, 40.0);
+        let Some((min, max)) = self.object(id).and_then(Self::world_bounds) else {
+            return Err("That model has no triangles.");
+        };
+        let Some(origin) = self.object(id).cloned() else {
+            return Err("That model is gone.");
+        };
+        let w = (max.x - min.x).max(0.1);
+        let d = (max.y - min.y).max(0.1);
+        let step_x = w + gap;
+        let step_y = d + gap;
+        let mut added = 0usize;
+        let mut col = 1i32;
+        let mut row = 0i32;
+        for n in 0..extra {
+            let mut x = min.x + col as f32 * step_x;
+            let mut y = min.y + row as f32 * step_y;
+            if x + w > plate_x + 0.5 {
+                col = 0;
+                row += 1;
+                x = min.x;
+                y = min.y + row as f32 * step_y;
+            }
+            if x + w > plate_x + 0.5 || y + d > plate_y + 0.5 {
+                return if added == 0 {
+                    Err("Those copies do not fit on the plate. Use a smaller gap or fewer copies.")
+                } else {
+                    Ok(added)
+                };
+            }
+            let new_id = self.alloc();
+            let mut copy = origin.clone();
+            copy.id = new_id;
+            copy.name = format!("{} {}", origin.name, n + 2);
+            copy.position.x += x - min.x;
+            copy.position.y += y - min.y;
+            self.objects.push(copy);
+            self.undo.push(Undo::Added(new_id));
+            added += 1;
+            col += 1;
+        }
+        self.selection = Selection::Object(id);
+        self.touch();
+        Ok(added)
+    }
+
+    /// Split the selected model on a horizontal plane and keep both pieces.
+    pub fn cut_at_z(&mut self, id: u64, z: f32) -> Result<u64, &'static str> {
+        let Some(obj) = self.object(id).cloned() else {
+            return Err("Select a model first.");
+        };
+        let world = Self::world_mesh(&obj);
+        let Some((min, max)) = world.bounds() else {
+            return Err("That model has no triangles.");
+        };
+        if z <= min[2] + 0.05 || z >= max[2] - 0.05 {
+            return Err(
+                "The cut sits outside the model. Pick a height between its bottom and its top.",
+            );
+        }
+        let (below, above) = world.split_at_z(z);
+        if below.triangle_count() == 0 || above.triangle_count() == 0 {
+            return Err("The cut did not produce two pieces.");
+        }
+        let added = self.alloc();
+        if let Some(lower) = self.object_mut(id) {
+            lower.mesh = below;
+            lower.position = Vec3::ZERO;
+            lower.rotation_deg = Vec3::ZERO;
+            lower.scale = Vec3::ONE;
+            lower.mesh_rev = lower.mesh_rev.wrapping_add(1);
+            if !lower.name.ends_with(" lower") {
+                lower.name = format!("{} lower", lower.name);
+            }
+            cache_bounds(lower);
+        }
+        let mut upper = obj.clone();
+        upper.id = added;
+        upper.mesh = above;
+        upper.position = Vec3::ZERO;
+        upper.rotation_deg = Vec3::ZERO;
+        upper.scale = Vec3::ONE;
+        upper.mesh_rev = 1;
+        upper.name = format!("{} upper", obj.name);
+        cache_bounds(&mut upper);
+        self.objects.push(upper);
+        self.undo.push(Undo::Cut {
+            original: obj,
+            added,
+        });
+        self.selection = Selection::Object(added);
+        self.touch();
+        Ok(added)
+    }
+
+    /// Names of the first two models whose boxes occupy the same space.
+    pub fn overlap_warning(&self) -> Option<String> {
+        let mut boxes = Vec::new();
+        for obj in &self.objects {
+            if let Some((min, max)) = Self::display_bounds(obj) {
+                boxes.push((obj.name.as_str(), min, max));
+            }
+        }
+        for i in 0..boxes.len() {
+            for j in (i + 1)..boxes.len() {
+                let (an, a0, a1) = boxes[i];
+                let (bn, b0, b1) = boxes[j];
+                let hit = a0.x < b1.x - 0.2
+                    && a1.x > b0.x + 0.2
+                    && a0.y < b1.y - 0.2
+                    && a1.y > b0.y + 0.2
+                    && a0.z < b1.z - 0.2
+                    && a1.z > b0.z + 0.2;
+                if hit {
+                    return Some(format!("{an} overlaps {bn}"));
+                }
+            }
+        }
+        None
     }
 
     pub fn delete_selection(&mut self) {
@@ -828,19 +977,17 @@ impl Document {
         let Some((min, max)) = Self::world_bounds(obj) else {
             return;
         };
-        let depth = (obj.bottom_cap_mm + obj.wall_mm + 4.0).clamp(6.0, 30.0);
-        let origin = Vec3::new(
-            (min.x + max.x) * 0.5,
-            (min.y + max.y) * 0.5,
-            min.z + 0.3,
-        );
+        let need = obj.bottom_cap_mm + obj.wall_mm + 1.0;
+        let depth = self.drain_depth_mm.max(need).clamp(1.0, 40.0);
+        let radius = (self.drain_diameter_mm * 0.5).clamp(0.2, 8.0);
+        let origin = Vec3::new((min.x + max.x) * 0.5, (min.y + max.y) * 0.5, min.z + 0.3);
         self.undo.push(Undo::Drains(self.drains.clone()));
         let drain_id = self.alloc();
         self.drains.push(DrainHole {
             id: drain_id,
             origin,
             axis: Vec3::Z,
-            radius_mm: 1.2,
+            radius_mm: radius,
             depth_mm: depth,
         });
         self.selection = Selection::Drain(drain_id);
@@ -872,12 +1019,14 @@ impl Document {
         } else {
             -into_model.normalize()
         };
+        let radius = (self.drain_diameter_mm * 0.5).clamp(0.2, 8.0);
+        let depth = self.drain_depth_mm.clamp(1.0, 40.0);
         self.drains.push(DrainHole {
             id,
             origin,
             axis,
-            radius_mm: 1.2,
-            depth_mm: 8.0,
+            radius_mm: radius,
+            depth_mm: depth,
         });
         self.selection = Selection::Drain(id);
         self.touch();
@@ -1102,6 +1251,35 @@ fn ray_triangle(origin: Vec3, dir: Vec3, a: Vec3, b: Vec3, c: Vec3) -> Option<(f
 mod tests {
     use super::*;
     use crate::mesh::box_mesh;
+
+    #[test]
+    fn cut_keeps_two_pieces_and_undo_restores_one() {
+        let mut doc = Document::new();
+        let id = doc.add_mesh("box".into(), box_mesh([0.0, 0.0, 0.0], [10.0, 10.0, 20.0]));
+        let upper = doc.cut_at_z(id, 8.0).unwrap();
+        assert_eq!(doc.objects.len(), 2);
+        assert_eq!(doc.selection, Selection::Object(upper));
+        doc.undo();
+        assert_eq!(doc.objects.len(), 1);
+        let obj = doc.object(id).unwrap();
+        let (_, max) = Document::world_bounds(obj).unwrap();
+        assert!((max.z - 20.0).abs() < 0.1, "restored height {}", max.z);
+    }
+
+    #[test]
+    fn overlapping_boxes_are_named() {
+        let mut doc = Document::new();
+        doc.add_mesh("left".into(), box_mesh([0.0, 0.0, 0.0], [10.0, 10.0, 10.0]));
+        doc.add_mesh(
+            "right".into(),
+            box_mesh([5.0, 0.0, 0.0], [15.0, 10.0, 10.0]),
+        );
+        let warning = doc.overlap_warning().unwrap();
+        assert!(
+            warning.contains("left") && warning.contains("right"),
+            "{warning}"
+        );
+    }
 
     #[test]
     fn fill_bed_tiles_a_small_cube() {

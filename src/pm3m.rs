@@ -149,7 +149,7 @@ fn write_header(
         machine.pixel_um,
         settings.layer_mm,
         settings.exposure_s,
-        settings.light_off_s,
+        settings.wait_s(),
         settings.bottom_exposure_s,
         settings.bottom_layers as f32,
         settings.lift_mm,

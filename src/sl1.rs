@@ -35,6 +35,7 @@ fn config_ini(slice: &Slice, machine: Machine, settings: &PrintSettings) -> Stri
         "action = print\n\
          expTime = {exp:.3}\n\
          expTimeFirst = {first:.3}\n\
+         lightOffDelay = {wait:.3}\n\
          layerHeight = {h:.3}\n\
          materialName = {resin}\n\
          numFade = {fade}\n\
@@ -51,6 +52,7 @@ fn config_ini(slice: &Slice, machine: Machine, settings: &PrintSettings) -> Stri
          prusaSlicerVersion = Amber\n",
         exp = settings.exposure_s,
         first = settings.bottom_exposure_s,
+        wait = settings.wait_s(),
         h = settings.layer_mm,
         resin = settings.resin.replace(['\n', '\r'], " "),
         fade = settings.transition_layers,

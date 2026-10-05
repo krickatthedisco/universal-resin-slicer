@@ -425,6 +425,8 @@ uniform vec3 u_light;
 uniform vec3 u_fill;
 uniform vec3 u_eye;
 uniform float u_alpha;
+uniform float u_show_overhang;
+uniform float u_overhang_deg;
 void main() {
     float len2 = dot(v_nrm, v_nrm);
     vec3 n = len2 > 1e-8 ? normalize(v_nrm) : vec3(0.0, 0.0, 1.0);
@@ -436,7 +438,14 @@ void main() {
     vec3 view = normalize(u_eye - v_pos);
     vec3 half_dir = normalize(light + view);
     float spec = pow(clamp(dot(n, half_dir), 0.0, 1.0), 48.0);
-    out_color = vec4(v_col * shade + vec3(spec * 0.16), u_alpha);
+    vec3 albedo = v_col;
+    if (u_show_overhang > 0.5 && n.z < -0.02) {
+        float slope = 90.0 - degrees(acos(clamp(-n.z, 0.0, 1.0)));
+        if (slope + 0.05 >= u_overhang_deg) {
+            albedo = mix(albedo, vec3(0.86, 0.24, 0.16), 0.82);
+        }
+    }
+    out_color = vec4(albedo * shade + vec3(spec * 0.16), u_alpha);
 }
 "#;
 
@@ -494,6 +503,8 @@ struct SolidLocs {
     fill: Option<glow::UniformLocation>,
     eye: Option<glow::UniformLocation>,
     alpha: Option<glow::UniformLocation>,
+    show_overhang: Option<glow::UniformLocation>,
+    overhang_deg: Option<glow::UniformLocation>,
 }
 
 pub struct Renderer {
@@ -527,6 +538,8 @@ impl Renderer {
                 fill: gl.get_uniform_location(program, "u_fill"),
                 eye: gl.get_uniform_location(program, "u_eye"),
                 alpha: gl.get_uniform_location(program, "u_alpha"),
+                show_overhang: gl.get_uniform_location(program, "u_show_overhang"),
+                overhang_deg: gl.get_uniform_location(program, "u_overhang_deg"),
             };
             let line_mvp = gl.get_uniform_location(line_program, "u_mvp");
             let line_vao = gl.create_vertex_array().map_err(|e| e.to_string())?;
@@ -641,7 +654,13 @@ impl Renderer {
         self.rafts = next;
     }
 
-    pub fn paint(&self, gl: &glow::Context, camera: &Camera, aspect: f32) {
+    pub fn paint(
+        &self,
+        gl: &glow::Context,
+        camera: &Camera,
+        aspect: f32,
+        overhang_deg: Option<f32>,
+    ) {
         unsafe {
             let vp = camera.view_proj(aspect);
             let eye = camera.eye();
@@ -658,6 +677,11 @@ impl Renderer {
             gl.uniform_3_f32(self.locs.light.as_ref(), 0.35, -0.25, 0.90);
             gl.uniform_3_f32(self.locs.fill.as_ref(), -0.4, 0.6, 0.2);
             gl.uniform_3_f32(self.locs.eye.as_ref(), eye.x, eye.y, eye.z);
+            gl.uniform_1_f32(self.locs.show_overhang.as_ref(), 0.0);
+            gl.uniform_1_f32(
+                self.locs.overhang_deg.as_ref(),
+                overhang_deg.unwrap_or(45.0),
+            );
             let under = camera.under_bed();
             if !under {
                 self.draw_solid(
@@ -683,9 +707,13 @@ impl Renderer {
             for raft in &self.rafts {
                 self.draw_solid(gl, &raft.batches, raft.model, raft_color, 0.0, 1.0, vp);
             }
+            if overhang_deg.is_some() {
+                gl.uniform_1_f32(self.locs.show_overhang.as_ref(), 1.0);
+            }
             for obj in &self.objects {
                 self.draw_solid(gl, &obj.batches, obj.model, obj.color, 1.0, 1.0, vp);
             }
+            gl.uniform_1_f32(self.locs.show_overhang.as_ref(), 0.0);
             if under {
                 gl.enable(glow::BLEND);
                 gl.blend_func(glow::SRC_ALPHA, glow::ONE_MINUS_SRC_ALPHA);

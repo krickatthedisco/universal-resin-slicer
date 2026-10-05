@@ -86,6 +86,12 @@ pub struct PrintSettings {
     pub bottom_layers: u32,
     pub transition_layers: u32,
     pub light_off_s: f32,
+    /// Wait after the lift, before the cure. Added to the file's light-off.
+    #[serde(default)]
+    pub rest_before_s: f32,
+    /// Wait after the cure, before the lift. Added to the file's light-off.
+    #[serde(default)]
+    pub rest_after_lift_s: f32,
     pub lift_mm: f32,
     pub lift_speed: f32,
     pub retract_speed: f32,
@@ -94,6 +100,9 @@ pub struct PrintSettings {
     pub bottom_retract_speed: f32,
     /// 1, 2, 4, or 8. 1 is a hard edge.
     pub anti_alias: u8,
+    /// Extra box blur in pixels. Zero leaves the anti-aliased edge alone.
+    #[serde(default)]
+    pub image_blur: u8,
     pub density_g_ml: f32,
     /// Positive grows the solid (and shrinks holes). Millimetres.
     #[serde(default)]
@@ -131,6 +140,8 @@ impl PrintSettings {
             bottom_layers: preset.bottom_layers,
             transition_layers: 0,
             light_off_s: preset.light_off_s,
+            rest_before_s: 0.0,
+            rest_after_lift_s: 0.0,
             lift_mm: preset.lift_mm,
             lift_speed: preset.lift_speed,
             retract_speed: preset.retract_speed,
@@ -138,6 +149,7 @@ impl PrintSettings {
             bottom_lift_speed: preset.lift_speed,
             bottom_retract_speed: preset.retract_speed,
             anti_alias: 4,
+            image_blur: 0,
             density_g_ml: 1.10,
             xy_offset_mm: 0.0,
             elephant_foot_mm: 0.0,
@@ -156,6 +168,8 @@ impl PrintSettings {
         s.bottom_layers = s.bottom_layers.clamp(1, 30);
         s.transition_layers = s.transition_layers.min(40);
         s.light_off_s = s.light_off_s.clamp(0.0, 30.0);
+        s.rest_before_s = s.rest_before_s.clamp(0.0, 30.0);
+        s.rest_after_lift_s = s.rest_after_lift_s.clamp(0.0, 30.0);
         s.lift_mm = s.lift_mm.clamp(1.0, 20.0);
         s.bottom_lift_mm = s.bottom_lift_mm.clamp(1.0, 20.0);
         s.lift_speed = s.lift_speed.clamp(0.2, 10.0);
@@ -168,6 +182,7 @@ impl PrintSettings {
             8 => 8,
             _ => 1,
         };
+        s.image_blur = s.image_blur.min(4);
         s.density_g_ml = s.density_g_ml.clamp(0.8, 2.0);
         s.xy_offset_mm = s.xy_offset_mm.clamp(-1.0, 1.0);
         s.elephant_foot_mm = s.elephant_foot_mm.clamp(0.0, 1.0);
@@ -283,6 +298,15 @@ pub const RESIN_PRESETS: &[ResinPreset] = &[
         retract_speed: 3.0,
     },
 ];
+
+impl PrintSettings {
+    /// The wait the Photon file can store. Rest before the cure and rest
+    /// after the lift are folded in once, so the time estimate and the
+    /// exported light-off describe the same pause.
+    pub fn wait_s(&self) -> f32 {
+        self.light_off_s + self.rest_before_s + self.rest_after_lift_s
+    }
+}
 
 pub fn layer_motion(settings: &PrintSettings, index: u32) -> (f32, f32, f32, f32) {
     let s = settings;

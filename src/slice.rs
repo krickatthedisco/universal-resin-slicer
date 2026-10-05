@@ -1,4 +1,4 @@
-//! Plane cut, scanline fill, shell, infill, drains, islands, and suction checks.
+//! Plane cut, scanline fill, shell, drains, islands, and suction checks.
 //!
 //! Layers are slabs stacked from the bed. Layer `i` is sampled on the plane
 //! through the middle of that slab, so a part's height in the file matches
@@ -205,25 +205,175 @@ pub fn slice(req: Request<'_>) -> Result<Slice, String> {
     }
 
     let layer_count = ((max_z / h).ceil() as u32).max(1);
-    // Each solid keeps the triangles that can still cross the plane. A tall
-    // mesh then only clips the band around the current layer.
-    let mut sweeps: Vec<Sweep> = solids.iter().map(Sweep::build).collect();
-    let mut layers = Vec::with_capacity(layer_count as usize);
-    let mut prev_solid = Bits::new(machine.res_x as usize, machine.res_y as usize);
-    let mut prev_enclosed: Vec<(i32, i32, u32)> = Vec::new();
+    // Sort each mesh once. Every core then walks its own z range forward,
+    // instead of re-sorting or clipping triangles that are already behind it.
+    let templates: Vec<Sweep> = solids.iter().map(Sweep::build).collect();
+    let threads = rayon::current_num_threads()
+        .max(1)
+        .min(layer_count as usize);
+    let chunk = (layer_count as usize).div_ceil(threads);
+    let ranges: Vec<(u32, u32)> = (0..threads)
+        .map(|t| {
+            let start = (t * chunk) as u32;
+            let end = (((t + 1) * chunk) as u32).min(layer_count);
+            (start, end)
+        })
+        .filter(|(start, end)| start < end)
+        .collect();
+    let cancel = req.cancel.clone();
+    let progress = req.progress.clone();
+    let drains = req.drains;
+    let mut products: Vec<RangeProduct> = ranges
+        .into_par_iter()
+        .map(|(start, end)| {
+            let sweeps: Vec<Sweep> = templates.iter().map(Sweep::fork).collect();
+            raster_range(
+                solids, drains, sweeps, machine, &settings, start, end, h, &cancel, &progress,
+            )
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    // Islands and sealed pockets need the previous layer. Each range already
+    // did that for its own layers; only the first layer of a later range is
+    // still open, and it is one decode per core.
+    let mut carry_bits = Bits::new(machine.res_x as usize, machine.res_y as usize);
+    let mut carry_enclosed: Vec<(i32, i32, u32)> = Vec::new();
     let mut thumb = vec![0u8; 224 * 168];
     let mut cavity_px_layers = 0.0f64;
     let mut sealed_layers = 0u32;
-
+    for product in &mut products {
+        if let Some(layer) = product.layers.first_mut() {
+            if layer.boundary {
+                let img = image_from_rle(&layer.rle, machine.res_x as i32, machine.res_y as i32)?;
+                let z = (layer.index as f32 + 0.5) * h;
+                if img.width > 0 {
+                    layer.islands = find_islands(&img, &carry_bits, machine, z);
+                    let mut seals = 0u32;
+                    for (x, y, area) in &carry_enclosed {
+                        if img.get(*x, *y) > 0 {
+                            seals += *area;
+                        }
+                    }
+                    layer.seals = seals;
+                    if seals > 0 {
+                        product.sealed += 1;
+                    }
+                }
+            }
+        }
+        carry_bits = std::mem::replace(&mut product.tail_bits, Bits::new(1, 1));
+        carry_enclosed = std::mem::take(&mut product.tail_enclosed);
+        cavity_px_layers += product.cavity_px;
+        sealed_layers += product.sealed;
+        for (i, v) in product.thumb.iter().enumerate() {
+            if *v > thumb[i] {
+                thumb[i] = *v;
+            }
+        }
+    }
     let mut last_solid = 0u32;
     let mut raw: Vec<Option<Layer>> = Vec::with_capacity(layer_count as usize);
+    for product in products {
+        for layer in product.layers {
+            if layer.nonzero > 0 {
+                last_solid = layer.index;
+            }
+            raw.push(Some(Layer {
+                index: layer.index,
+                z_top_mm: layer.z_top_mm,
+                thickness_mm: h,
+                exposure_s: layer.exposure_s,
+                lift_mm: layer.lift_mm,
+                lift_speed: layer.lift_speed,
+                rle: layer.rle,
+                nonzero: layer.nonzero,
+                coverage: layer.coverage,
+                islands: layer.islands,
+                seals_cavity_px: layer.seals,
+            }));
+        }
+    }
+    let mut layers = Vec::with_capacity(layer_count as usize);
+    for layer in raw.into_iter().take((last_solid + 1) as usize).flatten() {
+        layers.push(layer);
+    }
+    let _ = min_z;
+    if layers.is_empty() {
+        return Err("The slice produced no exposed pixels. The mesh may be below the bed or inside out. Try Flip normals.".into());
+    }
 
-    for index in 0..layer_count {
-        if req
-            .cancel
-            .as_ref()
-            .is_some_and(|c| c.load(Ordering::Relaxed))
-        {
+    let pixel_area = (machine.pixel_mm() as f64) * (machine.pixel_mm_y() as f64);
+    let mut cured_mm3 = 0.0f64;
+    let mut seconds = 0.0f32;
+    for layer in &layers {
+        cured_mm3 += layer.coverage * pixel_area * h as f64;
+        let (_, lift, lift_speed, retract) = layer_motion(&settings, layer.index);
+        seconds += layer.exposure_s + move_seconds(lift, lift_speed, retract, settings.wait_s());
+    }
+    let cured_ml = (cured_mm3 / 1000.0) as f32;
+    let cavity_ml = (cavity_px_layers * pixel_area * h as f64 / 1000.0) as f32;
+    if sealed_layers > 0 {
+        warnings.push(format!(
+            "{sealed_layers} layers seal an interior pocket ({cavity_ml:.2} ml of air in the slice). Add a drain at the bottom of a hollow, or it can suction onto the film. Fill enclosed voids closes accidental pockets and leaves a model you hollowed empty."
+        ));
+    }
+    Ok(Slice {
+        width: machine.res_x,
+        height: machine.res_y,
+        layers,
+        cured_ml,
+        weight_g: cured_ml * settings.density_g_ml,
+        seconds: seconds.round() as u32,
+        warnings,
+        thumbnail: thumb,
+        cavity_ml,
+        sealed_layers,
+    })
+}
+
+struct LayerJob {
+    index: u32,
+    z_top_mm: f32,
+    exposure_s: f32,
+    lift_mm: f32,
+    lift_speed: f32,
+    rle: Vec<u8>,
+    nonzero: u32,
+    coverage: f64,
+    islands: Vec<Island>,
+    seals: u32,
+    /// First exposed layer of a range that did not see the previous range.
+    boundary: bool,
+}
+
+struct RangeProduct {
+    layers: Vec<LayerJob>,
+    thumb: Vec<u8>,
+    cavity_px: f64,
+    sealed: u32,
+    tail_bits: Bits,
+    tail_enclosed: Vec<(i32, i32, u32)>,
+}
+
+fn raster_range(
+    solids: &[Solid],
+    drains: &[Drain],
+    mut sweeps: Vec<Sweep>,
+    machine: Machine,
+    settings: &PrintSettings,
+    start: u32,
+    end: u32,
+    h: f32,
+    cancel: &Option<Arc<AtomicBool>>,
+    progress: &Option<Arc<AtomicU32>>,
+) -> Result<RangeProduct, String> {
+    let mut layers = Vec::with_capacity((end - start) as usize);
+    let mut prev_solid = Bits::new(machine.res_x as usize, machine.res_y as usize);
+    let mut prev_enclosed: Vec<(i32, i32, u32)> = Vec::new();
+    let mut thumb = vec![0u8; 224 * 168];
+    let mut cavity_px = 0.0f64;
+    let mut sealed = 0u32;
+    for index in start..end {
+        if cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed)) {
             return Err("Slice cancelled.".into());
         }
         let z = (index as f32 + 0.5) * h;
@@ -252,42 +402,39 @@ pub fn slice(req: Request<'_>) -> Result<Slice, String> {
         if index < settings.bottom_layers {
             offset_image(&mut image, -settings.elephant_foot_mm, machine);
         }
-        apply_drains(&mut image, req.drains, z, machine);
-        let (exposure, lift, lift_speed, retract) = layer_motion(&settings, index);
-        let _ = retract;
-
+        apply_drains(&mut image, drains, z, machine);
+        if settings.image_blur > 0 {
+            box_blur(&mut image, settings.image_blur as i32);
+        }
+        let (exposure, lift, lift_speed, _) = layer_motion(settings, index);
+        let boundary = index == start && start > 0 && image.width > 0;
         let mut islands = Vec::new();
         let mut seals = 0u32;
         if image.width > 0 {
-            if index > 0 {
+            if !boundary && index > 0 {
                 islands = find_islands(&image, &prev_solid, machine, z);
-            }
-            for (x, y, area) in &prev_enclosed {
-                if image.get(*x, *y) > 0 {
-                    seals += *area;
+                for (x, y, area) in &prev_enclosed {
+                    if image.get(*x, *y) > 0 {
+                        seals += *area;
+                    }
+                }
+                if seals > 0 {
+                    sealed += 1;
                 }
             }
-            if seals > 0 {
-                sealed_layers += 1;
-            }
             prev_enclosed = enclosed_centroids(&image);
-            cavity_px_layers += prev_enclosed.iter().map(|p| p.2 as f64).sum::<f64>();
+            cavity_px += prev_enclosed.iter().map(|p| p.2 as f64).sum::<f64>();
             paint_bits(&mut prev_solid, &image);
             splat_thumb(&mut thumb, &image, machine);
         } else if index > 0 {
             prev_enclosed.clear();
             prev_solid.clear();
         }
-
         let (rle, nonzero, coverage) =
             encode_rle(&image, machine.res_x as i32, machine.res_y as i32);
-        if nonzero > 0 {
-            last_solid = index;
-        }
-        raw.push(Some(Layer {
+        layers.push(LayerJob {
             index,
             z_top_mm: (index as f32 + 1.0) * h,
-            thickness_mm: h,
             exposure_s: exposure,
             lift_mm: lift,
             lift_speed,
@@ -295,55 +442,28 @@ pub fn slice(req: Request<'_>) -> Result<Slice, String> {
             nonzero,
             coverage,
             islands,
-            seals_cavity_px: seals,
-        }));
-        if let Some(p) = &req.progress {
-            p.store(index + 1, Ordering::Relaxed);
+            seals,
+            boundary,
+        });
+        if let Some(p) = progress {
+            p.fetch_add(1, Ordering::Relaxed);
         }
-        let _ = min_z;
     }
-
-    for layer in raw.into_iter().take((last_solid + 1) as usize).flatten() {
-        layers.push(layer);
-    }
-    if layers.is_empty() {
-        return Err("The slice produced no exposed pixels. The mesh may be below the bed or inside out. Try Flip normals.".into());
-    }
-
-    let pixel_area = (machine.pixel_mm() as f64) * (machine.pixel_mm_y() as f64);
-    let mut cured_mm3 = 0.0f64;
-    let mut seconds = 0.0f32;
-    for layer in &layers {
-        cured_mm3 += layer.coverage * pixel_area * h as f64;
-        let (_, lift, lift_speed, retract) = layer_motion(&settings, layer.index);
-        seconds += layer.exposure_s + move_seconds(lift, lift_speed, retract, settings.light_off_s);
-    }
-    let cured_ml = (cured_mm3 / 1000.0) as f32;
-    let cavity_ml = (cavity_px_layers * pixel_area * h as f64 / 1000.0) as f32;
-    if sealed_layers > 0 {
-        warnings.push(format!(
-            "{sealed_layers} layers seal an interior pocket ({cavity_ml:.2} ml of air in the slice). Add a drain at the bottom of a hollow, or it can suction onto the film. Fill enclosed voids closes accidental pockets and leaves a model you hollowed empty."
-        ));
-    }
-    Ok(Slice {
-        width: machine.res_x,
-        height: machine.res_y,
+    Ok(RangeProduct {
         layers,
-        cured_ml,
-        weight_g: cured_ml * settings.density_g_ml,
-        seconds: seconds.round() as u32,
-        warnings,
-        thumbnail: thumb,
-        cavity_ml,
-        sealed_layers,
+        thumb,
+        cavity_px,
+        sealed,
+        tail_bits: prev_solid,
+        tail_enclosed: prev_enclosed,
     })
 }
 
 /// Triangles sorted by the lowest vertex so a layer can skip the rest of a tall mesh.
 struct Sweep {
-    zmin: Vec<f32>,
-    zmax: Vec<f32>,
-    order: Vec<u32>,
+    zmin: Arc<[f32]>,
+    zmax: Arc<[f32]>,
+    order: Arc<[u32]>,
     cursor: usize,
     active: Vec<u32>,
 }
@@ -370,9 +490,19 @@ impl Sweep {
         let mut order: Vec<u32> = (0..n as u32).collect();
         order.sort_by(|&a, &b| zmin[a as usize].total_cmp(&zmin[b as usize]));
         Self {
-            zmin,
-            zmax,
-            order,
+            zmin: zmin.into(),
+            zmax: zmax.into(),
+            order: order.into(),
+            cursor: 0,
+            active: Vec::new(),
+        }
+    }
+
+    fn fork(&self) -> Self {
+        Self {
+            zmin: Arc::clone(&self.zmin),
+            zmax: Arc::clone(&self.zmax),
+            order: Arc::clone(&self.order),
             cursor: 0,
             active: Vec::new(),
         }
@@ -424,7 +554,10 @@ fn clip_tris(solid: &Solid, z: f32, machine: Machine, tris: &[u32]) -> Vec<([f32
         }
     };
     // Order is preserved so a cracked contour still stitches the same way.
-    if tris.len() >= 4096 {
+    // A layer worker is already on a rayon thread. Nested row or triangle
+    // pools only fight that and make a tall slice slower.
+    let nested = rayon::current_thread_index().is_some();
+    if !nested && tris.len() >= 4096 {
         tris.par_iter().copied().filter_map(one).collect()
     } else {
         tris.iter().copied().filter_map(one).collect()
@@ -1583,11 +1716,179 @@ pub(crate) fn encode_rle(img: &Image, plate_w: i32, plate_h: i32) -> (Vec<u8>, u
     let content = img.width as i64 * img.height as i64;
     // A full-plate layer is tens of millions of pixels. Rows do not depend on
     // each other, so those layers split across cores. Smaller layers stay on
-    // one core and keep a single run across empty rows.
-    if content >= 250_000 && plate_w > 0 && plate_h > 0 {
+    // one core and keep a single run across empty rows. Inside a layer worker
+    // the cores are already busy, so the encode stays on that worker.
+    let nested = rayon::current_thread_index().is_some();
+    if !nested && content >= 250_000 && plate_w > 0 && plate_h > 0 {
         encode_rle_rows(img, plate_w, plate_h)
     } else {
         encode_rle_serial(img, plate_w, plate_h)
+    }
+}
+
+/// Rebuild the cropped gray image a layer stored. Empty plates stay empty
+/// instead of allocating the full LCD.
+fn image_from_rle(rle: &[u8], plate_w: i32, plate_h: i32) -> Result<Image, String> {
+    if plate_w <= 0 || plate_h <= 0 {
+        return Ok(Image::empty());
+    }
+    let n = (plate_w as usize)
+        .checked_mul(plate_h as usize)
+        .ok_or("resolution overflow")?;
+    let mut min_x = plate_w;
+    let mut min_y = plate_h;
+    let mut max_x = -1i32;
+    let mut max_y = -1i32;
+    let mut i = 0usize;
+    let mut p = 0usize;
+    while i < rle.len() && p < n {
+        let (color, reps, step) = next_run(rle, i)?;
+        i += step;
+        if reps == 0 || p + reps > n {
+            return Err(format!("RLE run of {reps} at pixel {p} does not fit {n}"));
+        }
+        if color > 0 {
+            cover_span(
+                p,
+                reps,
+                plate_w as usize,
+                &mut min_x,
+                &mut min_y,
+                &mut max_x,
+                &mut max_y,
+            );
+        }
+        p += reps;
+    }
+    if p != n {
+        return Err(format!("RLE decoded {p} pixels, expected {n}"));
+    }
+    if max_x < min_x || max_y < min_y {
+        return Ok(Image::empty());
+    }
+    let width = max_x - min_x + 1;
+    let height = max_y - min_y + 1;
+    let mut pixels = vec![0u8; (width * height) as usize];
+    let w = plate_w as usize;
+    i = 0;
+    p = 0;
+    while i < rle.len() && p < n {
+        let (color, reps, step) = next_run(rle, i)?;
+        i += step;
+        if color > 0 {
+            let mut left = p;
+            let end = p + reps;
+            while left < end {
+                let y = left / w;
+                let row_end = ((y + 1) * w).min(end);
+                let lx = (left % w) as i32 - min_x;
+                let ly = y as i32 - min_y;
+                let count = row_end - left;
+                let dst = (ly as usize) * width as usize + lx as usize;
+                pixels[dst..dst + count].fill(color);
+                left = row_end;
+            }
+        }
+        p += reps;
+    }
+    Ok(Image {
+        x0: min_x,
+        y0: min_y,
+        width,
+        height,
+        pixels,
+    })
+}
+
+fn next_run(rle: &[u8], i: usize) -> Result<(u8, usize, usize), String> {
+    if i >= rle.len() {
+        return Err("RLE ended early".into());
+    }
+    let b = rle[i];
+    let code = b >> 4;
+    let low = b & 0x0f;
+    if code == 0 || code == 0x0f {
+        if i + 1 >= rle.len() {
+            return Err("RLE ended inside a black or white run".into());
+        }
+        let reps = ((low as usize) << 8) | rle[i + 1] as usize;
+        let color = if code == 0 { 0 } else { 255 };
+        Ok((color, reps, 2))
+    } else {
+        let color = (code << 4) | code;
+        Ok((color, low as usize, 1))
+    }
+}
+
+fn cover_span(
+    p: usize,
+    reps: usize,
+    plate_w: usize,
+    min_x: &mut i32,
+    min_y: &mut i32,
+    max_x: &mut i32,
+    max_y: &mut i32,
+) {
+    let mut left = p;
+    let end = p + reps;
+    while left < end {
+        let y = (left / plate_w) as i32;
+        let row_end = ((y as usize + 1) * plate_w).min(end);
+        let x0 = (left % plate_w) as i32;
+        let x1 = ((row_end - 1) % plate_w) as i32;
+        *min_x = (*min_x).min(x0);
+        *max_x = (*max_x).max(x1);
+        *min_y = (*min_y).min(y);
+        *max_y = (*max_y).max(y);
+        left = row_end;
+    }
+}
+
+fn box_blur(img: &mut Image, radius: i32) {
+    let radius = radius.max(0) as usize;
+    if radius == 0 || img.width < 1 || img.height < 1 {
+        return;
+    }
+    let w = img.width as usize;
+    let h = img.height as usize;
+    if img.pixels.len() < w * h {
+        return;
+    }
+    let mut tmp = vec![0u8; w * h];
+    blur_rows(&img.pixels, &mut tmp, w, h, radius);
+    blur_cols(&tmp, &mut img.pixels, w, h, radius);
+}
+
+fn blur_rows(src: &[u8], dst: &mut [u8], w: usize, h: usize, radius: usize) {
+    for y in 0..h {
+        let row = y * w;
+        let mut prefix = vec![0u32; w + 1];
+        for x in 0..w {
+            prefix[x + 1] = prefix[x] + src[row + x] as u32;
+        }
+        for x in 0..w {
+            let a = x.saturating_sub(radius);
+            let b = (x + radius).min(w - 1);
+            let sum = prefix[b + 1] - prefix[a];
+            let n = (b - a + 1) as u32;
+            dst[row + x] = (sum / n) as u8;
+        }
+    }
+}
+
+fn blur_cols(src: &[u8], dst: &mut [u8], w: usize, h: usize, radius: usize) {
+    for x in 0..w {
+        let mut prefix = vec![0u32; h + 1];
+        for y in 0..h {
+            prefix[y + 1] = prefix[y] + src[y * w + x] as u32;
+        }
+        for y in 0..h {
+            let a = y.saturating_sub(radius);
+            let b = (y + radius).min(h - 1);
+            let sum = prefix[b + 1] - prefix[a];
+            let n = (b - a + 1) as u32;
+            dst[y * w + x] = (sum / n) as u8;
+        }
     }
 }
 
@@ -1826,12 +2127,8 @@ mod tests {
     #[test]
     fn separate_shapes_do_not_grow_a_line_between_them() {
         let machine = machine_no_flip();
-        let wall = |x0: f32, x1: f32, y0: f32, y1: f32| {
-            vec![
-                ([x0, y0], [x0, y1]),
-                ([x1, y0], [x1, y1]),
-            ]
-        };
+        let wall =
+            |x0: f32, x1: f32, y0: f32, y1: f32| vec![([x0, y0], [x0, y1]), ([x1, y0], [x1, y1])];
         let mut segs = wall(10.0, 30.0, 10.0, 40.0);
         segs.extend(wall(80.0, 100.0, 10.0, 40.0));
         // One leftover edge, as a tangent or a cracked contour leaves behind.
@@ -2313,5 +2610,45 @@ mod tests {
         assert_eq!(back[60 * 900 + 60], 255);
         assert_eq!(back[0], 0);
         assert_eq!(back.iter().filter(|p| **p > 0).count(), nonzero as usize);
+        let cropped = image_from_rle(&rle, 900, 500).unwrap();
+        assert!(cropped.get(60, 60) > 0);
+        assert_eq!(cropped.get(0, 0), 0);
+    }
+
+    #[test]
+    fn rest_is_counted_once_in_the_time_estimate() {
+        let mesh = box_mesh([10.0, 10.0, 0.0], [16.0, 16.0, 1.0]);
+        let solid = Solid {
+            vertices: mesh.vertices,
+            indices: mesh.indices,
+            hollow: None,
+        };
+        let mut plain = PrintSettings::default();
+        plain.layer_mm = 0.5;
+        plain.anti_alias = 1;
+        let mut rested = plain.clone();
+        rested.rest_before_s = 1.0;
+        rested.rest_after_lift_s = 0.5;
+        let run = |settings: &PrintSettings| {
+            slice(Request {
+                solids: &[solid.clone()],
+                drains: &[],
+                machine: machine_no_flip(),
+                settings,
+                cancel: None,
+                progress: None,
+            })
+            .unwrap()
+        };
+        let a = run(&plain);
+        let b = run(&rested);
+        assert_eq!(a.layers.len(), b.layers.len());
+        assert_eq!(a.layers[0].nonzero, b.layers[0].nonzero);
+        let extra = (b.layers.len() as f32) * 1.5;
+        let got = b.seconds as f32 - a.seconds as f32;
+        assert!(
+            (got - extra).abs() < 2.0,
+            "rest added {got}s, expected about {extra}"
+        );
     }
 }

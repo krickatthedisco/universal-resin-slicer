@@ -106,6 +106,334 @@ impl Mesh {
         self.vertices.extend_from_slice(&other.vertices);
         self.indices.extend(other.indices.iter().map(|i| i + base));
     }
+
+    /// Cut on the horizontal plane `z` and close both pieces across the cut.
+    pub fn split_at_z(&self, z: f32) -> (Mesh, Mesh) {
+        split_mesh_at_z(self, z)
+    }
+}
+
+const CUT_EPS: f32 = 1e-4;
+
+fn split_mesh_at_z(mesh: &Mesh, z: f32) -> (Mesh, Mesh) {
+    let mut below = Weld::new();
+    let mut above = Weld::new();
+    let mut cap_edges: Vec<([f32; 3], [f32; 3])> = Vec::new();
+    for tri in mesh.indices.chunks_exact(3) {
+        let a = mesh.vertices[tri[0] as usize];
+        let b = mesh.vertices[tri[1] as usize];
+        let c = mesh.vertices[tri[2] as usize];
+        if on_plane(a, z) && on_plane(b, z) && on_plane(c, z) {
+            if face_normal(a, b, c)[2] >= 0.0 {
+                below.add_tri(a, b, c);
+            } else {
+                above.add_tri(a, b, c);
+            }
+            continue;
+        }
+        let (low, edge) = clip_side(&[a, b, c], z, true);
+        if low.len() >= 3 {
+            below.add_poly(&low);
+        }
+        if let Some(edge) = edge {
+            cap_edges.push(edge);
+        }
+        let (high, _) = clip_side(&[a, b, c], z, false);
+        if high.len() >= 3 {
+            above.add_poly(&high);
+        }
+    }
+    let cap = cap_from_edges(&cap_edges, true);
+    let mut cap_down = cap.clone();
+    cap_down.flip_winding();
+    below.mesh.append(&cap);
+    above.mesh.append(&cap_down);
+    (below.mesh, above.mesh)
+}
+
+fn on_plane(p: [f32; 3], z: f32) -> bool {
+    (p[2] - z).abs() <= CUT_EPS
+}
+
+fn inside_side(p: [f32; 3], z: f32, keep_below: bool) -> bool {
+    if keep_below {
+        p[2] <= z + CUT_EPS
+    } else {
+        p[2] >= z - CUT_EPS
+    }
+}
+
+fn plane_point(a: [f32; 3], b: [f32; 3], z: f32) -> [f32; 3] {
+    let denom = b[2] - a[2];
+    let t = if denom.abs() < 1e-12 {
+        0.0
+    } else {
+        ((z - a[2]) / denom).clamp(0.0, 1.0)
+    };
+    [a[0] + t * (b[0] - a[0]), a[1] + t * (b[1] - a[1]), z]
+}
+
+/// Polygon kept on one side of the plane, plus the cut edge in boundary order.
+fn clip_side(
+    poly: &[[f32; 3]],
+    z: f32,
+    keep_below: bool,
+) -> (Vec<[f32; 3]>, Option<([f32; 3], [f32; 3])>) {
+    if poly.is_empty() {
+        return (Vec::new(), None);
+    }
+    let mut out = Vec::new();
+    let mut prev = poly[poly.len() - 1];
+    let mut prev_in = inside_side(prev, z, keep_below);
+    for &curr in poly {
+        let curr_in = inside_side(curr, z, keep_below);
+        if curr_in != prev_in {
+            out.push(plane_point(prev, curr, z));
+        }
+        if curr_in {
+            out.push(curr);
+        }
+        prev = curr;
+        prev_in = curr_in;
+    }
+    let mut edge = None;
+    if out.len() >= 2 {
+        for i in 0..out.len() {
+            let p = out[i];
+            let q = out[(i + 1) % out.len()];
+            if on_plane(p, z) && on_plane(q, z) && (p[0] - q[0]).abs() + (p[1] - q[1]).abs() > 1e-4
+            {
+                edge = Some((p, q));
+                break;
+            }
+        }
+    }
+    (out, edge)
+}
+
+struct Weld {
+    map: HashMap<(i32, i32, i32), u32>,
+    mesh: Mesh,
+}
+
+impl Weld {
+    fn new() -> Self {
+        Self {
+            map: HashMap::new(),
+            mesh: Mesh {
+                vertices: Vec::new(),
+                indices: Vec::new(),
+            },
+        }
+    }
+
+    fn add_poly(&mut self, poly: &[[f32; 3]]) {
+        if poly.len() < 3 {
+            return;
+        }
+        for i in 1..poly.len() - 1 {
+            self.add_tri(poly[0], poly[i], poly[i + 1]);
+        }
+    }
+
+    fn add_tri(&mut self, a: [f32; 3], b: [f32; 3], c: [f32; 3]) {
+        let ia = self.vert(a);
+        let ib = self.vert(b);
+        let ic = self.vert(c);
+        if ia != ib && ib != ic && ia != ic {
+            self.mesh.indices.extend_from_slice(&[ia, ib, ic]);
+        }
+    }
+
+    fn vert(&mut self, p: [f32; 3]) -> u32 {
+        let key = (
+            (p[0] * 1000.0).round() as i32,
+            (p[1] * 1000.0).round() as i32,
+            (p[2] * 1000.0).round() as i32,
+        );
+        if let Some(id) = self.map.get(&key) {
+            return *id;
+        }
+        let id = self.mesh.vertices.len() as u32;
+        self.map.insert(key, id);
+        self.mesh.vertices.push(p);
+        id
+    }
+}
+
+fn cap_from_edges(segs: &[([f32; 3], [f32; 3])], normal_up: bool) -> Mesh {
+    let loops = stitch_loops(segs);
+    let mut mesh = Mesh {
+        vertices: Vec::new(),
+        indices: Vec::new(),
+    };
+    for mut loop_pts in loops {
+        if loop_pts.len() < 3 {
+            continue;
+        }
+        let area = signed_area_xy(&loop_pts);
+        let want_positive = normal_up;
+        if (area >= 0.0) != want_positive {
+            loop_pts.reverse();
+        }
+        let flat: Vec<[f32; 2]> = loop_pts.iter().map(|p| [p[0], p[1]]).collect();
+        let tris = ear_clip(&flat);
+        let base = mesh.vertices.len() as u32;
+        mesh.vertices.extend(loop_pts);
+        for (a, b, c) in tris {
+            mesh.indices
+                .extend_from_slice(&[base + a as u32, base + b as u32, base + c as u32]);
+        }
+    }
+    mesh
+}
+
+fn signed_area_xy(poly: &[[f32; 3]]) -> f32 {
+    let mut area = 0.0f32;
+    for i in 0..poly.len() {
+        let p = poly[i];
+        let q = poly[(i + 1) % poly.len()];
+        area += p[0] * q[1] - q[0] * p[1];
+    }
+    area * 0.5
+}
+
+fn stitch_loops(segs: &[([f32; 3], [f32; 3])]) -> Vec<Vec<[f32; 3]>> {
+    let key = |p: [f32; 3]| {
+        (
+            (p[0] * 1000.0).round() as i32,
+            (p[1] * 1000.0).round() as i32,
+        )
+    };
+    struct Seg {
+        a: [f32; 3],
+        b: [f32; 3],
+        used: bool,
+    }
+    let mut segs: Vec<Seg> = segs
+        .iter()
+        .copied()
+        .map(|(a, b)| Seg { a, b, used: false })
+        .collect();
+    let mut map: HashMap<(i32, i32), Vec<usize>> = HashMap::new();
+    for (i, seg) in segs.iter().enumerate() {
+        map.entry(key(seg.a)).or_default().push(i);
+    }
+    let mut loops = Vec::new();
+    for i in 0..segs.len() {
+        if segs[i].used {
+            continue;
+        }
+        let start = segs[i].a;
+        let mut current = segs[i].b;
+        segs[i].used = true;
+        let mut pts = vec![start];
+        if key(current) != key(start) {
+            pts.push(current);
+        }
+        let mut guard = 0;
+        while key(current) != key(start) && guard < segs.len() + 2 {
+            guard += 1;
+            let Some(cands) = map.get(&key(current)) else {
+                break;
+            };
+            let Some(j) = cands.iter().copied().find(|&j| !segs[j].used) else {
+                break;
+            };
+            segs[j].used = true;
+            current = segs[j].b;
+            if key(current) != key(start) {
+                pts.push(current);
+            }
+        }
+        if pts.len() >= 3 && key(current) == key(start) {
+            loops.push(pts);
+        }
+    }
+    loops
+}
+
+fn ear_clip(poly: &[[f32; 2]]) -> Vec<(usize, usize, usize)> {
+    let n = poly.len();
+    if n < 3 {
+        return Vec::new();
+    }
+    if n == 3 {
+        return vec![(0, 1, 2)];
+    }
+    let mut left: Vec<usize> = (0..n).collect();
+    let ccw = signed_area_flat(poly) >= 0.0;
+    let mut tris = Vec::new();
+    let mut guard = 0;
+    while left.len() > 3 && guard < n * n {
+        guard += 1;
+        let m = left.len();
+        let mut clipped = false;
+        for i in 0..m {
+            let i0 = left[(i + m - 1) % m];
+            let i1 = left[i];
+            let i2 = left[(i + 1) % m];
+            if is_ear(poly, &left, i0, i1, i2, ccw) {
+                tris.push((i0, i1, i2));
+                left.remove(i);
+                clipped = true;
+                break;
+            }
+        }
+        if !clipped {
+            break;
+        }
+    }
+    if left.len() >= 3 {
+        for i in 1..left.len() - 1 {
+            tris.push((left[0], left[i], left[i + 1]));
+        }
+    }
+    tris
+}
+
+fn signed_area_flat(poly: &[[f32; 2]]) -> f32 {
+    let mut area = 0.0f32;
+    for i in 0..poly.len() {
+        let p = poly[i];
+        let q = poly[(i + 1) % poly.len()];
+        area += p[0] * q[1] - q[0] * p[1];
+    }
+    area * 0.5
+}
+
+fn is_ear(poly: &[[f32; 2]], left: &[usize], i0: usize, i1: usize, i2: usize, ccw: bool) -> bool {
+    let a = poly[i0];
+    let b = poly[i1];
+    let c = poly[i2];
+    let cross = (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]);
+    if ccw && cross <= 1e-6 {
+        return false;
+    }
+    if !ccw && cross >= -1e-6 {
+        return false;
+    }
+    for &i in left {
+        if i == i0 || i == i1 || i == i2 {
+            continue;
+        }
+        if point_in_tri(poly[i], a, b, c) {
+            return false;
+        }
+    }
+    true
+}
+
+fn point_in_tri(p: [f32; 2], a: [f32; 2], b: [f32; 2], c: [f32; 2]) -> bool {
+    let sign = |p: [f32; 2], q: [f32; 2], r: [f32; 2]| {
+        (p[0] - r[0]) * (q[1] - r[1]) - (q[0] - r[0]) * (p[1] - r[1])
+    };
+    let d1 = sign(p, a, b);
+    let d2 = sign(p, b, c);
+    let d3 = sign(p, c, a);
+    let neg = d1 < -1e-6 || d2 < -1e-6 || d3 < -1e-6;
+    let pos = d1 > 1e-6 || d2 > 1e-6 || d3 > 1e-6;
+    !(neg && pos)
 }
 
 pub fn load_mesh(path: &Path) -> Result<Mesh> {
@@ -485,5 +813,22 @@ mod tests {
         let ml = mesh.volume_mm3() / 1000.0;
         assert!((ml - 1.0).abs() < 1e-3, "ml {ml}");
         assert_eq!(mesh.triangle_count(), 12);
+    }
+
+    #[test]
+    fn a_box_cut_in_half_keeps_both_volumes() {
+        let mesh = box_mesh([0.0, 0.0, 0.0], [10.0, 20.0, 8.0]);
+        let (below, above) = mesh.split_at_z(3.0);
+        let whole = mesh.signed_volume_mm3();
+        let low = below.signed_volume_mm3();
+        let high = above.signed_volume_mm3();
+        assert!(low > 0.0, "lower piece inside out: {low}");
+        assert!(high > 0.0, "upper piece inside out: {high}");
+        assert!((low - 10.0 * 20.0 * 3.0).abs() < 2.0, "lower {low}");
+        assert!((high - 10.0 * 20.0 * 5.0).abs() < 2.0, "upper {high}");
+        assert!(
+            (low + high - whole).abs() < 2.0,
+            "sum {low}+{high} vs {whole}"
+        );
     }
 }

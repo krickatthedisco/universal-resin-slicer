@@ -142,6 +142,10 @@ pub struct AmberApp {
     only_profiled: bool,
     part_menu: Option<egui::Pos2>,
     part_menu_fresh: bool,
+    show_overhangs: bool,
+    copy_count: u32,
+    copy_gap: f32,
+    cut_z: f32,
 }
 
 impl AmberApp {
@@ -244,6 +248,10 @@ impl AmberApp {
             only_profiled,
             part_menu: None,
             part_menu_fresh: false,
+            show_overhangs: false,
+            copy_count: 2,
+            copy_gap: 3.0,
+            cut_z: 10.0,
         }
     }
 
@@ -652,6 +660,7 @@ impl AmberApp {
                     self.camera.pitch = -55.0;
                     ui.close();
                 }
+                ui.checkbox(&mut self.show_overhangs, "Show overhangs");
                 if ui.button("Right").clicked() {
                     self.camera.pitch = 8.0;
                     self.camera.yaw = 90.0;
@@ -791,6 +800,9 @@ impl AmberApp {
             if self.doc.outside_plate(self.plate()) {
                 ui.colored_label(egui::Color32::from_rgb(220, 120, 90), "Outside the plate");
             }
+            if let Some(overlap) = self.doc.overlap_warning() {
+                ui.colored_label(egui::Color32::from_rgb(220, 120, 90), overlap);
+            }
             ui.separator();
             ui.label(&self.status);
         });
@@ -872,7 +884,8 @@ impl AmberApp {
         self.doc.punch_bottom_drain(id);
         self.tool = Tool::Drain;
         self.invalidate_slice();
-        self.status = "Punched a drain at the bottom of this model. Click the shell to place another.".into();
+        self.status =
+            "Punched a drain at the bottom of this model. Click the shell to place another.".into();
     }
 
     fn grow_supports(&mut self, platform_only: bool) {
@@ -1033,6 +1046,46 @@ impl AmberApp {
                 self.invalidate_slice();
             }
         });
+        ui.label("Quarter turns");
+        ui.horizontal_wrapped(|ui| {
+            for (label, axis, deg) in [
+                ("−90° X", 0, -90.0),
+                ("+90° X", 0, 90.0),
+                ("−90° Y", 1, -90.0),
+                ("+90° Y", 1, 90.0),
+                ("−90° Z", 2, -90.0),
+                ("+90° Z", 2, 90.0),
+            ] {
+                if ui.button(label).clicked() {
+                    self.turn(id, axis, deg);
+                }
+            }
+        });
+        ui.separator();
+        ui.label("Cut on Z keeps both pieces. The upper piece stays selected.");
+        drag_f32(ui, "Cut height", &mut self.cut_z, 0.1, 0.0, 400.0, "mm");
+        if ui.button("Cut").clicked() {
+            match self.doc.cut_at_z(id, self.cut_z) {
+                Ok(_) => {
+                    self.invalidate_slice();
+                    self.status = "Cut the model and kept both pieces.".into();
+                }
+                Err(err) => self.status = err.into(),
+            }
+        }
+    }
+
+    fn turn(&mut self, id: u64, axis: usize, deg: f32) {
+        self.doc.push_xform_undo(id);
+        if let Some(obj) = self.doc.object_mut(id) {
+            match axis {
+                0 => obj.rotation_deg.x += deg,
+                1 => obj.rotation_deg.y += deg,
+                _ => obj.rotation_deg.z += deg,
+            }
+        }
+        self.doc.touch_xform();
+        self.invalidate_slice();
     }
 
     fn scale_ui(&mut self, ui: &mut egui::Ui) {
@@ -1051,7 +1104,70 @@ impl AmberApp {
             self.doc.touch_xform();
             self.invalidate_slice();
         }
+        self.size_editors(ui, id);
         self.size_label(ui, id);
+    }
+
+    fn size_editors(&mut self, ui: &mut egui::Ui, id: u64) {
+        let Some(obj) = self.doc.object(id) else {
+            return;
+        };
+        let local = [
+            (obj.bounds_max[0] - obj.bounds_min[0]).abs().max(1e-4),
+            (obj.bounds_max[1] - obj.bounds_min[1]).abs().max(1e-4),
+            (obj.bounds_max[2] - obj.bounds_min[2]).abs().max(1e-4),
+        ];
+        let signs = [
+            obj.scale.x.signum(),
+            obj.scale.y.signum(),
+            obj.scale.z.signum(),
+        ];
+        let mut size = Vec3::new(
+            local[0] * obj.scale.x.abs(),
+            local[1] * obj.scale.y.abs(),
+            local[2] * obj.scale.z.abs(),
+        );
+        let before_pos = obj.position;
+        let before_rot = obj.rotation_deg;
+        let before_scale = obj.scale;
+        ui.label("Size along the model axes");
+        let mut started = false;
+        let mut changed = false;
+        for (axis, label) in [(0, "X"), (1, "Y"), (2, "Z")] {
+            let value = match axis {
+                0 => &mut size.x,
+                1 => &mut size.y,
+                _ => &mut size.z,
+            };
+            ui.horizontal(|ui| {
+                ui.label(label);
+                let response = ui.add(
+                    egui::DragValue::new(value)
+                        .speed(0.1)
+                        .range(0.1..=2000.0)
+                        .suffix(" mm"),
+                );
+                started |= response.drag_started();
+                changed |= response.changed();
+            });
+        }
+        if started && !self.gesture {
+            self.doc
+                .remember_xform(id, before_pos, before_rot, before_scale);
+            self.gesture = true;
+        }
+        if changed {
+            if let Some(obj) = self.doc.object_mut(id) {
+                let sign = |s: f32| if s < 0.0 { -1.0 } else { 1.0 };
+                obj.scale = Vec3::new(
+                    sign(signs[0]) * (size.x / local[0]).max(0.01),
+                    sign(signs[1]) * (size.y / local[1]).max(0.01),
+                    sign(signs[2]) * (size.z / local[2]).max(0.01),
+                );
+            }
+            self.doc.touch_xform();
+            self.invalidate_slice();
+        }
     }
 
     fn mirror_ui(&mut self, ui: &mut egui::Ui) {
@@ -1092,6 +1208,45 @@ impl AmberApp {
         ui.heading("Hole");
         ui.label("Click the outside of a hollow. The hole points inward so resin can drain and air can enter.");
         ui.label("Put at least one hole near the lowest point of a cup, or the layer that seals it will suction onto the film.");
+        let mut hole = false;
+        hole |= drag_f32(
+            ui,
+            "Diameter",
+            &mut self.doc.drain_diameter_mm,
+            0.05,
+            0.4,
+            12.0,
+            "mm",
+        );
+        hole |= drag_f32(
+            ui,
+            "Depth",
+            &mut self.doc.drain_depth_mm,
+            0.1,
+            1.0,
+            40.0,
+            "mm",
+        );
+        if hole {
+            self.doc.touch();
+        }
+        if let Selection::Drain(id) = self.doc.selection {
+            let current = self.doc.drains.iter().find(|d| d.id == id).copied();
+            if let Some(mut drain) = current {
+                let mut diameter = drain.radius_mm * 2.0;
+                let mut edited = false;
+                edited |= drag_f32(ui, "This hole", &mut diameter, 0.05, 0.4, 12.0, "mm");
+                edited |= drag_f32(ui, "This depth", &mut drain.depth_mm, 0.1, 1.0, 40.0, "mm");
+                if edited {
+                    drain.radius_mm = diameter * 0.5;
+                    if let Some(slot) = self.doc.drains.iter_mut().find(|d| d.id == id) {
+                        *slot = drain;
+                    }
+                    self.doc.touch();
+                    self.invalidate_slice();
+                }
+            }
+        }
         if ui.button("Punch hole at the bottom").clicked() {
             if let Some(id) = self.doc.edit_target() {
                 self.punch_hole(id);
@@ -1141,6 +1296,32 @@ impl AmberApp {
                 }
             }
         });
+        ui.separator();
+        ui.label("Or make a set number of copies, with a gap between them.");
+        let mut count = self.copy_count as f32;
+        if drag_f32(ui, "Copies", &mut count, 0.05, 1.0, 40.0, "") {
+            self.copy_count = count.round().clamp(1.0, 40.0) as u32;
+        }
+        drag_f32(ui, "Gap", &mut self.copy_gap, 0.1, 0.0, 30.0, "mm");
+        if ui.button("Make copies").clicked() {
+            let Selection::Object(id) = self.doc.selection else {
+                self.status = "Select the model you want to copy.".into();
+                return;
+            };
+            match self.doc.duplicate_copies(
+                id,
+                self.copy_count,
+                self.copy_gap,
+                self.machine.size_x,
+                self.machine.size_y,
+            ) {
+                Ok(n) => {
+                    self.invalidate_slice();
+                    self.status = format!("Added {n} copies.");
+                }
+                Err(err) => self.status = err.into(),
+            }
+        }
     }
 
     fn hollow_ui(&mut self, ui: &mut egui::Ui) {
@@ -1661,6 +1842,25 @@ impl AmberApp {
             changed = true;
         }
         changed |= drag_f32(ui, "Light-off", &mut s.light_off_s, 0.05, 0.0, 20.0, "s");
+        changed |= drag_f32(
+            ui,
+            "Rest before cure",
+            &mut s.rest_before_s,
+            0.05,
+            0.0,
+            20.0,
+            "s",
+        );
+        changed |= drag_f32(
+            ui,
+            "Rest after lift",
+            &mut s.rest_after_lift_s,
+            0.05,
+            0.0,
+            20.0,
+            "s",
+        );
+        ui.label("Rest is added to the light-off the Photon file can store, and counted once in the time estimate.");
         changed |= drag_f32(ui, "Lift distance", &mut s.lift_mm, 0.1, 2.0, 15.0, "mm");
         changed |= drag_f32(ui, "Lift speed", &mut s.lift_speed, 0.05, 0.5, 8.0, "mm/s");
         changed |= drag_f32(
@@ -1685,6 +1885,12 @@ impl AmberApp {
             }
             changed = true;
         }
+        let mut blur = s.image_blur as f32;
+        if drag_f32(ui, "Image blur", &mut blur, 0.05, 0.0, 4.0, "px") {
+            s.image_blur = blur.round() as u8;
+            changed = true;
+        }
+        ui.label("Blur stays off unless you set it. It softens the anti-aliased edge and adds time to the slice.");
         changed |= ui
             .checkbox(&mut s.fill_voids, "Fill enclosed voids")
             .changed();
@@ -1840,6 +2046,13 @@ impl AmberApp {
         let frame = self.frame.clone();
         let camera = self.camera.clone();
         let aspect = (rect.width() / rect.height().max(1.0)).clamp(0.2, 5.0);
+        let overhang = self.show_overhangs.then(|| {
+            self.doc
+                .edit_target()
+                .and_then(|id| self.doc.object(id))
+                .map(|obj| obj.support.style.overhang_deg)
+                .unwrap_or(45.0)
+        });
         let callback = egui::PaintCallback {
             rect,
             callback: Arc::new(egui_glow::CallbackFn::new(move |info, painter| {
@@ -1859,7 +2072,7 @@ impl AmberApp {
                 if let Some(frame) = &frame {
                     gpu.sync(gl, frame);
                 }
-                gpu.paint(gl, &camera, aspect);
+                gpu.paint(gl, &camera, aspect, overhang);
             })),
         };
         ui.painter().add(callback);
@@ -2017,6 +2230,31 @@ impl AmberApp {
             self.invalidate_slice();
             close = true;
         }
+        if click(ui, "+90° Z") {
+            self.turn(id, 2, 90.0);
+            close = true;
+        }
+        if click(ui, "−90° Z") {
+            self.turn(id, 2, -90.0);
+            close = true;
+        }
+        if click(ui, "Cut in half on Z") {
+            let z = self
+                .doc
+                .object(id)
+                .and_then(Document::world_bounds)
+                .map(|(min, max)| (min.z + max.z) * 0.5)
+                .unwrap_or(self.cut_z);
+            self.cut_z = z;
+            match self.doc.cut_at_z(id, z) {
+                Ok(_) => {
+                    self.invalidate_slice();
+                    self.status = "Cut the model and kept both pieces.".into();
+                }
+                Err(err) => self.status = err.into(),
+            }
+            close = true;
+        }
         if click(ui, "Reset scale to 100%") {
             self.doc.push_xform_undo(id);
             if let Some(obj) = self.doc.object_mut(id) {
@@ -2051,7 +2289,9 @@ impl AmberApp {
         }
         if click(ui, "Place holes by clicking") {
             self.tool = Tool::Drain;
-            self.status = "Click the shell to punch a drain. Orbit under the bed if you need the underside.".into();
+            self.status =
+                "Click the shell to punch a drain. Orbit under the bed if you need the underside."
+                    .into();
             close = true;
         }
         ui.separator();
@@ -2095,7 +2335,8 @@ impl AmberApp {
         if click(ui, "Repair") {
             self.doc.repair(id);
             self.invalidate_slice();
-            self.status = "Welded duplicate corners and flipped the shell if it was inside out.".into();
+            self.status =
+                "Welded duplicate corners and flipped the shell if it was inside out.".into();
             close = true;
         }
         if click(ui, "Flip normals") {
