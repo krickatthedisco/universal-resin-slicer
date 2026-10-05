@@ -2,7 +2,9 @@
 
 Amber is a desktop resin slicer. The machine it was built around is the **Anycubic Photon M3 Max** (298.08 × 165.6 × 300 mm, 6480×3600, 46 µm). It also knows the build volume and pixel grid of the other printers in the UVtools printer list, and it can write a Photon Workshop **v516** file for the machines whose profile is version 516. Every printer can be saved as an open `.sl1` zip. Encrypted CTB, GOO, and similar files are not written.
 
-The window is a native app (Rust, egui, OpenGL). The same program builds on Windows and on Linux. It is not a web app.
+The window is a native app (Rust, egui, OpenGL), version 0.1.0. The same program builds on Windows and on Linux. It is not a web app.
+
+The window opens in **Simple**. That path is: open a model, pick the printer and resin, hollow and punch a hole if you need to, add supports, then **Slice and save**. **Workshop**, in the top bar, is every control. Help → How to print (F1) is the same five steps. Ctrl+O opens a file, Ctrl+Enter slices, and Ctrl+S saves.
 
 ## Run the Windows app
 
@@ -40,6 +42,7 @@ Amber is not affiliated with Anycubic or Elegoo. A resin row is copied from a ma
 - Import STL (binary or ASCII), OBJ, and 3MF. Drop files on the plate.
 - Printer list with search. Picking a printer sets the plate, the pixel size, and that machine's lift defaults. It does not invent an exposure.
 - Resin list with search. It starts filtered to resins that have a published profile for the printer you picked; uncheck that to see the whole library. A dot means this printer has a published starting point. Elegoo rows are the 2023-12-11 official sheet (Mars, Saturn, and Jupiter, including color). Anycubic rows are the Photon M3 Max store guide from November 2023. Other bottles are named so you can find them, without a guessed cure time.
+- A Measure tool: click two points and read the distance. Recent files stay in the File menu. Models can be renamed in the list.
 - Several models, with move, rotate, scale to a size in millimetres, quarter turns, mirror, duplicate, a counted row of copies, delete, and undo. Cut a model on Z and keep both pieces. The Select tool moves the selected model in X and Y with a left drag. Right-drag still orbits, and Shift-drag or middle-drag pans. Right-click a part for the same edits. Overlapping models are marked, and View → Show overhangs paints faces that need support.
 - Drop to the bed, center, put the largest face down, auto-orient one model or all of them, shelf-pack the plate, and fill the bed with copies. Repair flips an inside-out shell and welds duplicate corners. Models that hang off the plate are marked.
 - Hollow at slice time: wall thickness and top and bottom caps. The inside stays empty. Drain holes are cylinders you click onto the surface, with a diameter and depth, or a hole punched through the bottom.
@@ -50,7 +53,7 @@ Amber is not affiliated with Anycubic or Elegoo. A resin row is copied from a ma
 - Layer preview with a vertical bar on the right: step up or down one layer, drag the bar, or type a layer number. A new slice opens on the last layer. Islands are tinted, and a layer that seals a cavity is called out.
 - The plate uses a 24-bit depth buffer and smooth shading, the same way PrusaSlicer and OrcaSlicer draw a solid STL, so the front of the shell hides the inside. Dragging right turns the build plate to the right. Moving a model sends a new matrix; the sculpt and the support forest stay on the GPU until the mesh or the supports change.
 - Volume, weight, and a time estimate. Export the native v516 file when the printer has one, or `.sl1` for every machine, or one layer as PNG.
-- Large meshes stay on the CPU path that only clips triangles crossing the current layer, and each scanline only tests the edges that cross it. Layers are rasterized in parallel, one contiguous band of heights per core. Islands and sealed pockets are finished in order afterwards, because those depend on the previous layer.
+- Large meshes stay on the CPU path that only clips triangles crossing the current layer, and each scanline only tests the edges that cross it. Layers are rasterized in parallel, several bands of height per core so a wide base does not stall the top. Islands and sealed pockets are finished in order afterwards, because those depend on the previous layer. The slice bar estimates the time left. The layer view splits the print time into light and lifting.
 - Settings persist between launches.
 
 The slicer keeps empty layers under a floating part. The printer stacks exposures from the bed, so dropping those layers would print the part on the plate.

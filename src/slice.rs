@@ -208,11 +208,12 @@ pub fn slice(req: Request<'_>) -> Result<Slice, String> {
     // Sort each mesh once. Every core then walks its own z range forward,
     // instead of re-sorting or clipping triangles that are already behind it.
     let templates: Vec<Sweep> = solids.iter().map(Sweep::build).collect();
-    let threads = rayon::current_num_threads()
-        .max(1)
-        .min(layer_count as usize);
-    let chunk = (layer_count as usize).div_ceil(threads);
-    let ranges: Vec<(u32, u32)> = (0..threads)
+    let cores = rayon::current_num_threads().max(1);
+    // Several bands per core so a wide base does not leave the top of the
+    // model waiting on one thread.
+    let bands = cores.saturating_mul(4).min(layer_count as usize).max(1);
+    let chunk = (layer_count as usize).div_ceil(bands);
+    let ranges: Vec<(u32, u32)> = (0..bands)
         .map(|t| {
             let start = (t * chunk) as u32;
             let end = (((t + 1) * chunk) as u32).min(layer_count);
@@ -1713,6 +1714,12 @@ fn splat_thumb(thumb: &mut [u8], img: &Image, machine: Machine) {
 }
 
 pub(crate) fn encode_rle(img: &Image, plate_w: i32, plate_h: i32) -> (Vec<u8>, u32, f64) {
+    if img.width <= 0 || img.height <= 0 {
+        let mut out = Vec::new();
+        let n = (plate_w.max(0) as usize).saturating_mul(plate_h.max(0) as usize);
+        push_pw0(&mut out, 0, n);
+        return (out, 0, 0.0);
+    }
     let content = img.width as i64 * img.height as i64;
     // A full-plate layer is tens of millions of pixels. Rows do not depend on
     // each other, so those layers split across cores. Smaller layers stay on

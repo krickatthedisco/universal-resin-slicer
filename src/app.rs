@@ -29,6 +29,7 @@ enum Tool {
     Hollow,
     Support,
     Drain,
+    Measure,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -44,6 +45,7 @@ struct Job {
     done: Arc<Mutex<Option<Result<Slice, String>>>>,
     generation: u64,
     export_after: bool,
+    started: std::time::Instant,
 }
 
 fn default_machine_id() -> String {
@@ -113,6 +115,11 @@ struct Persist {
     /// Missing on older saves, so those installs start filtered.
     #[serde(default = "default_true")]
     only_profiled: bool,
+    /// Simple is the first-print view. Missing on older saves, so those open in Simple.
+    #[serde(default)]
+    workshop: bool,
+    #[serde(default)]
+    recent: Vec<String>,
 }
 
 pub struct AmberApp {
@@ -146,6 +153,15 @@ pub struct AmberApp {
     copy_count: u32,
     copy_gap: f32,
     cut_z: f32,
+    workshop: bool,
+    recent: Vec<String>,
+    /// 0 home, 1 printer, 2 resin. Only the Simple view uses it.
+    simple_page: u8,
+    help_open: bool,
+    measure_a: Option<Vec3>,
+    measure_b: Option<Vec3>,
+    measure_gen: u64,
+    measure_drawn: u64,
 }
 
 impl AmberApp {
@@ -165,6 +181,8 @@ impl AmberApp {
         let mut saved_style = None;
         let mut platform_only = false;
         let mut only_profiled = true;
+        let mut workshop = false;
+        let mut recent = Vec::new();
         if let Some(storage) = cc.storage {
             if let Some(raw) = storage.get_string("amber.print") {
                 if let Ok(saved) = serde_json::from_str::<Persist>(&raw) {
@@ -187,6 +205,8 @@ impl AmberApp {
                     saved_style = saved.style;
                     platform_only = saved.platform_only;
                     only_profiled = saved.only_profiled;
+                    workshop = saved.workshop;
+                    recent = saved.recent;
                 }
             }
         }
@@ -252,6 +272,14 @@ impl AmberApp {
             copy_count: 2,
             copy_gap: 3.0,
             cut_z: 10.0,
+            workshop,
+            recent,
+            simple_page: 0,
+            help_open: false,
+            measure_a: None,
+            measure_b: None,
+            measure_gen: 0,
+            measure_drawn: 0,
         }
     }
 
@@ -278,7 +306,8 @@ impl AmberApp {
         let Some(result) = finished else {
             let done = job.progress.load(Ordering::Relaxed);
             let total = job.total.max(1);
-            self.status = format!("Slicing layer {done} of {total}…");
+            let eta = slice_eta(job.started, done, total);
+            self.status = format!("Slicing layer {done} of {total}…{eta}");
             return;
         };
         let generation = job.generation;
@@ -364,6 +393,7 @@ impl AmberApp {
             done,
             generation,
             export_after,
+            started: std::time::Instant::now(),
         });
         self.status = "Slicing…".into();
     }
@@ -459,6 +489,7 @@ impl AmberApp {
                 self.doc.drop_object(id);
                 self.export_name = default_export_name(&self.doc, self.machine.extension);
                 self.invalidate_slice();
+                self.remember_recent(&path);
                 self.status = format!("Imported {}", path.display());
                 self.view = View::Prepare;
             }
@@ -499,6 +530,22 @@ impl AmberApp {
             ctx.input(|i| i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace));
         let undo = ctx.input(|i| i.key_pressed(egui::Key::Z) && i.modifiers.command);
         let duplicate = ctx.input(|i| i.key_pressed(egui::Key::D) && i.modifiers.command);
+        let open = ctx.input(|i| i.key_pressed(egui::Key::O) && i.modifiers.command);
+        let slice_now = ctx.input(|i| i.key_pressed(egui::Key::Enter) && i.modifiers.command);
+        let save = ctx.input(|i| i.key_pressed(egui::Key::S) && i.modifiers.command);
+        let help = ctx.input(|i| i.key_pressed(egui::Key::F1));
+        if help {
+            self.help_open = true;
+        }
+        if open {
+            self.open_dialog();
+        }
+        if slice_now && self.job.is_none() {
+            self.start_slice(false);
+        }
+        if save && self.job.is_none() {
+            self.export_print(false);
+        }
         if undo {
             self.doc.undo();
             self.invalidate_slice();
@@ -555,6 +602,8 @@ impl eframe::App for AmberApp {
             platform_only: self.doc.platform_only,
             machine_id: self.machine.id.to_string(),
             only_profiled: self.only_profiled,
+            workshop: self.workshop,
+            recent: self.recent.clone(),
         };
         if let Ok(raw) = serde_json::to_string(&saved) {
             storage.set_string("amber.print", raw);
@@ -579,12 +628,21 @@ impl eframe::App for AmberApp {
         for file in ctx.input(|i| i.raw.dropped_files.clone()) {
             self.import_path(file.path().to_path_buf());
         }
-        if self.draw_gen != self.doc.changed || self.frame.is_none() {
-            self.frame = Some(
-                self.view_cache
-                    .frame(&self.doc, self.plate(), self.doc.selection),
-            );
+        if self.draw_gen != self.doc.changed
+            || self.frame.is_none()
+            || self.measure_drawn != self.measure_gen
+        {
+            let mut frame = self
+                .view_cache
+                .frame(&self.doc, self.plate(), self.doc.selection);
+            self.paint_measure(&mut frame);
+            frame.line_gen = frame
+                .line_gen
+                .wrapping_mul(31)
+                .wrapping_add(self.measure_gen);
+            self.frame = Some(frame);
             self.draw_gen = self.doc.changed;
+            self.measure_drawn = self.measure_gen;
         }
 
         egui::Panel::top("menu").show(ui, |ui| self.menu(ui));
@@ -599,6 +657,7 @@ impl eframe::App for AmberApp {
             .show(ui, |ui| self.props_panel(ui));
         egui::CentralPanel::default().show(ui, |ui| self.center(ui));
         self.show_part_menu(&ctx);
+        self.show_help(&ctx);
     }
 }
 
@@ -609,6 +668,22 @@ impl AmberApp {
                 if ui.button("Open STL, OBJ, or 3MF…").clicked() {
                     self.open_dialog();
                     ui.close();
+                }
+                if !self.recent.is_empty() {
+                    ui.separator();
+                    ui.label("Recent");
+                    let recent = self.recent.clone();
+                    for path in recent {
+                        let label = std::path::Path::new(&path)
+                            .file_name()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or(&path)
+                            .to_string();
+                        if ui.button(label).clicked() {
+                            self.import_path(PathBuf::from(path));
+                            ui.close();
+                        }
+                    }
                 }
                 if ui.button("Add 20 mm cube").clicked() {
                     self.add_builtin("cube");
@@ -687,6 +762,10 @@ impl AmberApp {
                     self.start_slice(false);
                     ui.close();
                 }
+                if ui.button("Slice and save…").clicked() {
+                    self.start_slice(true);
+                    ui.close();
+                }
                 let export_label = if self.machine.native_photon {
                     format!("Export .{}…", self.machine.extension)
                 } else {
@@ -705,7 +784,20 @@ impl AmberApp {
                     ui.close();
                 }
             });
+            ui.menu_button("Help", |ui| {
+                if ui.button("How to print").clicked() {
+                    self.help_open = true;
+                    ui.close();
+                }
+            });
             ui.separator();
+            if ui.selectable_label(!self.workshop, "Simple").clicked() {
+                self.workshop = false;
+                self.simple_page = 0;
+            }
+            if ui.selectable_label(self.workshop, "Workshop").clicked() {
+                self.workshop = true;
+            }
             if ui
                 .selectable_label(self.view == View::Prepare, "Prepare")
                 .clicked()
@@ -769,6 +861,11 @@ impl AmberApp {
                 "Support",
                 "Click an underside to plant a support on that model. Orbit under the bed and the plate turns clear.",
             ),
+            (
+                Tool::Measure,
+                "Measure",
+                "Click two points. Amber shows the distance in millimetres.",
+            ),
         ] {
             let on = self.tool == tool;
             let button = egui::Button::new(label).min_size(egui::vec2(88.0, 32.0));
@@ -805,7 +902,294 @@ impl AmberApp {
             }
             ui.separator();
             ui.label(&self.status);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label(format!("Amber {}", crate::VERSION));
+            });
         });
+    }
+
+    fn simple_panel(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Let's print");
+        ui.label("Simple keeps the path short. Workshop, in the top bar, has every control.");
+        if self.simple_page == 1 {
+            if ui.button("Back").clicked() {
+                self.simple_page = 0;
+            }
+            ui.strong("Printer");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.printer_filter)
+                    .hint_text("Search printers")
+                    .desired_width(f32::INFINITY),
+            );
+            let filter = self.printer_filter.to_ascii_lowercase();
+            let current = self.machine.id;
+            let mut pick = None;
+            egui::ScrollArea::vertical()
+                .id_salt("simple-printers")
+                .max_height(360.0)
+                .show(ui, |ui| {
+                    for printer in catalog::PRINTERS {
+                        if !filter.is_empty()
+                            && !printer.name.to_ascii_lowercase().contains(&filter)
+                            && !printer.vendor.to_ascii_lowercase().contains(&filter)
+                        {
+                            continue;
+                        }
+                        if ui
+                            .selectable_label(printer.id == current, printer.name)
+                            .clicked()
+                        {
+                            pick = Some(printer.id);
+                        }
+                    }
+                });
+            if let Some(id) = pick {
+                self.select_printer(id);
+                self.simple_page = 0;
+            }
+            return;
+        }
+        if self.simple_page == 2 {
+            if ui.button("Back").clicked() {
+                self.simple_page = 0;
+            }
+            ui.strong("Resin");
+            ui.checkbox(
+                &mut self.only_profiled,
+                "Only resins with settings for this printer",
+            );
+            ui.add(
+                egui::TextEdit::singleline(&mut self.resin_filter)
+                    .hint_text("Search resins")
+                    .desired_width(f32::INFINITY),
+            );
+            let filter = self.resin_filter.to_ascii_lowercase();
+            let machine_id = self.machine.id;
+            let mut with_profile = std::collections::HashSet::new();
+            for profile in resins::PROFILES.iter().chain(community::PROFILES.iter()) {
+                if profile.machine_id == machine_id {
+                    with_profile.insert(profile.resin_id);
+                }
+            }
+            let mut pick = None;
+            egui::ScrollArea::vertical()
+                .id_salt("simple-resins")
+                .max_height(360.0)
+                .show(ui, |ui| {
+                    for resin in resin_catalog() {
+                        if self.only_profiled && !with_profile.contains(resin.id) {
+                            continue;
+                        }
+                        let blob = format!("{} {}", resin.vendor, resin.name);
+                        if !filter.is_empty() && !blob.to_ascii_lowercase().contains(&filter) {
+                            continue;
+                        }
+                        if ui
+                            .selectable_label(resin.name == self.settings.resin, blob)
+                            .clicked()
+                        {
+                            pick = Some(resin.name);
+                        }
+                    }
+                });
+            if let Some(name) = pick {
+                self.apply_resin(name);
+                self.simple_page = 0;
+            }
+            return;
+        }
+        ui.label(format!("Printer: {}", self.machine.name));
+        if ui.button("Change printer").clicked() {
+            self.simple_page = 1;
+        }
+        ui.label(format!("Resin: {}", self.settings.resin));
+        if ui.button("Change resin").clicked() {
+            self.simple_page = 2;
+        }
+        ui.separator();
+        if self.doc.objects.is_empty() {
+            ui.label("Start with a model. Drop an STL, OBJ, or 3MF on the window, or open one.");
+            if ui.button("Open a model…").clicked() {
+                self.open_dialog();
+            }
+            if ui.button("Add a 20 mm test cube").clicked() {
+                self.add_builtin("cube");
+            }
+            return;
+        }
+        self.model_list(ui);
+        ui.separator();
+        ui.strong("Before you print");
+        for line in self.readiness() {
+            ui.label(line);
+        }
+        ui.separator();
+        let id = self.doc.edit_target();
+        if let Some(id) = id {
+            if ui.button("Put it on the bed").clicked() {
+                self.doc.push_xform_undo(id);
+                self.doc.drop_object(id);
+                self.invalidate_slice();
+            }
+            let hollow = self.doc.object(id).is_some_and(|obj| obj.hollow);
+            if hollow {
+                let mut wall = self.doc.object(id).map(|obj| obj.wall_mm).unwrap_or(2.0);
+                if drag_f32(ui, "Wall thickness", &mut wall, 0.05, 0.4, 8.0, "mm") {
+                    if let Some(obj) = self.doc.object_mut(id) {
+                        obj.wall_mm = wall;
+                    }
+                    self.doc.touch_xform();
+                    self.invalidate_slice();
+                }
+            }
+        }
+        ui.add_space(8.0);
+        ui.label("File name on the USB stick");
+        ui.text_edit_singleline(&mut self.export_name);
+        ui.label("Keep it short. The Photon skips a very long name.");
+        let slicing = self.job.is_some();
+        let save = egui::Button::new("Slice and save…").fill(egui::Color32::from_rgb(224, 122, 47));
+        if ui.add_enabled(!slicing, save).clicked() {
+            self.start_slice(true);
+        }
+        ui.collapsing("Layer and exposure", |ui| {
+            let mut changed = false;
+            changed |= drag_f32(
+                ui,
+                "Layer height",
+                &mut self.settings.layer_mm,
+                0.005,
+                0.01,
+                0.2,
+                "mm",
+            );
+            changed |= drag_f32(
+                ui,
+                "Exposure",
+                &mut self.settings.exposure_s,
+                0.05,
+                0.5,
+                20.0,
+                "s",
+            );
+            changed |= drag_f32(
+                ui,
+                "Bottom exposure",
+                &mut self.settings.bottom_exposure_s,
+                0.5,
+                5.0,
+                80.0,
+                "s",
+            );
+            if changed {
+                self.invalidate_slice();
+            }
+            ui.label(
+                "These come from the resin you picked. Change them only if a test print says so.",
+            );
+        });
+    }
+
+    fn readiness(&self) -> Vec<String> {
+        let mut lines = Vec::new();
+        let tall = self
+            .doc
+            .objects
+            .iter()
+            .filter_map(Document::display_bounds)
+            .map(|(_, max)| max.z)
+            .fold(0.0f32, f32::max);
+        if tall > 0.0 {
+            let layers = ((tall / self.settings.layer_mm.max(0.01)).ceil() as u32).max(1);
+            lines.push(format!(
+                "About {layers} layers, {tall:.0} mm tall, on {}.",
+                self.machine.name
+            ));
+        }
+        if self.doc.outside_plate(self.plate()) {
+            lines.push("A model hangs off the plate. Drag it back on.".into());
+        } else {
+            lines.push("Everything sits on the plate.".into());
+        }
+        if let Some(overlap) = self.doc.overlap_warning() {
+            lines.push(format!("{overlap}. Separate them before you slice."));
+        }
+        if let Some(name) = self.doc.hollow_without_drain() {
+            lines.push(format!(
+                "{name} is hollow and has no hole. Punch one at the bottom so resin can drain."
+            ));
+        }
+        if self.slice.is_none() {
+            lines.push("Not sliced yet. Slice and save writes the file the printer reads.".into());
+        } else if self.slice_gen != self.doc.changed {
+            lines.push("The plate changed after the last slice. Slice it again.".into());
+        } else if let Some(slice) = &self.slice {
+            let minutes = slice.seconds / 60;
+            lines.push(format!(
+                "Last slice is {minutes} min and {:.1} ml. Save it, then copy the file to a USB stick.",
+                slice.cured_ml
+            ));
+        }
+        lines
+    }
+
+    fn measure_ui(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Measure");
+        ui.label("Click a point on a model, or on the bed, then click a second point.");
+        match (self.measure_a, self.measure_b) {
+            (Some(a), Some(b)) => {
+                let d = b - a;
+                ui.label(
+                    egui::RichText::new(format!("{:.2} mm", d.length()))
+                        .size(28.0)
+                        .strong(),
+                );
+                ui.label(format!(
+                    "X {:.2}   Y {:.2}   Z {:.2} mm",
+                    d.x.abs(),
+                    d.y.abs(),
+                    d.z.abs()
+                ));
+                ui.label(format!("From {:.1}, {:.1}, {:.1}", a.x, a.y, a.z));
+                ui.label(format!("To {:.1}, {:.1}, {:.1}", b.x, b.y, b.z));
+            }
+            (Some(_), None) => {
+                ui.label("Click the second point.");
+            }
+            _ => {
+                ui.label("Click the first point.");
+            }
+        }
+        if ui.button("Clear").clicked() {
+            self.measure_a = None;
+            self.measure_b = None;
+            self.measure_gen = self.measure_gen.wrapping_add(1);
+        }
+    }
+
+    fn paint_measure(&self, frame: &mut PlateFrame) {
+        let Some(a) = self.measure_a else {
+            return;
+        };
+        let color = [0.96, 0.84, 0.28];
+        let cross = |frame: &mut PlateFrame, p: Vec3| {
+            let n = 1.2;
+            frame.add_line(p - Vec3::X * n, p + Vec3::X * n, color);
+            frame.add_line(p - Vec3::Y * n, p + Vec3::Y * n, color);
+            frame.add_line(p - Vec3::Z * n, p + Vec3::Z * n, color);
+        };
+        cross(frame, a);
+        if let Some(b) = self.measure_b {
+            cross(frame, b);
+            frame.add_line(a, b, color);
+        }
+    }
+
+    fn remember_recent(&mut self, path: &std::path::Path) {
+        let text = path.display().to_string();
+        self.recent.retain(|p| p != &text);
+        self.recent.insert(0, text);
+        self.recent.truncate(8);
     }
 
     fn model_list(&mut self, ui: &mut egui::Ui) {
@@ -838,6 +1222,14 @@ impl AmberApp {
         if let Some(sel) = select {
             self.doc.selection = sel;
             self.doc.touch_xform();
+        }
+        if let Selection::Object(id) = self.doc.selection {
+            if let Some(obj) = self.doc.object_mut(id) {
+                ui.horizontal(|ui| {
+                    ui.label("Name");
+                    ui.text_edit_singleline(&mut obj.name);
+                });
+            }
         }
         ui.add_space(6.0);
         self.model_actions(ui);
@@ -907,6 +1299,10 @@ impl AmberApp {
 
     fn props_panel(&mut self, ui: &mut egui::Ui) {
         egui::ScrollArea::vertical().show(ui, |ui| {
+            if !self.workshop {
+                self.simple_panel(ui);
+                return;
+            }
             self.model_list(ui);
             ui.separator();
             match self.tool {
@@ -918,6 +1314,7 @@ impl AmberApp {
                 Tool::Hollow => self.hollow_ui(ui),
                 Tool::Drain => self.drain_ui(ui),
                 Tool::Support => self.support_ui(ui),
+                Tool::Measure => self.measure_ui(ui),
             }
             ui.separator();
             egui::CollapsingHeader::new("Print settings")
@@ -2028,6 +2425,7 @@ impl AmberApp {
                     | Tool::Scale
                     | Tool::Mirror
                     | Tool::Hollow
+                    | Tool::Measure
             )
         {
             self.part_menu = None;
@@ -2158,6 +2556,38 @@ impl AmberApp {
             self.part_menu = Some(pointer);
             self.part_menu_fresh = true;
         }
+    }
+
+    fn show_help(&mut self, ctx: &egui::Context) {
+        if !self.help_open {
+            return;
+        }
+        let mut open = true;
+        egui::Window::new("How to print")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(true)
+            .default_width(460.0)
+            .show(ctx, |ui| {
+                ui.label("1. Open a model, or drop it on the window.");
+                ui.label("2. Pick your printer and your resin. The times fill in from a published table.");
+                ui.label("3. If the model is hollow, punch a hole at the bottom so resin can drain.");
+                ui.label("4. If a part floats or has a steep underside, add supports. They lift the model off the bed.");
+                ui.label("5. Slice and save. Copy that file onto a USB stick and print it from the printer.");
+                ui.separator();
+                ui.label("Simple is the short path. Workshop is every control: rafts, rest times, compensation, and the rest.");
+                ui.label("Right-click a model for the same edits. Right-drag orbits, and you can swing under the bed. The bed turns clear so you can click an underside.");
+                ui.separator();
+                ui.label("Ctrl+O open    Ctrl+Z undo    Ctrl+D duplicate    Delete remove");
+                ui.label("Ctrl+Enter slice    Ctrl+S save    F1 this page");
+                ui.label("In the layer view, the arrow keys step through layers.");
+                ui.separator();
+                ui.label(format!(
+                    "Amber {}  ·  built for the Anycubic Photon M3 Max, and the other printers in the list.",
+                    crate::VERSION
+                ));
+            });
+        self.help_open = open;
     }
 
     fn show_part_menu(&mut self, ctx: &egui::Context) {
@@ -2373,6 +2803,29 @@ impl AmberApp {
                     self.invalidate_slice();
                 }
             }
+            Tool::Measure => {
+                let point = self
+                    .doc
+                    .raycast(origin, dir)
+                    .map(|(_, p, _)| p)
+                    .or_else(|| {
+                        hit_z(origin, dir, 0.0).filter(|p| {
+                            p.x >= -1.0
+                                && p.y >= -1.0
+                                && p.x <= self.machine.size_x + 1.0
+                                && p.y <= self.machine.size_y + 1.0
+                        })
+                    });
+                if let Some(point) = point {
+                    if self.measure_a.is_none() || self.measure_b.is_some() {
+                        self.measure_a = Some(point);
+                        self.measure_b = None;
+                    } else {
+                        self.measure_b = Some(point);
+                    }
+                    self.measure_gen = self.measure_gen.wrapping_add(1);
+                }
+            }
             _ => {
                 if let Some((id, _, _)) = self.doc.raycast(origin, dir) {
                     self.doc.selection = Selection::Object(id);
@@ -2394,6 +2847,8 @@ impl AmberApp {
             return;
         }
         self.preview_index = self.preview_index.min(count - 1);
+        let clock = slice_clock(slice);
+        ui.label(egui::RichText::new(&clock).strong());
         let (caption, seals) = {
             let layer = &slice.layers[self.preview_index];
             (
@@ -2622,6 +3077,33 @@ fn lookup_profile(
         .or_else(|| community::profile_for(resin_id, machine_id, layer_mm))
 }
 
+fn slice_eta(started: std::time::Instant, done: u32, total: u32) -> String {
+    if done < 3 || done >= total {
+        return String::new();
+    }
+    let elapsed = started.elapsed().as_secs_f32();
+    let remain = elapsed / done as f32 * (total - done) as f32;
+    if remain < 90.0 {
+        format!("  about {:.0} s left", remain.max(1.0))
+    } else {
+        format!("  about {:.0} min left", remain / 60.0)
+    }
+}
+
+fn slice_clock(slice: &Slice) -> String {
+    let expose: f32 = slice.layers.iter().map(|layer| layer.exposure_s).sum();
+    let motion = (slice.seconds as f32 - expose).max(0.0);
+    let minutes = slice.seconds / 60;
+    let extra = slice.seconds % 60;
+    format!(
+        "{minutes} min {extra} s on the printer  ·  {:.0} min of light, {:.0} min of lifting  ·  {:.2} ml  ·  {:.1} g",
+        expose / 60.0,
+        motion / 60.0,
+        slice.cured_ml,
+        slice.weight_g
+    )
+}
+
 fn slice_bytes(slice: &Slice) -> usize {
     80_000 + slice.layers.iter().map(|l| l.rle.len()).sum::<usize>()
 }
@@ -2660,7 +3142,7 @@ pub fn run() -> eframe::Result {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1440.0, 900.0])
             .with_min_inner_size([1100.0, 700.0])
-            .with_title("Amber"),
+            .with_title(format!("Amber {}", crate::VERSION)),
         renderer: eframe::Renderer::Glow,
         // egui leaves this at 0, which draws every triangle on top of the
         // last one, so you can see through the shell. 24 bits is what the

@@ -216,6 +216,12 @@ impl ViewCache {
     }
 }
 
+impl PlateFrame {
+    pub fn add_line(&mut self, a: Vec3, b: Vec3, color: [f32; 3]) {
+        push_line(&mut self.lines, a.to_array(), b.to_array(), color);
+    }
+}
+
 fn quant(v: f32) -> i32 {
     (v * 100.0).round() as i32
 }

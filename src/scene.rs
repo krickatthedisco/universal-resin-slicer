@@ -554,6 +554,30 @@ impl Document {
         Ok(added)
     }
 
+    /// A hollow model with no drain near it. Resin and air need that hole.
+    pub fn hollow_without_drain(&self) -> Option<&str> {
+        for obj in &self.objects {
+            if !obj.hollow {
+                continue;
+            }
+            let Some((min, max)) = Self::display_bounds(obj) else {
+                continue;
+            };
+            let covered = self.drains.iter().any(|drain| {
+                drain.origin.x >= min.x - 2.0
+                    && drain.origin.x <= max.x + 2.0
+                    && drain.origin.y >= min.y - 2.0
+                    && drain.origin.y <= max.y + 2.0
+                    && drain.origin.z >= min.z - 4.0
+                    && drain.origin.z <= max.z + 2.0
+            });
+            if !covered {
+                return Some(obj.name.as_str());
+            }
+        }
+        None
+    }
+
     /// Names of the first two models whose boxes occupy the same space.
     pub fn overlap_warning(&self) -> Option<String> {
         let mut boxes = Vec::new();
@@ -1264,6 +1288,16 @@ mod tests {
         let obj = doc.object(id).unwrap();
         let (_, max) = Document::world_bounds(obj).unwrap();
         assert!((max.z - 20.0).abs() < 0.1, "restored height {}", max.z);
+    }
+
+    #[test]
+    fn a_hollow_without_a_drain_is_named() {
+        let mut doc = Document::new();
+        let id = doc.add_mesh("cup".into(), box_mesh([0.0, 0.0, 0.0], [10.0, 10.0, 10.0]));
+        doc.object_mut(id).unwrap().hollow = true;
+        assert_eq!(doc.hollow_without_drain(), Some("cup"));
+        doc.punch_bottom_drain(id);
+        assert_eq!(doc.hollow_without_drain(), None);
     }
 
     #[test]
