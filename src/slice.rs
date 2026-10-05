@@ -244,6 +244,9 @@ pub fn slice(req: Request<'_>) -> Result<Slice, String> {
         if index < settings.bottom_layers {
             offset_image(&mut image, -settings.elephant_foot_mm, machine);
         }
+        if settings.fill_voids {
+            fill_enclosed(&mut image);
+        }
         apply_drains(&mut image, req.drains, z, machine);
         let (exposure, lift, lift_speed, retract) = layer_motion(&settings, index);
         let _ = retract;
@@ -314,7 +317,7 @@ pub fn slice(req: Request<'_>) -> Result<Slice, String> {
     let cavity_ml = (cavity_px_layers * pixel_area * h as f64 / 1000.0) as f32;
     if sealed_layers > 0 {
         warnings.push(format!(
-            "{sealed_layers} layers seal an interior pocket ({cavity_ml:.2} ml of air in the slice). Add a drain at the bottom of a cup or it can suction onto the film."
+            "{sealed_layers} layers seal an interior pocket ({cavity_ml:.2} ml of air in the slice). Turn on Fill enclosed voids, or add a drain at the bottom of a cup, or it can suction onto the film."
         ));
     }
     Ok(Slice {
@@ -1304,6 +1307,54 @@ fn find_islands(img: &Image, prev: &Bits, machine: Machine, z: f32) -> Vec<Islan
     islands
 }
 
+/// Paint empty pixels that cannot reach the border of this layer. Those are
+/// the same closed holes the suction check reports. Drains run after this,
+/// so a drain still opens.
+fn fill_enclosed(img: &mut Image) {
+    if img.width <= 0 || img.height <= 0 {
+        return;
+    }
+    let w = img.width;
+    let h = img.height;
+    let n = (w * h) as usize;
+    if img.pixels.len() < n {
+        return;
+    }
+    let mut reach = vec![false; n];
+    let mut q = VecDeque::new();
+    let push_empty =
+        |x: i32, y: i32, reach: &mut [bool], q: &mut VecDeque<(i32, i32)>, pixels: &[u8]| {
+            if x < 0 || y < 0 || x >= w || y >= h {
+                return;
+            }
+            let i = (y * w + x) as usize;
+            if reach[i] || pixels[i] > 0 {
+                return;
+            }
+            reach[i] = true;
+            q.push_back((x, y));
+        };
+    for x in 0..w {
+        push_empty(x, 0, &mut reach, &mut q, &img.pixels);
+        push_empty(x, h - 1, &mut reach, &mut q, &img.pixels);
+    }
+    for y in 0..h {
+        push_empty(0, y, &mut reach, &mut q, &img.pixels);
+        push_empty(w - 1, y, &mut reach, &mut q, &img.pixels);
+    }
+    let dirs = [(1i32, 0i32), (-1, 0), (0, 1), (0, -1)];
+    while let Some((x, y)) = q.pop_front() {
+        for (dx, dy) in dirs {
+            push_empty(x + dx, y + dy, &mut reach, &mut q, &img.pixels);
+        }
+    }
+    for (pixel, reached) in img.pixels.iter_mut().zip(reach.iter()) {
+        if *pixel == 0 && !reached {
+            *pixel = 255;
+        }
+    }
+}
+
 fn enclosed_centroids(img: &Image) -> Vec<(i32, i32, u32)> {
     if img.width == 0 {
         return Vec::new();
@@ -1879,6 +1930,68 @@ mod tests {
         let shell_px = shell.layers[4].nonzero;
         assert!(shell_px < full_px / 2, "shell {shell_px} full {full_px}");
         assert!(shell_px > 1000, "shell collapsed: {shell_px}");
+    }
+
+    #[test]
+    fn fill_voids_closes_a_capped_hollow() {
+        let mesh = box_mesh([40.0, 40.0, 0.0], [60.0, 60.0, 10.0]);
+        let hollowed = Solid {
+            vertices: mesh.vertices,
+            indices: mesh.indices,
+            hollow: Some(Hollow {
+                wall_mm: 1.5,
+                bottom_cap_mm: 2.0,
+                top_cap_mm: 2.0,
+                infill_spacing_mm: 0.0,
+                infill_thickness_mm: 0.4,
+                gyroid: false,
+                z_min: 0.0,
+                z_max: 10.0,
+            }),
+        };
+        let mut open = PrintSettings::default();
+        open.layer_mm = 0.2;
+        open.anti_alias = 1;
+        open.fill_voids = false;
+        let mut shut = open.clone();
+        shut.fill_voids = true;
+        let slice_of = |settings: &PrintSettings| {
+            slice(Request {
+                solids: &[hollowed.clone()],
+                drains: &[],
+                machine: machine_no_flip(),
+                settings,
+                cancel: None,
+                progress: None,
+            })
+            .unwrap()
+        };
+        let plain = slice_of(&open);
+        let filled = slice_of(&shut);
+        assert!(
+            plain.sealed_layers > 0,
+            "the cap should seal the hollow, sealed {} cavity {:.3} ml",
+            plain.sealed_layers,
+            plain.cavity_ml
+        );
+        assert_eq!(
+            filled.sealed_layers, 0,
+            "filled voids are not empty pockets"
+        );
+        let mid = |slice: &Slice| {
+            slice
+                .layers
+                .iter()
+                .find(|l| (l.z_top_mm - 5.0).abs() < 0.15)
+                .map(|l| l.nonzero)
+                .unwrap_or(0)
+        };
+        assert!(
+            mid(&filled) > mid(&plain) * 2,
+            "filled {} plain {}",
+            mid(&filled),
+            mid(&plain)
+        );
     }
 
     #[test]

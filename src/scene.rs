@@ -98,7 +98,7 @@ impl Document {
             supports: Vec::new(),
             drains: Vec::new(),
             selection: Selection::None,
-            raft: true,
+            raft: false,
             raft_mm: 1.0,
             raft_margin: 2.0,
             braces_on: true,
@@ -744,7 +744,8 @@ impl Document {
     }
 
     pub fn raft_top(&self) -> f32 {
-        if self.raft && !self.objects.is_empty() {
+        let on_bed = self.supports.iter().any(|s| s.z_base <= 0.45);
+        if self.raft && on_bed {
             self.raft_mm.max(0.2)
         } else {
             0.0
@@ -774,26 +775,31 @@ impl Document {
             } else {
                 None
             };
-            if self.raft {
-                if let Some(raft) = supports::skate_raft(
-                    &world.vertices,
-                    &world.indices,
-                    self.raft_mm,
-                    self.raft_margin,
-                    self.raft_angle,
-                ) {
-                    solids.push(Solid {
-                        vertices: raft.vertices,
-                        indices: raft.indices,
-                        hollow: None,
-                    });
-                }
-            }
             solids.push(Solid {
                 vertices: world.vertices,
                 indices: world.indices,
                 hollow,
             });
+        }
+        if self.raft {
+            let foot = if self.style.foot_diam_mm > 0.05 {
+                self.style.foot_diam_mm
+            } else {
+                self.style.trunk_mm * 2.1
+            };
+            if let Some(raft) = supports::support_raft(
+                &self.supports,
+                foot,
+                self.raft_mm,
+                self.raft_margin,
+                self.raft_angle,
+            ) {
+                solids.push(Solid {
+                    vertices: raft.vertices,
+                    indices: raft.indices,
+                    hollow: None,
+                });
+            }
         }
         let raft_top = self.raft_top();
         let forest = supports::forest_mesh(

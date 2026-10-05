@@ -95,22 +95,11 @@ pub struct RaftFrame {
     pub tris: Arc<Vec<f32>>,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-struct RaftKey {
-    mesh_rev: u64,
-    rot: [i32; 3],
-    scale: [i32; 3],
-    thick: i32,
-    margin: i32,
-    angle: i32,
-}
-
 pub struct ViewCache {
     world_gen: u64,
     world: Arc<Vec<f32>>,
     grid_lines: Vec<f32>,
     locals: HashMap<(u64, u64), Arc<Vec<f32>>>,
-    rafts: HashMap<u64, (RaftKey, Arc<Vec<f32>>)>,
 }
 
 impl ViewCache {
@@ -120,7 +109,6 @@ impl ViewCache {
             world: Arc::new(Vec::new()),
             grid_lines: Vec::new(),
             locals: HashMap::new(),
-            rafts: HashMap::new(),
         }
     }
 
@@ -130,6 +118,22 @@ impl ViewCache {
             let mut tris = Vec::new();
             let mut lines = Vec::new();
             push_plate(&mut tris, &mut lines, plate);
+            if doc.raft {
+                let foot = if doc.style.foot_diam_mm > 0.05 {
+                    doc.style.foot_diam_mm
+                } else {
+                    doc.style.trunk_mm * 2.1
+                };
+                if let Some(raft) = supports::support_raft(
+                    &doc.supports,
+                    foot,
+                    doc.raft_mm,
+                    doc.raft_margin,
+                    doc.raft_angle,
+                ) {
+                    push_mesh_flat(&mut tris, &raft, [0.45, 0.38, 0.28]);
+                }
+            }
             let forest = supports::forest_mesh(
                 &doc.supports,
                 &doc.style,
@@ -164,9 +168,7 @@ impl ViewCache {
 
         let mut lines = self.grid_lines.clone();
         let mut objects = Vec::with_capacity(doc.objects.len());
-        let mut rafts = Vec::new();
         let mut live_locals = HashSet::new();
-        let mut live_rafts = HashSet::new();
         for obj in &doc.objects {
             let selected = selection == Selection::Object(obj.id);
             let outside = Document::display_bounds(obj).is_some_and(|(min, max)| {
@@ -204,57 +206,15 @@ impl ViewCache {
                     push_box_lines(&mut lines, min, max, [0.89, 0.63, 0.18]);
                 }
             }
-            if doc.raft {
-                let raft_key = RaftKey {
-                    mesh_rev: obj.mesh_rev,
-                    rot: [
-                        quant(obj.rotation_deg.x),
-                        quant(obj.rotation_deg.y),
-                        quant(obj.rotation_deg.z),
-                    ],
-                    scale: [quant(obj.scale.x), quant(obj.scale.y), quant(obj.scale.z)],
-                    thick: quant(doc.raft_mm),
-                    margin: quant(doc.raft_margin),
-                    angle: quant(doc.raft_angle),
-                };
-                let stale = self
-                    .rafts
-                    .get(&obj.id)
-                    .map(|(key, _)| *key != raft_key)
-                    .unwrap_or(true);
-                if stale {
-                    if let Some(tris) = bake_raft(obj, doc) {
-                        self.rafts.insert(obj.id, (raft_key, Arc::new(tris)));
-                    } else {
-                        self.rafts.remove(&obj.id);
-                    }
-                }
-                if let Some((key, tris)) = self.rafts.get(&obj.id) {
-                    if *key == raft_key {
-                        live_rafts.insert(obj.id);
-                        rafts.push(RaftFrame {
-                            id: obj.id,
-                            key: raft_hash(&raft_key),
-                            model: Mat4::from_translation(Vec3::new(
-                                obj.position.x,
-                                obj.position.y,
-                                0.0,
-                            )),
-                            tris: tris.clone(),
-                        });
-                    }
-                }
-            }
         }
         self.locals.retain(|key, _| live_locals.contains(key));
-        self.rafts.retain(|id, _| live_rafts.contains(id));
         PlateFrame {
             world_gen,
             world: self.world.clone(),
             lines,
             line_gen: doc.changed,
             objects,
-            rafts,
+            rafts: Vec::new(),
         }
     }
 }
@@ -281,19 +241,6 @@ fn world_stamp(structure: u64, plate: Vec3, selection: Selection) -> u64 {
     h
 }
 
-fn raft_hash(key: &RaftKey) -> u64 {
-    let mut h = key.mesh_rev;
-    for n in key
-        .rot
-        .into_iter()
-        .chain(key.scale)
-        .chain([key.thick, key.margin, key.angle])
-    {
-        h = h.wrapping_mul(0x9E3779B1).wrapping_add(n as u32 as u64);
-    }
-    h
-}
-
 fn local_tris(mesh: &Mesh) -> Vec<f32> {
     let normals = smooth_world_normals(mesh, Mat4::IDENTITY);
     let mut tris = Vec::with_capacity(mesh.indices.len() * 9);
@@ -307,28 +254,6 @@ fn local_tris(mesh: &Mesh) -> Vec<f32> {
         }
     }
     tris
-}
-
-fn bake_raft(obj: &crate::scene::Object, doc: &Document) -> Option<Vec<f32>> {
-    let world = Document::world_mesh(obj);
-    let mut raft = supports::skate_raft(
-        &world.vertices,
-        &world.indices,
-        doc.raft_mm,
-        doc.raft_margin,
-        doc.raft_angle,
-    )?;
-    for v in &mut raft.vertices {
-        v[0] -= obj.position.x;
-        v[1] -= obj.position.y;
-    }
-    let mut tris = Vec::new();
-    push_mesh_flat(&mut tris, &raft, [0.45, 0.38, 0.28]);
-    if tris.is_empty() {
-        None
-    } else {
-        Some(tris)
-    }
 }
 
 fn smooth_world_normals(mesh: &Mesh, mat: Mat4) -> Vec<[f32; 3]> {

@@ -823,12 +823,13 @@ fn tapered(a: Vec3, ra: f32, b: Vec3, rb: f32, seg: usize) -> Mesh {
     Mesh { vertices, indices }
 }
 
-/// One skate raft for a part: the outline of the mesh, grown by `oversize`,
-/// with the outer wall leaning out. `angle_deg` is measured from vertical,
-/// so 45° makes the base wider than the top by the raft thickness.
-pub fn skate_raft(
-    vertices: &[[f32; 3]],
-    indices: &[u32],
+/// Skate under the supports that reach the bed. Each pillar gets a square pad.
+/// Pads that sit near each other are joined, so the outline follows the
+/// supports instead of the whole part. `oversize` grows each square.
+/// `angle_deg` is the wall measured from vertical: the base is wider than the top.
+pub fn support_raft(
+    supports: &[Support],
+    foot_diam_mm: f32,
     thickness: f32,
     oversize: f32,
     angle_deg: f32,
@@ -836,53 +837,69 @@ pub fn skate_raft(
     let thickness = thickness.clamp(0.2, 5.0);
     let oversize = oversize.clamp(0.0, 30.0);
     let flare = thickness * angle_deg.clamp(0.0, 70.0).to_radians().tan();
-    if vertices.is_empty() || indices.len() < 3 {
+    let half = (foot_diam_mm.max(0.8) * 0.5 + oversize).clamp(1.0, 40.0);
+    let pillars: Vec<(f32, f32)> = supports
+        .iter()
+        .filter(|s| s.z_base <= 0.45)
+        .map(|s| (s.x, s.y))
+        .collect();
+    if pillars.is_empty() {
         return None;
     }
-    let cell = 0.8_f32;
+    let cell = 0.25_f32;
+    let pad = half + flare + cell * 2.0;
     let mut min_x = f32::MAX;
     let mut min_y = f32::MAX;
     let mut max_x = f32::MIN;
     let mut max_y = f32::MIN;
-    for v in vertices {
-        min_x = min_x.min(v[0]);
-        min_y = min_y.min(v[1]);
-        max_x = max_x.max(v[0]);
-        max_y = max_y.max(v[1]);
+    for &(x, y) in &pillars {
+        min_x = min_x.min(x - half);
+        min_y = min_y.min(y - half);
+        max_x = max_x.max(x + half);
+        max_y = max_y.max(y + half);
     }
-    if !min_x.is_finite() {
-        return None;
-    }
-    let pad = oversize + flare + cell * 2.0;
     let origin_x = min_x - pad;
     let origin_y = min_y - pad;
-    let w = ((max_x - min_x + pad * 2.0) / cell).ceil() as usize + 1;
-    let h = ((max_y - min_y + pad * 2.0) / cell).ceil() as usize + 1;
-    if w < 2 || h < 2 || w.saturating_mul(h) > 2_000_000 {
+    let w = ((max_x - min_x + pad * 2.0) / cell).ceil() as usize + 2;
+    let h = ((max_y - min_y + pad * 2.0) / cell).ceil() as usize + 2;
+    if w < 2 || h < 2 || w.saturating_mul(h) > 4_000_000 {
         return None;
     }
-    let mut mask = vec![false; w * h];
-    for tri in indices.chunks_exact(3) {
-        stamp_tri(
-            &mut mask,
-            origin_x,
-            origin_y,
-            cell,
-            w,
-            h,
-            vertices[tri[0] as usize],
-            vertices[tri[1] as usize],
-            vertices[tri[2] as usize],
-        );
+    let mut solid = vec![false; w * h];
+    for &(cx, cy) in &pillars {
+        stamp_square(&mut solid, origin_x, origin_y, cell, w, h, cx, cy, half);
     }
-    fill_silhouette_holes(&mut mask, w, h);
-    if !mask.iter().any(|bit| *bit) {
-        return None;
+    let link = half * 3.2;
+    for i in 0..pillars.len() {
+        for j in (i + 1)..pillars.len() {
+            let (ax, ay) = pillars[i];
+            let (bx, by) = pillars[j];
+            let dx = bx - ax;
+            let dy = by - ay;
+            let dist = (dx * dx + dy * dy).sqrt();
+            if dist < 0.2 || dist > link {
+                continue;
+            }
+            let steps = ((dist / (cell * 0.5)).ceil() as i32).max(1);
+            for s in 0..=steps {
+                let t = s as f32 / steps as f32;
+                stamp_square(
+                    &mut solid,
+                    origin_x,
+                    origin_y,
+                    cell,
+                    w,
+                    h,
+                    ax + dx * t,
+                    ay + dy * t,
+                    half,
+                );
+            }
+        }
     }
-    let dist = distance_outside(&mask, w, h, cell);
-    let mesh = heightfield(
-        origin_x, origin_y, cell, w, h, &dist, thickness, oversize, flare,
-    );
+    fill_mask_holes(&mut solid, w, h);
+    let loops = trace_loops(&solid, w, h, origin_x, origin_y, cell);
+    let mesh = extrude_skates(&loops, thickness, flare);
     if mesh.triangle_count() == 0 {
         None
     } else {
@@ -890,60 +907,49 @@ pub fn skate_raft(
     }
 }
 
-fn stamp_tri(
-    mask: &mut [bool],
+fn stamp_square(
+    solid: &mut [bool],
     origin_x: f32,
     origin_y: f32,
     cell: f32,
     w: usize,
     h: usize,
-    a: [f32; 3],
-    b: [f32; 3],
-    c: [f32; 3],
+    cx: f32,
+    cy: f32,
+    half: f32,
 ) {
-    let min_x = a[0].min(b[0]).min(c[0]);
-    let max_x = a[0].max(b[0]).max(c[0]);
-    let min_y = a[1].min(b[1]).min(c[1]);
-    let max_y = a[1].max(b[1]).max(c[1]);
-    let x0 = (((min_x - origin_x) / cell).floor() as isize).clamp(0, w as isize - 1) as usize;
-    let x1 = (((max_x - origin_x) / cell).ceil() as isize).clamp(0, w as isize - 1) as usize;
-    let y0 = (((min_y - origin_y) / cell).floor() as isize).clamp(0, h as isize - 1) as usize;
-    let y1 = (((max_y - origin_y) / cell).ceil() as isize).clamp(0, h as isize - 1) as usize;
-    for y in y0..=y1 {
-        for x in x0..=x1 {
+    let x0 = ((cx - half - origin_x) / cell).floor() as isize;
+    let x1 = ((cx + half - origin_x) / cell).ceil() as isize;
+    let y0 = ((cy - half - origin_y) / cell).floor() as isize;
+    let y1 = ((cy + half - origin_y) / cell).ceil() as isize;
+    for y in y0.max(0)..=y1.min(h as isize - 1) {
+        for x in x0.max(0)..=x1.min(w as isize - 1) {
             let px = origin_x + (x as f32 + 0.5) * cell;
             let py = origin_y + (y as f32 + 0.5) * cell;
-            if point_in_tri(px, py, a, b, c) {
-                mask[y * w + x] = true;
+            if (px - cx).abs() <= half + cell * 0.5 && (py - cy).abs() <= half + cell * 0.5 {
+                solid[y as usize * w + x as usize] = true;
             }
         }
     }
 }
 
-fn point_in_tri(px: f32, py: f32, a: [f32; 3], b: [f32; 3], c: [f32; 3]) -> bool {
-    let denom = (b[1] - c[1]) * (a[0] - c[0]) + (c[0] - b[0]) * (a[1] - c[1]);
-    if denom.abs() < 1e-8 {
-        return false;
-    }
-    let w0 = ((b[1] - c[1]) * (px - c[0]) + (c[0] - b[0]) * (py - c[1])) / denom;
-    let w1 = ((c[1] - a[1]) * (px - c[0]) + (a[0] - c[0]) * (py - c[1])) / denom;
-    let w2 = 1.0 - w0 - w1;
-    w0 >= -1e-3 && w1 >= -1e-3 && w2 >= -1e-3
-}
-
-fn fill_silhouette_holes(mask: &mut [bool], w: usize, h: usize) {
+fn fill_mask_holes(mask: &mut [bool], w: usize, h: usize) {
     let mut outside = vec![false; mask.len()];
     let mut stack = Vec::new();
     for x in 0..w {
         stack.push(x);
-        stack.push((h - 1) * w + x);
+        if h > 1 {
+            stack.push((h - 1) * w + x);
+        }
     }
     for y in 0..h {
         stack.push(y * w);
-        stack.push(y * w + (w - 1));
+        if w > 1 {
+            stack.push(y * w + (w - 1));
+        }
     }
     while let Some(i) = stack.pop() {
-        if outside[i] || mask[i] {
+        if i >= mask.len() || outside[i] || mask[i] {
             continue;
         }
         outside[i] = true;
@@ -969,164 +975,267 @@ fn fill_silhouette_holes(mask: &mut [bool], w: usize, h: usize) {
     }
 }
 
-fn distance_outside(mask: &[bool], w: usize, h: usize, cell: f32) -> Vec<f32> {
-    let diag = cell * std::f32::consts::SQRT_2;
-    let mut dist = vec![1.0e9_f32; w * h];
-    for (i, bit) in mask.iter().enumerate() {
-        if *bit {
-            dist[i] = 0.0;
-        }
-    }
-    for y in 0..h {
-        for x in 0..w {
-            let i = y * w + x;
-            let mut d = dist[i];
-            if x > 0 {
-                d = d.min(dist[i - 1] + cell);
-            }
-            if y > 0 {
-                d = d.min(dist[i - w] + cell);
-            }
-            if x > 0 && y > 0 {
-                d = d.min(dist[i - w - 1] + diag);
-            }
-            if x + 1 < w && y > 0 {
-                d = d.min(dist[i - w + 1] + diag);
-            }
-            dist[i] = d;
-        }
-    }
-    for y in (0..h).rev() {
-        for x in (0..w).rev() {
-            let i = y * w + x;
-            let mut d = dist[i];
-            if x + 1 < w {
-                d = d.min(dist[i + 1] + cell);
-            }
-            if y + 1 < h {
-                d = d.min(dist[i + w] + cell);
-            }
-            if x + 1 < w && y + 1 < h {
-                d = d.min(dist[i + w + 1] + diag);
-            }
-            if x > 0 && y + 1 < h {
-                d = d.min(dist[i + w - 1] + diag);
-            }
-            dist[i] = d;
-        }
-    }
-    dist
-}
-
-fn raft_height(dist: f32, thickness: f32, oversize: f32, flare: f32) -> f32 {
-    if dist <= oversize {
-        thickness
-    } else if flare < 0.05 || dist >= oversize + flare {
-        0.0
-    } else {
-        thickness * (1.0 - (dist - oversize) / flare)
-    }
-}
-
-fn heightfield(
+fn trace_loops(
+    solid: &[bool],
+    w: usize,
+    h: usize,
     origin_x: f32,
     origin_y: f32,
     cell: f32,
-    w: usize,
-    h: usize,
-    dist: &[f32],
-    thickness: f32,
-    oversize: f32,
-    flare: f32,
-) -> Mesh {
-    let mut vertices = Vec::new();
-    let mut indices = Vec::new();
-    let tri = |vertices: &mut Vec<[f32; 3]>, indices: &mut Vec<u32>, a, b, c| {
-        let base = vertices.len() as u32;
-        vertices.push(a);
-        vertices.push(b);
-        vertices.push(c);
-        indices.extend_from_slice(&[base, base + 1, base + 2]);
+) -> Vec<Vec<[f32; 2]>> {
+    let mut edges: HashMap<(i32, i32), Vec<(i32, i32)>> = HashMap::new();
+    let add = |edges: &mut HashMap<(i32, i32), Vec<(i32, i32)>>, a: (i32, i32), b: (i32, i32)| {
+        edges.entry(a).or_default().push(b);
     };
-    let height_at = |x: i32, y: i32| -> f32 {
-        if x < 0 || y < 0 || x >= w as i32 || y >= h as i32 {
-            0.0
-        } else {
-            raft_height(
-                dist[y as usize * w + x as usize],
-                thickness,
-                oversize,
-                flare,
-            )
-        }
+    let inside = |x: i32, y: i32| -> bool {
+        x >= 0
+            && y >= 0
+            && (x as usize) < w
+            && (y as usize) < h
+            && solid[y as usize * w + x as usize]
     };
-    for y in 0..h {
-        for x in 0..w {
-            let z = height_at(x as i32, y as i32);
-            if z < 0.02 {
+    for y in 0..h as i32 {
+        for x in 0..w as i32 {
+            if !inside(x, y) {
                 continue;
             }
-            let x0 = origin_x + x as f32 * cell;
-            let y0 = origin_y + y as f32 * cell;
-            let x1 = x0 + cell;
-            let y1 = y0 + cell;
-            tri(
-                &mut vertices,
-                &mut indices,
-                [x0, y0, z],
-                [x1, y0, z],
-                [x1, y1, z],
-            );
-            tri(
-                &mut vertices,
-                &mut indices,
-                [x0, y0, z],
-                [x1, y1, z],
-                [x0, y1, z],
-            );
-            tri(
-                &mut vertices,
-                &mut indices,
-                [x0, y0, 0.0],
-                [x1, y1, 0.0],
-                [x1, y0, 0.0],
-            );
-            tri(
-                &mut vertices,
-                &mut indices,
-                [x0, y0, 0.0],
-                [x0, y1, 0.0],
-                [x1, y1, 0.0],
-            );
-            let walls = [
-                (0, -1, [x0, y0], [x1, y0]),
-                (0, 1, [x1, y1], [x0, y1]),
-                (-1, 0, [x0, y1], [x0, y0]),
-                (1, 0, [x1, y0], [x1, y1]),
-            ];
-            for (dx, dy, p0, p1) in walls {
-                let zn = height_at(x as i32 + dx, y as i32 + dy);
-                if zn + 0.02 >= z {
-                    continue;
-                }
-                tri(
-                    &mut vertices,
-                    &mut indices,
-                    [p0[0], p0[1], z],
-                    [p0[0], p0[1], zn],
-                    [p1[0], p1[1], zn],
-                );
-                tri(
-                    &mut vertices,
-                    &mut indices,
-                    [p0[0], p0[1], z],
-                    [p1[0], p1[1], zn],
-                    [p1[0], p1[1], z],
-                );
+            if !inside(x, y - 1) {
+                add(&mut edges, (x, y), (x + 1, y));
+            }
+            if !inside(x + 1, y) {
+                add(&mut edges, (x + 1, y), (x + 1, y + 1));
+            }
+            if !inside(x, y + 1) {
+                add(&mut edges, (x + 1, y + 1), (x, y + 1));
+            }
+            if !inside(x - 1, y) {
+                add(&mut edges, (x, y + 1), (x, y));
             }
         }
     }
+    let starts: Vec<(i32, i32)> = edges.keys().copied().collect();
+    let mut loops = Vec::new();
+    for start in starts {
+        while edges.get(&start).is_some_and(|v| !v.is_empty()) {
+            let mut cur = start;
+            let mut pts = Vec::new();
+            for _ in 0..edges.len() + 4 {
+                let Some(next) = edges.get_mut(&cur).and_then(|v| {
+                    if v.is_empty() {
+                        None
+                    } else {
+                        Some(v.remove(0))
+                    }
+                }) else {
+                    break;
+                };
+                pts.push(cur);
+                if next == start {
+                    break;
+                }
+                cur = next;
+            }
+            let poly = simplify_loop(pts, origin_x, origin_y, cell);
+            if poly.len() >= 3 {
+                loops.push(poly);
+            }
+        }
+    }
+    loops
+}
+
+fn simplify_loop(pts: Vec<(i32, i32)>, origin_x: f32, origin_y: f32, cell: f32) -> Vec<[f32; 2]> {
+    if pts.len() < 3 {
+        return Vec::new();
+    }
+    let mut poly: Vec<[f32; 2]> = pts
+        .into_iter()
+        .map(|(x, y)| [origin_x + x as f32 * cell, origin_y + y as f32 * cell])
+        .collect();
+    let mut changed = true;
+    let mut guard = 0;
+    while changed && poly.len() >= 4 && guard < 8 {
+        guard += 1;
+        changed = false;
+        let n = poly.len();
+        let mut next = Vec::with_capacity(n);
+        for i in 0..n {
+            let a = poly[(i + n - 1) % n];
+            let b = poly[i];
+            let c = poly[(i + 1) % n];
+            let abx = b[0] - a[0];
+            let aby = b[1] - a[1];
+            let bcx = c[0] - b[0];
+            let bcy = c[1] - b[1];
+            let cross = (abx * bcy - aby * bcx).abs();
+            let scale = abx.hypot(aby) + bcx.hypot(bcy);
+            if cross < 0.02 * scale.max(0.25) {
+                changed = true;
+                continue;
+            }
+            next.push(b);
+        }
+        if next.len() >= 3 {
+            poly = next;
+        } else {
+            break;
+        }
+    }
+    let area = polygon_area(&poly);
+    if area.abs() < 0.4 {
+        return Vec::new();
+    }
+    if area < 0.0 {
+        poly.reverse();
+    }
+    poly
+}
+
+fn polygon_area(poly: &[[f32; 2]]) -> f32 {
+    let mut acc = 0.0f32;
+    for i in 0..poly.len() {
+        let a = poly[i];
+        let b = poly[(i + 1) % poly.len()];
+        acc += a[0] * b[1] - b[0] * a[1];
+    }
+    acc * 0.5
+}
+
+fn extrude_skates(loops: &[Vec<[f32; 2]>], thickness: f32, flare: f32) -> Mesh {
+    let mut vertices = Vec::new();
+    let mut indices = Vec::new();
+    for top in loops {
+        if top.len() < 3 {
+            continue;
+        }
+        let bot = offset_polygon(top, flare);
+        if bot.len() != top.len() {
+            continue;
+        }
+        let top_i = vertices.len() as u32;
+        for p in top {
+            vertices.push([p[0], p[1], thickness]);
+        }
+        let bot_i = vertices.len() as u32;
+        for p in &bot {
+            vertices.push([p[0], p[1], 0.0]);
+        }
+        for tri in triangulate(top) {
+            indices.extend_from_slice(&[top_i + tri[0], top_i + tri[1], top_i + tri[2]]);
+        }
+        for tri in triangulate(&bot) {
+            indices.extend_from_slice(&[bot_i + tri[0], bot_i + tri[2], bot_i + tri[1]]);
+        }
+        let n = top.len() as u32;
+        for i in 0..n {
+            let j = (i + 1) % n;
+            indices.extend_from_slice(&[
+                top_i + i,
+                bot_i + i,
+                bot_i + j,
+                top_i + i,
+                bot_i + j,
+                top_i + j,
+            ]);
+        }
+    }
     Mesh { vertices, indices }
+}
+
+fn offset_polygon(poly: &[[f32; 2]], dist: f32) -> Vec<[f32; 2]> {
+    if dist < 0.02 {
+        return poly.to_vec();
+    }
+    let n = poly.len();
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        let prev = poly[(i + n - 1) % n];
+        let curr = poly[i];
+        let next = poly[(i + 1) % n];
+        let e0 = unit2(curr[0] - prev[0], curr[1] - prev[1]);
+        let e1 = unit2(next[0] - curr[0], next[1] - curr[1]);
+        let n0 = [e0[1], -e0[0]];
+        let n1 = [e1[1], -e1[0]];
+        let mut bx = n0[0] + n1[0];
+        let mut by = n0[1] + n1[1];
+        let len = bx.hypot(by);
+        if len < 1e-5 {
+            bx = n0[0];
+            by = n0[1];
+        } else {
+            bx /= len;
+            by /= len;
+        }
+        let denom = (bx * n0[0] + by * n0[1]).abs().max(0.35);
+        let scale = (dist / denom).min(dist * 3.0);
+        out.push([curr[0] + bx * scale, curr[1] + by * scale]);
+    }
+    out
+}
+
+fn unit2(x: f32, y: f32) -> [f32; 2] {
+    let len = x.hypot(y);
+    if len < 1e-8 {
+        [1.0, 0.0]
+    } else {
+        [x / len, y / len]
+    }
+}
+
+fn triangulate(poly: &[[f32; 2]]) -> Vec<[u32; 3]> {
+    let mut idx: Vec<usize> = (0..poly.len()).collect();
+    let mut tris = Vec::new();
+    let mut guard = 0;
+    let limit = poly.len() * poly.len() + 4;
+    while idx.len() > 3 && guard < limit {
+        guard += 1;
+        let n = idx.len();
+        let mut clipped = false;
+        for i in 0..n {
+            let ia = idx[(i + n - 1) % n];
+            let ib = idx[i];
+            let ic = idx[(i + 1) % n];
+            if !convex_corner(poly[ia], poly[ib], poly[ic]) {
+                continue;
+            }
+            let mut blocked = false;
+            for &j in &idx {
+                if j == ia || j == ib || j == ic {
+                    continue;
+                }
+                if point_in_tri2(poly[j], poly[ia], poly[ib], poly[ic]) {
+                    blocked = true;
+                    break;
+                }
+            }
+            if blocked {
+                continue;
+            }
+            tris.push([ia as u32, ib as u32, ic as u32]);
+            idx.remove(i);
+            clipped = true;
+            break;
+        }
+        if !clipped {
+            break;
+        }
+    }
+    if idx.len() == 3 {
+        tris.push([idx[0] as u32, idx[1] as u32, idx[2] as u32]);
+    }
+    tris
+}
+
+fn convex_corner(a: [f32; 2], b: [f32; 2], c: [f32; 2]) -> bool {
+    let cross = (b[0] - a[0]) * (c[1] - b[1]) - (b[1] - a[1]) * (c[0] - b[0]);
+    cross > 1e-5
+}
+
+fn point_in_tri2(p: [f32; 2], a: [f32; 2], b: [f32; 2], c: [f32; 2]) -> bool {
+    let c0 = (b[0] - a[0]) * (p[1] - a[1]) - (b[1] - a[1]) * (p[0] - a[0]);
+    let c1 = (c[0] - b[0]) * (p[1] - b[1]) - (c[1] - b[1]) * (p[0] - b[0]);
+    let c2 = (a[0] - c[0]) * (p[1] - c[1]) - (a[1] - c[1]) * (p[0] - c[0]);
+    c0 > 1e-4 && c1 > 1e-4 && c2 > 1e-4
 }
 
 #[cfg(test)]
@@ -1189,30 +1298,112 @@ mod tests {
     }
 
     #[test]
-    fn skate_raft_follows_the_part_and_leans_out() {
-        let mesh = crate::mesh::box_mesh([0.0, 0.0, 0.0], [10.0, 10.0, 8.0]);
-        let raft = skate_raft(&mesh.vertices, &mesh.indices, 1.0, 2.0, 45.0).unwrap();
-        let (min, max) = raft.bounds().unwrap();
+    fn support_raft_joins_nearby_squares_and_leans_out() {
+        let supports = [
+            Support {
+                id: 1,
+                x: 0.0,
+                y: 0.0,
+                z_top: 12.0,
+                z_base: 0.0,
+            },
+            Support {
+                id: 2,
+                x: 8.0,
+                y: 0.0,
+                z_top: 12.0,
+                z_base: 0.0,
+            },
+            Support {
+                id: 3,
+                x: 8.0,
+                y: 8.0,
+                z_top: 12.0,
+                z_base: 0.0,
+            },
+            Support {
+                id: 4,
+                x: 0.0,
+                y: 8.0,
+                z_top: 12.0,
+                z_base: 0.0,
+            },
+        ];
+        let raft = support_raft(&supports, 2.5, 1.0, 2.0, 0.0).unwrap();
         assert!(
-            min[0] < -1.5,
-            "oversize should pass the outline, min x {}",
-            min[0]
+            raft.vertices.len() < 80,
+            "a joined skate should be a polygon, not a pixel grid ({} verts)",
+            raft.vertices.len()
         );
         assert!(
-            max[0] > 11.5,
-            "oversize should pass the outline, max x {}",
-            max[0]
+            covers_xy(&raft, 4.0, 4.0),
+            "nearby pads should join across the middle"
         );
+        let far = [Support {
+            id: 5,
+            x: 80.0,
+            y: 80.0,
+            z_top: 12.0,
+            z_base: 0.0,
+        }];
+        let mut split = supports.to_vec();
+        split.extend(far);
+        let apart = support_raft(&split, 2.5, 1.0, 2.0, 0.0).unwrap();
         assert!(
-            raft.vertices.iter().any(|v| v[2] > 0.8),
-            "the top of the raft is the thickness"
+            !covers_xy(&apart, 40.0, 40.0),
+            "pillars far apart stay separate skates"
         );
+        let leaned = support_raft(&supports, 2.5, 1.0, 2.0, 45.0).unwrap();
+        let top_min = leaned
+            .vertices
+            .iter()
+            .filter(|v| v[2] > 0.8)
+            .map(|v| v[0])
+            .fold(f32::MAX, f32::min);
+        let bed_min = leaned
+            .vertices
+            .iter()
+            .filter(|v| v[2] < 0.05)
+            .map(|v| v[0])
+            .fold(f32::MAX, f32::min);
         assert!(
-            raft.vertices
-                .iter()
-                .any(|v| v[2] < 0.05 && (v[0] < -0.5 || v[0] > 10.5)),
-            "the leaned wall meets the bed outside the part"
+            bed_min < top_min - 0.4,
+            "45° wall should land outside the top, bed {bed_min} top {top_min}"
         );
+        assert!(support_raft(
+            &[Support {
+                id: 9,
+                x: 0.0,
+                y: 0.0,
+                z_top: 20.0,
+                z_base: 8.0,
+            }],
+            2.5,
+            1.0,
+            2.0,
+            30.0,
+        )
+        .is_none());
+    }
+
+    fn covers_xy(mesh: &Mesh, x: f32, y: f32) -> bool {
+        mesh.indices.chunks_exact(3).any(|tri| {
+            let a = mesh.vertices[tri[0] as usize];
+            let b = mesh.vertices[tri[1] as usize];
+            let c = mesh.vertices[tri[2] as usize];
+            if a[2] < 0.2 && b[2] < 0.2 && c[2] < 0.2 {
+                return false;
+            }
+            let points = [[a[0], a[1]], [b[0], b[1]], [c[0], c[1]]];
+            let cross = |p: [f32; 2], q: [f32; 2], r: [f32; 2]| {
+                (q[0] - p[0]) * (r[1] - p[1]) - (q[1] - p[1]) * (r[0] - p[0])
+            };
+            let c0 = cross(points[0], points[1], [x, y]);
+            let c1 = cross(points[1], points[2], [x, y]);
+            let c2 = cross(points[2], points[0], [x, y]);
+            (c0 >= -1e-3 && c1 >= -1e-3 && c2 >= -1e-3)
+                || (c0 <= 1e-3 && c1 <= 1e-3 && c2 <= 1e-3)
+        })
     }
 
     #[test]

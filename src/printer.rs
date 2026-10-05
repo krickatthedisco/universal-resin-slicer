@@ -110,6 +110,9 @@ pub struct PrintSettings {
     /// Currency per litre. Zero hides the cost.
     #[serde(default)]
     pub price_per_liter: f32,
+    /// Cure closed holes in each layer so a detected pocket does not stay empty.
+    #[serde(default)]
+    pub fill_voids: bool,
 }
 
 impl Default for PrintSettings {
@@ -141,6 +144,7 @@ impl PrintSettings {
             shrink_xy_pct: 0.0,
             shrink_z_pct: 0.0,
             price_per_liter: 0.0,
+            fill_voids: false,
         }
     }
 

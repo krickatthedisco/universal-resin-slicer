@@ -85,6 +85,9 @@ struct Persist {
     mirror_x: bool,
     mirror_y: bool,
     preset: usize,
+    /// Older saves stored this as `raft`, which defaulted on. A skate now
+    /// stays off until the user asks for one.
+    #[serde(default, rename = "raft_on")]
     raft: bool,
     #[serde(default = "default_raft_mm")]
     raft_mm: f32,
@@ -145,7 +148,7 @@ impl AmberApp {
         let mut machine = Machine::photon_m3_max();
         let mut settings = PrintSettings::default();
         let mut preset = 1usize;
-        let mut raft = true;
+        let mut raft = false;
         let mut raft_mm = 1.0;
         let mut raft_margin = 2.0;
         let mut raft_angle = 30.0;
@@ -1295,7 +1298,7 @@ impl AmberApp {
         raft_changed |= drag_f32(ui, "Raft thickness", &mut raft_mm, 0.05, 0.2, 5.0, "mm");
         raft_changed |= drag_f32(ui, "Raft oversize", &mut raft_margin, 0.05, 0.0, 20.0, "mm");
         raft_changed |= drag_f32(ui, "Raft wall angle", &mut raft_angle, 0.5, 0.0, 70.0, "°");
-        ui.label("Each part gets its own skate in the shape of its outline. Oversize grows that outline. The wall leans out from vertical by the angle, so the base is wider than the top.");
+        ui.label("Off until you turn it on, and only under supports that reach the bed. Each of those pillars gets a square pad. Nearby pads join into one skate about the shape of the supported area. Oversize grows the pads. The wall leans out from vertical, so the base is wider than the top.");
         raft_changed |= ui.checkbox(&mut braces, "Diagonal braces").changed();
         raft_changed |= drag_f32(ui, "Brace angle", &mut brace_angle, 0.5, 15.0, 75.0, "°");
         raft_changed |= drag_f32(ui, "Brace spacing", &mut brace_dist, 0.1, 2.0, 20.0, "mm");
@@ -1603,6 +1606,10 @@ impl AmberApp {
             }
             changed = true;
         }
+        changed |= ui
+            .checkbox(&mut s.fill_voids, "Fill enclosed voids")
+            .changed();
+        ui.label("Cures closed holes in each layer, the same pockets the suction check finds. A hollow interior is filled too. Drain holes are cut after the fill, so a drain still opens.");
         ui.collapsing("Compensation and cost", |ui| {
             changed |= drag_f32(ui, "XY offset", &mut s.xy_offset_mm, 0.01, -0.5, 0.5, "mm");
             changed |= drag_f32(
