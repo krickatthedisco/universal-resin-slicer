@@ -6,7 +6,7 @@
 //! the Photon exposes layer 0 on the plate and then steps by the layer height.
 
 use crate::printer::{layer_motion, move_seconds, Machine, PrintSettings};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 
@@ -312,11 +312,104 @@ fn raster_solid(solid: &Solid, z: f32, machine: Machine, aa: u8) -> Image {
             let p0 = to_px(seg.0, machine);
             let p1 = to_px(seg.1, machine);
             if (p0[0] - p1[0]).abs() + (p0[1] - p1[1]).abs() > 1e-5 {
-                segs.push((p0, p1));
+                segs.push((snap_px(p0), snap_px(p1)));
             }
         }
     }
+    stitch_open_ends(&mut segs);
     fill_segments(&segs, machine, aa)
+}
+
+fn snap_px(p: [f32; 2]) -> [f32; 2] {
+    const Q: f32 = 32.0;
+    [(p[0] * Q).round() / Q, (p[1] * Q).round() / Q]
+}
+
+/// Join contour ends that nearly meet. A sculpt often has a crack a pixel or
+/// two wide; even-odd fill turns that into a missing line through the layer.
+fn stitch_open_ends(segs: &mut Vec<([f32; 2], [f32; 2])>) {
+    const GAP: f32 = 2.5;
+    const ALREADY: f32 = 0.4;
+    if segs.len() < 2 || segs.len() > 1_500_000 {
+        return;
+    }
+    let cell = GAP;
+    let key = |p: [f32; 2]| ((p[0] / cell).floor() as i32, (p[1] / cell).floor() as i32);
+    let mut grid: HashMap<(i32, i32), Vec<usize>> = HashMap::new();
+    for (i, (a, b)) in segs.iter().enumerate() {
+        grid.entry(key(*a)).or_default().push(i * 2);
+        grid.entry(key(*b)).or_default().push(i * 2 + 1);
+    }
+    let ends: Vec<[f32; 2]> = segs.iter().flat_map(|(a, b)| [*a, *b]).collect();
+    let nearest = |id: usize, p: [f32; 2]| -> Option<f32> {
+        let (cx, cy) = key(p);
+        let mut best = f32::MAX;
+        for dy in -1..=1 {
+            for dx in -1..=1 {
+                let Some(bucket) = grid.get(&(cx + dx, cy + dy)) else {
+                    continue;
+                };
+                for &other in bucket {
+                    if other == id || other == id ^ 1 {
+                        continue;
+                    }
+                    let q = ends[other];
+                    let d2 = (p[0] - q[0]).powi(2) + (p[1] - q[1]).powi(2);
+                    if d2 < best {
+                        best = d2;
+                    }
+                }
+            }
+        }
+        if best < f32::MAX {
+            Some(best)
+        } else {
+            None
+        }
+    };
+    let mut open = Vec::new();
+    for (id, p) in ends.iter().copied().enumerate() {
+        match nearest(id, p) {
+            None => open.push(id),
+            Some(d2) => {
+                let d = d2.sqrt();
+                if d > ALREADY && d <= GAP {
+                    open.push(id);
+                }
+            }
+        }
+    }
+    if open.len() > 8_000 {
+        return;
+    }
+    let mut used = vec![false; open.len()];
+    let mut extra = Vec::new();
+    for i in 0..open.len() {
+        if used[i] {
+            continue;
+        }
+        let p = ends[open[i]];
+        let mut best: Option<(usize, f32)> = None;
+        for j in (i + 1)..open.len() {
+            if used[j] {
+                continue;
+            }
+            let q = ends[open[j]];
+            let d2 = (p[0] - q[0]).powi(2) + (p[1] - q[1]).powi(2);
+            if d2 > ALREADY * ALREADY
+                && d2 <= GAP * GAP
+                && best.map(|(_, bd)| d2 < bd).unwrap_or(true)
+            {
+                best = Some((j, d2));
+            }
+        }
+        if let Some((j, _)) = best {
+            used[i] = true;
+            used[j] = true;
+            extra.push((p, ends[open[j]]));
+        }
+    }
+    segs.extend(extra);
 }
 
 fn to_px(p: [f32; 2], machine: Machine) -> [f32; 2] {
@@ -483,12 +576,63 @@ fn fill_segments(segs: &[([f32; 2], [f32; 2])], machine: Machine, aa: u8) -> Ima
             i += 2;
         }
     }
+    seal_hairlines(&mut pixels, width, height);
     Image {
         x0,
         y0,
         width,
         height,
         pixels,
+    }
+}
+
+/// Fill a one- or two-pixel crack that has solid resin on both sides.
+/// That is the missing line in an otherwise solid layer, not a real hole.
+fn seal_hairlines(pixels: &mut [u8], width: i32, height: i32) {
+    let w = width as usize;
+    let h = height as usize;
+    if w < 3 || h < 3 {
+        return;
+    }
+    let mut extra: Vec<(usize, u8)> = Vec::new();
+    for y in 1..h - 1 {
+        for x in 0..w {
+            let i = y * w + x;
+            if pixels[i] == 0 && pixels[i - w] > 0 && pixels[i + w] > 0 {
+                extra.push((i, pixels[i - w].min(pixels[i + w])));
+            }
+        }
+    }
+    for y in 1..h.saturating_sub(2) {
+        for x in 0..w {
+            let i = y * w + x;
+            let j = i + w;
+            if pixels[i] == 0 && pixels[j] == 0 && pixels[i - w] > 0 && pixels[j + w] > 0 {
+                let v = pixels[i - w].min(pixels[j + w]);
+                extra.push((i, v));
+                extra.push((j, v));
+            }
+        }
+    }
+    for (i, v) in &extra {
+        if pixels[*i] < *v {
+            pixels[*i] = *v;
+        }
+    }
+    extra.clear();
+    for y in 0..h {
+        let row = y * w;
+        for x in 1..w - 1 {
+            let i = row + x;
+            if pixels[i] == 0 && pixels[i - 1] > 0 && pixels[i + 1] > 0 {
+                extra.push((i, pixels[i - 1].min(pixels[i + 1])));
+            }
+        }
+    }
+    for (i, v) in extra {
+        if pixels[i] < v {
+            pixels[i] = v;
+        }
     }
 }
 
@@ -1121,6 +1265,22 @@ mod tests {
             (got - expected).abs() / expected < 0.06,
             "flipped nonzero {got} expected ~{expected}"
         );
+    }
+
+    #[test]
+    fn hairline_between_solid_rows_is_filled() {
+        let width = 6i32;
+        let height = 4i32;
+        let mut pixels = vec![0u8; (width * height) as usize];
+        for x in 0..width as usize {
+            pixels[x] = 255;
+            pixels[3 * width as usize + x] = 255;
+        }
+        seal_hairlines(&mut pixels, width, height);
+        for x in 0..width as usize {
+            assert_eq!(pixels[width as usize + x], 255, "row 1 col {x}");
+            assert_eq!(pixels[2 * width as usize + x], 255, "row 2 col {x}");
+        }
     }
 
     #[test]

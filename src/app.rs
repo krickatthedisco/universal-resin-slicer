@@ -1359,19 +1359,6 @@ impl AmberApp {
                 egui::FontId::proportional(22.0),
                 egui::Color32::from_rgb(180, 164, 140),
             );
-        } else if self
-            .doc
-            .objects
-            .iter()
-            .any(|obj| obj.mesh.triangle_count() > 280_000)
-        {
-            ui.painter().text(
-                rect.left_bottom() + egui::vec2(12.0, -16.0),
-                egui::Align2::LEFT_BOTTOM,
-                "Dense mesh: the plate view is simplified so the surface stays solid. Slicing still uses every triangle.",
-                egui::FontId::proportional(13.0),
-                egui::Color32::from_rgb(190, 176, 150),
-            );
         }
     }
 
@@ -1523,10 +1510,14 @@ impl AmberApp {
         {
             self.preview_index = (self.preview_index + 1).min(count - 1);
         }
-        let slider_h = (ui.available_height() - 128.0).max(80.0);
+        // egui's vertical slider uses Spacing::slider_width for its length,
+        // not the rectangle passed to add_sized. Stretch it to the gap
+        // between the step buttons.
+        let footer = 128.0;
+        let slider_h = (ui.available_height() - footer).max(64.0);
+        ui.spacing_mut().slider_width = slider_h;
         let mut layer = self.preview_index;
-        ui.add_sized(
-            [28.0, slider_h],
+        ui.add(
             egui::Slider::new(&mut layer, 0..=count - 1)
                 .vertical()
                 .show_value(false),

@@ -44,7 +44,7 @@ Amber is not affiliated with Anycubic. Resin times below are Anycubic's publishe
 - The prepare window follows the classic Chitubox layout: a top menu, a left tool rail (Select, Move, Rotate, Scale, Mirror, Hollow, Hole, Support), and a right panel that changes with the tool. Print settings stay in the panel under that name.
 - Automatic tree supports (Light, Medium, Heavy). Nearby tips share a trunk. Each tip has a point or ball contact, contact diameter and depth, upper and lower diameter, connection length, trunk diameter, branch angle, and a foot. Cross-braces and a raft are optional. You can also click an underside, send supports only to the platform, or drop them on islands from the last slice.
 - Layer preview with a vertical bar on the right: step up or down one layer, drag the bar, or type a layer number. Islands are tinted, and a layer that seals a cavity is called out.
-- A very dense sculpt is drawn with a coarser plate mesh so triangles smaller than a pixel do not vanish. The slice still uses every triangle in the file.
+- The plate draws every triangle, with a point on each corner so faces smaller than a pixel do not turn into holes.
 - Volume, weight, and a time estimate. Export `.pm3m` or one layer as PNG.
 - Settings persist between launches.
 

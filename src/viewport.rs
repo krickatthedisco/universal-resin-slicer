@@ -5,8 +5,6 @@ use crate::scene::{Document, Selection};
 use crate::supports;
 use glam::{Mat4, Vec3};
 use glow::HasContext;
-use std::cell::RefCell;
-use std::collections::HashMap;
 use std::sync::Arc;
 
 #[derive(Clone)]
@@ -73,8 +71,6 @@ pub struct DrawLists {
 }
 
 pub fn build_draw(doc: &Document, plate: Vec3, selection: Selection) -> DrawLists {
-    let ids: Vec<u64> = doc.objects.iter().map(|obj| obj.id).collect();
-    prune_display(&ids);
     let mut tris = Vec::new();
     let mut lines = Vec::new();
     push_plate(&mut tris, &mut lines, plate);
@@ -141,69 +137,10 @@ pub fn build_draw(doc: &Document, plate: Vec3, selection: Selection) -> DrawList
     DrawLists { tris, lines }
 }
 
-/// Above this, a sculpt's triangles are smaller than a screen pixel and the
-/// rasterizer drops them, which reads as holes. The slice still uses the
-/// full mesh. The plate view keeps a welded, coarser copy.
-const DISPLAY_TRIANGLES: usize = 280_000;
-
-struct CachedView {
-    stamp: u64,
-    mesh: Mesh,
-}
-
-thread_local! {
-    static DISPLAY: RefCell<HashMap<u64, CachedView>> = RefCell::new(HashMap::new());
-}
-
-fn prune_display(live: &[u64]) {
-    DISPLAY.with(|cache| {
-        cache
-            .borrow_mut()
-            .retain(|id, _| live.iter().any(|live_id| live_id == id));
-    });
-}
-
-fn mesh_stamp(mesh: &Mesh) -> u64 {
-    let mut stamp = ((mesh.vertices.len() as u64) << 32) ^ mesh.indices.len() as u64;
-    if let Some(v) = mesh.vertices.first() {
-        stamp ^= v[0].to_bits() as u64;
-        stamp ^= (v[1].to_bits() as u64) << 1;
-        stamp ^= (v[2].to_bits() as u64) << 2;
-    }
-    if let Some(v) = mesh.vertices.get(mesh.vertices.len() / 2) {
-        stamp ^= (v[0].to_bits() as u64).rotate_left(13);
-    }
-    if let Some(index) = mesh.indices.last() {
-        stamp ^= *index as u64;
-    }
-    stamp
-}
-
 fn push_object(tris: &mut Vec<f32>, obj: &crate::scene::Object, color: [f32; 3]) {
-    let mat = Document::matrix(obj);
-    if obj.mesh.triangle_count() <= DISPLAY_TRIANGLES {
-        push_transformed(tris, &obj.mesh, mat, color);
-        return;
-    }
-    let stamp = mesh_stamp(&obj.mesh);
-    DISPLAY.with(|cache| {
-        let mut cache = cache.borrow_mut();
-        let stale = cache
-            .get(&obj.id)
-            .is_none_or(|cached| cached.stamp != stamp);
-        if stale {
-            cache.insert(
-                obj.id,
-                CachedView {
-                    stamp,
-                    mesh: cluster_for_display(&obj.mesh, DISPLAY_TRIANGLES),
-                },
-            );
-        }
-        if let Some(cached) = cache.get(&obj.id) {
-            push_transformed(tris, &cached.mesh, mat, color);
-        }
-    });
+    // Every triangle of the file. A coarser stand-in was merging the sculpt
+    // into a speckled shell. Sub-pixel faces are covered by the point pass.
+    push_transformed(tris, &obj.mesh, Document::matrix(obj), color);
 }
 
 fn push_transformed(tris: &mut Vec<f32>, mesh: &Mesh, mat: Mat4, color: [f32; 3]) {
@@ -222,62 +159,6 @@ fn push_transformed(tris: &mut Vec<f32>, mesh: &Mesh, mat: Mat4, color: [f32; 3]
             push_vert(tris, p.to_array(), n, color);
         }
     }
-}
-
-fn cluster_for_display(mesh: &Mesh, target: usize) -> Mesh {
-    let Some((min, max)) = mesh.bounds() else {
-        return Mesh {
-            vertices: vec![],
-            indices: vec![],
-        };
-    };
-    let tris = mesh.triangle_count().max(1) as f32;
-    let ratio = (tris / target as f32).sqrt().max(1.0);
-    let dx = max[0] - min[0];
-    let dy = max[1] - min[1];
-    let dz = max[2] - min[2];
-    let diag = (dx * dx + dy * dy + dz * dz).sqrt().max(1.0);
-    let cell = ((diag / 160.0) * ratio.sqrt()).clamp(0.04, diag / 6.0);
-    let inv = 1.0 / cell;
-    let mut map: HashMap<(i32, i32, i32), u32> = HashMap::new();
-    let mut vertices = Vec::new();
-    let mut acc: Vec<[f32; 4]> = Vec::new();
-    let mut remap = vec![0u32; mesh.vertices.len()];
-    for (i, v) in mesh.vertices.iter().enumerate() {
-        let key = (
-            ((v[0] - min[0]) * inv).floor() as i32,
-            ((v[1] - min[1]) * inv).floor() as i32,
-            ((v[2] - min[2]) * inv).floor() as i32,
-        );
-        if let Some(&id) = map.get(&key) {
-            remap[i] = id;
-            let slot = &mut acc[id as usize];
-            slot[0] += v[0];
-            slot[1] += v[1];
-            slot[2] += v[2];
-            slot[3] += 1.0;
-        } else {
-            let id = vertices.len() as u32;
-            map.insert(key, id);
-            vertices.push(*v);
-            acc.push([v[0], v[1], v[2], 1.0]);
-            remap[i] = id;
-        }
-    }
-    for (vertex, sum) in vertices.iter_mut().zip(&acc) {
-        let n = sum[3].max(1.0);
-        *vertex = [sum[0] / n, sum[1] / n, sum[2] / n];
-    }
-    let mut indices = Vec::new();
-    for tri in mesh.indices.chunks_exact(3) {
-        let a = remap[tri[0] as usize];
-        let b = remap[tri[1] as usize];
-        let c = remap[tri[2] as usize];
-        if a != b && b != c && c != a {
-            indices.extend_from_slice(&[a, b, c]);
-        }
-    }
-    Mesh { vertices, indices }
 }
 
 fn push_mesh_flat(tris: &mut Vec<f32>, mesh: &Mesh, color: [f32; 3]) {
@@ -422,6 +303,22 @@ void main() {
 }
 "#;
 
+const POINT_VERT: &str = r#"
+layout(location = 0) in vec3 a_pos;
+layout(location = 1) in vec3 a_nrm;
+layout(location = 2) in vec3 a_col;
+uniform mat4 u_mvp;
+uniform float u_point;
+out vec3 v_nrm;
+out vec3 v_col;
+void main() {
+    v_nrm = a_nrm;
+    v_col = a_col;
+    gl_Position = u_mvp * vec4(a_pos, 1.0);
+    gl_PointSize = u_point;
+}
+"#;
+
 const LINE_VERT: &str = r#"
 layout(location = 0) in vec3 a_pos;
 layout(location = 1) in vec3 a_col;
@@ -449,6 +346,7 @@ struct Batch {
 
 pub struct Renderer {
     program: glow::Program,
+    point_program: glow::Program,
     line_program: glow::Program,
     batches: Vec<Batch>,
     line_vao: glow::VertexArray,
@@ -461,11 +359,13 @@ impl Renderer {
     pub fn new(gl: &glow::Context) -> Result<Self, String> {
         unsafe {
             let program = link(gl, VERT, FRAG)?;
+            let point_program = link(gl, POINT_VERT, FRAG)?;
             let line_program = link(gl, LINE_VERT, LINE_FRAG)?;
             let line_vao = gl.create_vertex_array().map_err(|e| e.to_string())?;
             let line_vbo = gl.create_buffer().map_err(|e| e.to_string())?;
             Ok(Self {
                 program,
+                point_program,
                 line_program,
                 batches: Vec::new(),
                 line_vao,
@@ -540,11 +440,28 @@ impl Renderer {
             gl.enable(glow::DEPTH_TEST);
             gl.depth_func(glow::LEQUAL);
             gl.depth_mask(true);
-            gl.enable(glow::POLYGON_OFFSET_FILL);
-            gl.polygon_offset(1.0, 1.0);
+            gl.disable(glow::POLYGON_OFFSET_FILL);
             gl.front_face(glow::CCW);
             gl.clear_color(0.11, 0.12, 0.14, 1.0);
             gl.clear(glow::COLOR_BUFFER_BIT | glow::DEPTH_BUFFER_BIT);
+            // Points first, then triangles. A face smaller than a pixel never
+            // covers a pixel center, which is the holey sculpt. A 3px point on
+            // each corner fills that gap; the triangles replace the points
+            // wherever they actually cover.
+            gl.enable(glow::PROGRAM_POINT_SIZE);
+            gl.use_program(Some(self.point_program));
+            let loc = gl.get_uniform_location(self.point_program, "u_mvp");
+            gl.uniform_matrix_4_f32_slice(loc.as_ref(), false, vp.as_ref());
+            let point = gl.get_uniform_location(self.point_program, "u_point");
+            gl.uniform_1_f32(point.as_ref(), 3.0);
+            let light = gl.get_uniform_location(self.point_program, "u_light");
+            gl.uniform_3_f32(light.as_ref(), 0.35, -0.25, 0.90);
+            let fill = gl.get_uniform_location(self.point_program, "u_fill");
+            gl.uniform_3_f32(fill.as_ref(), -0.4, 0.6, 0.2);
+            for batch in &self.batches {
+                gl.bind_vertex_array(Some(batch.vao));
+                gl.draw_arrays(glow::POINTS, 0, batch.count);
+            }
             gl.use_program(Some(self.program));
             let loc = gl.get_uniform_location(self.program, "u_mvp");
             gl.uniform_matrix_4_f32_slice(loc.as_ref(), false, vp.as_ref());
@@ -556,7 +473,6 @@ impl Renderer {
                 gl.bind_vertex_array(Some(batch.vao));
                 gl.draw_arrays(glow::TRIANGLES, 0, batch.count);
             }
-            gl.disable(glow::POLYGON_OFFSET_FILL);
 
             gl.use_program(Some(self.line_program));
             let loc = gl.get_uniform_location(self.line_program, "u_mvp");
@@ -571,6 +487,7 @@ impl Renderer {
     pub fn destroy(&self, gl: &glow::Context) {
         unsafe {
             gl.delete_program(self.program);
+            gl.delete_program(self.point_program);
             gl.delete_program(self.line_program);
             for batch in &self.batches {
                 gl.delete_vertex_array(batch.vao);
