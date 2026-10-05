@@ -139,7 +139,8 @@ pub fn build_draw(doc: &Document, plate: Vec3, selection: Selection) -> DrawList
 
 fn push_object(tris: &mut Vec<f32>, obj: &crate::scene::Object, color: [f32; 3]) {
     // Every triangle of the file. A coarser stand-in was merging the sculpt
-    // into a speckled shell. Sub-pixel faces are covered by the point pass.
+    // into a speckled shell. Faces smaller than a pixel are grown in the
+    // geometry shader so the rasterizer still hits them.
     push_transformed(tris, &obj.mesh, Document::matrix(obj), color);
 }
 
@@ -287,6 +288,25 @@ void main() {
 "#;
 
 const FRAG: &str = r#"
+in vec3 g_nrm;
+in vec3 g_col;
+out vec4 out_color;
+uniform vec3 u_light;
+uniform vec3 u_fill;
+void main() {
+    float len2 = dot(g_nrm, g_nrm);
+    vec3 n = len2 > 1e-8 ? normalize(g_nrm) : vec3(0.0, 0.0, 1.0);
+    if (!gl_FrontFacing) { n = -n; }
+    float ndl = clamp(dot(n, normalize(u_light)), 0.0, 1.0);
+    float fill = clamp(dot(n, normalize(u_fill)), 0.0, 1.0);
+    float shade = 0.62 + 0.34 * ndl + 0.10 * fill;
+    out_color = vec4(g_col * shade, 1.0);
+}
+"#;
+
+// Same lighting, reading the vertex shader outputs. Used only when the
+// geometry shader will not link.
+const FRAG_DIRECT: &str = r#"
 in vec3 v_nrm;
 in vec3 v_col;
 out vec4 out_color;
@@ -303,19 +323,82 @@ void main() {
 }
 "#;
 
-const POINT_VERT: &str = r#"
-layout(location = 0) in vec3 a_pos;
-layout(location = 1) in vec3 a_nrm;
-layout(location = 2) in vec3 a_col;
-uniform mat4 u_mvp;
-uniform float u_point;
-out vec3 v_nrm;
-out vec3 v_col;
+// A sculpt's faces are often smaller than one pixel, so the rasterizer
+// skips them and the surface looks full of holes. Grow each face just
+// enough to cover a pixel, and give every edge a fraction of a pixel of
+// overlap so shared borders don't leave a crack.
+const GEOM: &str = r#"
+layout(triangles) in;
+layout(triangle_strip, max_vertices = 3) out;
+in vec3 v_nrm[];
+in vec3 v_col[];
+out vec3 g_nrm;
+out vec3 g_col;
+uniform vec2 u_viewport;
+
+vec2 screen_of(vec4 clip) {
+    return (clip.xy / clip.w) * (u_viewport * 0.5);
+}
+
+vec4 clip_from_screen(vec2 screen, vec4 clip) {
+    vec2 ndc = screen / (u_viewport * 0.5);
+    clip.xy = ndc * clip.w;
+    return clip;
+}
+
+vec2 outward(vec2 d) {
+    float len = length(d);
+    return len > 1e-4 ? d / len : vec2(1.0, 0.0);
+}
+
+void emit_vert(int i, vec4 clip) {
+    g_nrm = v_nrm[i];
+    g_col = v_col[i];
+    gl_Position = clip;
+    EmitVertex();
+}
+
 void main() {
-    v_nrm = a_nrm;
-    v_col = a_col;
-    gl_Position = u_mvp * vec4(a_pos, 1.0);
-    gl_PointSize = u_point;
+    vec4 c0 = gl_in[0].gl_Position;
+    vec4 c1 = gl_in[1].gl_Position;
+    vec4 c2 = gl_in[2].gl_Position;
+    // A vertex behind the camera has a nonsense screen position. Let the
+    // clipper handle that triangle instead of exploding it.
+    if (c0.w <= 1e-4 || c1.w <= 1e-4 || c2.w <= 1e-4) {
+        emit_vert(0, c0);
+        emit_vert(1, c1);
+        emit_vert(2, c2);
+        EndPrimitive();
+        return;
+    }
+    vec2 s0 = screen_of(c0);
+    vec2 s1 = screen_of(c1);
+    vec2 s2 = screen_of(c2);
+    vec2 center = (s0 + s1 + s2) / 3.0;
+    vec2 d0 = s0 - center;
+    vec2 d1 = s1 - center;
+    vec2 d2 = s2 - center;
+    float r = max(length(d0), max(length(d1), length(d2)));
+    // Inradius of an equilateral triangle is half the vertex radius. 1.6 px
+    // of vertex radius keeps a pixel center inside even when the face sits
+    // between pixels. The extra outward step closes cracks on thin faces.
+    vec2 n0;
+    vec2 n1;
+    vec2 n2;
+    if (r < 0.05) {
+        n0 = center + vec2(1.7, 0.0);
+        n1 = center + vec2(-0.85, 1.47);
+        n2 = center + vec2(-0.85, -1.47);
+    } else {
+        float scale = min(max(r, 1.6) / r, 32.0);
+        n0 = center + d0 * scale + outward(d0) * 0.85;
+        n1 = center + d1 * scale + outward(d1) * 0.85;
+        n2 = center + d2 * scale + outward(d2) * 0.85;
+    }
+    emit_vert(0, clip_from_screen(n0, c0));
+    emit_vert(1, clip_from_screen(n1, c1));
+    emit_vert(2, clip_from_screen(n2, c2));
+    EndPrimitive();
 }
 "#;
 
@@ -346,32 +429,36 @@ struct Batch {
 
 pub struct Renderer {
     program: glow::Program,
-    point_program: glow::Program,
     line_program: glow::Program,
     batches: Vec<Batch>,
     line_vao: glow::VertexArray,
     line_vbo: glow::Buffer,
     line_verts: i32,
     generation: u64,
+    /// False when the driver rejected the geometry shader and faces smaller
+    /// than a pixel can still drop out.
+    pub covers_pixels: bool,
 }
 
 impl Renderer {
     pub fn new(gl: &glow::Context) -> Result<Self, String> {
         unsafe {
-            let program = link(gl, VERT, FRAG)?;
-            let point_program = link(gl, POINT_VERT, FRAG)?;
+            let (program, covers_pixels) = match link_with_geom(gl, VERT, GEOM, FRAG) {
+                Ok(program) => (program, true),
+                Err(_) => (link(gl, VERT, FRAG_DIRECT)?, false),
+            };
             let line_program = link(gl, LINE_VERT, LINE_FRAG)?;
             let line_vao = gl.create_vertex_array().map_err(|e| e.to_string())?;
             let line_vbo = gl.create_buffer().map_err(|e| e.to_string())?;
             Ok(Self {
                 program,
-                point_program,
                 line_program,
                 batches: Vec::new(),
                 line_vao,
                 line_vbo,
                 line_verts: 0,
                 generation: 0,
+                covers_pixels,
             })
         }
     }
@@ -432,7 +519,7 @@ impl Renderer {
         self.line_verts = (draw.lines.len() / 6) as i32;
     }
 
-    pub fn paint(&self, gl: &glow::Context, camera: &Camera, aspect: f32) {
+    pub fn paint(&self, gl: &glow::Context, camera: &Camera, aspect: f32, width: f32, height: f32) {
         unsafe {
             let vp = camera.view_proj(aspect);
             gl.disable(glow::CULL_FACE);
@@ -444,27 +531,11 @@ impl Renderer {
             gl.front_face(glow::CCW);
             gl.clear_color(0.11, 0.12, 0.14, 1.0);
             gl.clear(glow::COLOR_BUFFER_BIT | glow::DEPTH_BUFFER_BIT);
-            // Points first, then triangles. A face smaller than a pixel never
-            // covers a pixel center, which is the holey sculpt. A 3px point on
-            // each corner fills that gap; the triangles replace the points
-            // wherever they actually cover.
-            gl.enable(glow::PROGRAM_POINT_SIZE);
-            gl.use_program(Some(self.point_program));
-            let loc = gl.get_uniform_location(self.point_program, "u_mvp");
-            gl.uniform_matrix_4_f32_slice(loc.as_ref(), false, vp.as_ref());
-            let point = gl.get_uniform_location(self.point_program, "u_point");
-            gl.uniform_1_f32(point.as_ref(), 3.0);
-            let light = gl.get_uniform_location(self.point_program, "u_light");
-            gl.uniform_3_f32(light.as_ref(), 0.35, -0.25, 0.90);
-            let fill = gl.get_uniform_location(self.point_program, "u_fill");
-            gl.uniform_3_f32(fill.as_ref(), -0.4, 0.6, 0.2);
-            for batch in &self.batches {
-                gl.bind_vertex_array(Some(batch.vao));
-                gl.draw_arrays(glow::POINTS, 0, batch.count);
-            }
             gl.use_program(Some(self.program));
             let loc = gl.get_uniform_location(self.program, "u_mvp");
             gl.uniform_matrix_4_f32_slice(loc.as_ref(), false, vp.as_ref());
+            let view_px = gl.get_uniform_location(self.program, "u_viewport");
+            gl.uniform_2_f32(view_px.as_ref(), width.max(1.0), height.max(1.0));
             let light = gl.get_uniform_location(self.program, "u_light");
             gl.uniform_3_f32(light.as_ref(), 0.35, -0.25, 0.90);
             let fill = gl.get_uniform_location(self.program, "u_fill");
@@ -487,7 +558,6 @@ impl Renderer {
     pub fn destroy(&self, gl: &glow::Context) {
         unsafe {
             gl.delete_program(self.program);
-            gl.delete_program(self.point_program);
             gl.delete_program(self.line_program);
             for batch in &self.batches {
                 gl.delete_vertex_array(batch.vao);
@@ -522,10 +592,33 @@ unsafe fn upload_attrib(
 }
 
 fn link(gl: &glow::Context, vert: &str, frag: &str) -> Result<glow::Program, String> {
+    link_stages(
+        gl,
+        &[(glow::VERTEX_SHADER, vert), (glow::FRAGMENT_SHADER, frag)],
+    )
+}
+
+fn link_with_geom(
+    gl: &glow::Context,
+    vert: &str,
+    geom: &str,
+    frag: &str,
+) -> Result<glow::Program, String> {
+    link_stages(
+        gl,
+        &[
+            (glow::VERTEX_SHADER, vert),
+            (glow::GEOMETRY_SHADER, geom),
+            (glow::FRAGMENT_SHADER, frag),
+        ],
+    )
+}
+
+fn link_stages(gl: &glow::Context, stages: &[(u32, &str)]) -> Result<glow::Program, String> {
     unsafe {
         let program = gl.create_program().map_err(|e| e.to_string())?;
         let header = "#version 330\n";
-        for (kind, src) in [(glow::VERTEX_SHADER, vert), (glow::FRAGMENT_SHADER, frag)] {
+        for &(kind, src) in stages {
             let shader = gl.create_shader(kind).map_err(|e| e.to_string())?;
             gl.shader_source(shader, &format!("{header}{src}"));
             gl.compile_shader(shader);

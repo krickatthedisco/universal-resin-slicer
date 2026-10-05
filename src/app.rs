@@ -109,10 +109,21 @@ impl AmberApp {
         doc.raft = raft;
         doc.platform_only = platform_only;
         let plate = Vec3::new(machine.size_x, machine.size_y, machine.size_z);
-        let renderer = cc.gl.as_ref().and_then(|gl| {
-            Renderer::new(gl.as_ref())
-                .map(|r| Arc::new(Mutex::new(r)))
-                .ok()
+        let mut gpu_note = None;
+        let renderer = cc.gl.as_ref().and_then(|gl| match Renderer::new(gl.as_ref()) {
+            Ok(renderer) => {
+                if !renderer.covers_pixels {
+                    gpu_note = Some(
+                        "This GPU would not grow tiny faces, so a dense sculpt can still look speckled."
+                            .to_string(),
+                    );
+                }
+                Some(Arc::new(Mutex::new(renderer)))
+            }
+            Err(err) => {
+                gpu_note = Some(format!("OpenGL plate view failed to start: {err}"));
+                None
+            }
         });
         Self {
             machine,
@@ -124,7 +135,9 @@ impl AmberApp {
             renderer,
             draw: None,
             draw_gen: 0,
-            status: "Photon M3 Max · drop an STL or OBJ, or add the overhang bridge.".into(),
+            status: gpu_note.unwrap_or_else(|| {
+                "Photon M3 Max · drop an STL or OBJ, or add the overhang bridge.".into()
+            }),
             job: None,
             slice: None,
             slice_gen: 0,
@@ -180,7 +193,7 @@ impl AmberApp {
                 }
                 self.slice = Some(slice);
                 self.slice_gen = generation;
-                self.preview_index = 0;
+                self.preview_index = layers.saturating_sub(1);
                 self.preview_for = None;
                 self.view = View::Preview;
                 if export_after {
@@ -1347,7 +1360,13 @@ impl AmberApp {
                 if let Some(draw) = &draw {
                     gpu.sync(gl, draw, generation);
                 }
-                gpu.paint(gl, &camera, aspect);
+                gpu.paint(
+                    gl,
+                    &camera,
+                    aspect,
+                    vp.width_px.max(1) as f32,
+                    vp.height_px.max(1) as f32,
+                );
             })),
         };
         ui.painter().add(callback);
