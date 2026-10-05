@@ -4,6 +4,16 @@ Amber is a desktop resin slicer for the **Anycubic Photon M3 Max**. It opens STL
 
 The window is a native app (Rust, egui, OpenGL). The same program builds on Windows and on Linux. It is not a web app.
 
+## Run the Windows app
+
+`amber.exe` in this folder is a 64-bit Windows program. Copy it to your PC and double-click it. It does not need Rust or an installer. Windows may warn that the file is unrecognized; that is the usual prompt for an app that is not signed.
+
+From a terminal in the same folder you can also slice without opening the window:
+
+```text
+amber.exe slice model.stl -o model.pm3m --layer 0.05 --supports medium
+```
+
 Amber is not affiliated with Anycubic. Resin times below are Anycubic's published starting points, not a tuned profile for your bottle, temperature, or screen.
 
 ## First print on the M3 Max
