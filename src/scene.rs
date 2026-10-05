@@ -339,6 +339,76 @@ impl Document {
         self.drop_object(id);
     }
 
+    pub fn repair(&mut self, id: u64) {
+        if let Some(obj) = self.object_mut(id) {
+            obj.mesh.repair();
+        }
+        self.touch();
+    }
+
+    pub fn auto_orient_all(&mut self) {
+        let ids: Vec<u64> = self.objects.iter().map(|o| o.id).collect();
+        for id in ids {
+            self.auto_orient(id);
+        }
+    }
+
+    /// Tile copies of one model across the plate. Returns how many new copies were added.
+    pub fn fill_bed(
+        &mut self,
+        id: u64,
+        plate_x: f32,
+        plate_y: f32,
+    ) -> std::result::Result<usize, &'static str> {
+        let Some((min, max)) = self.object(id).and_then(Self::world_bounds) else {
+            return Err("That model has no triangles.");
+        };
+        let gap = 3.0f32;
+        let w = (max.x - min.x).max(0.1);
+        let d = (max.y - min.y).max(0.1);
+        if w + gap > plate_x || d + gap > plate_y {
+            return Err(
+                "That model is larger than the plate, so it cannot be copied across the bed.",
+            );
+        }
+        let cols = ((plate_x - gap) / (w + gap)).floor().max(1.0) as i32;
+        let rows = ((plate_y - gap) / (d + gap)).floor().max(1.0) as i32;
+        let total = (cols * rows) as usize;
+        if total <= 1 {
+            return Err("Only one copy fits. Scale it down or use Layout if several models are already on the plate.");
+        }
+        let Some(origin) = self.object(id).cloned() else {
+            return Err("That model is gone.");
+        };
+        self.push_xform_undo(id);
+        let dx0 = gap - min.x;
+        let dy0 = gap - min.y;
+        if let Some(obj) = self.object_mut(id) {
+            obj.position.x += dx0;
+            obj.position.y += dy0;
+        }
+        let mut added = 0usize;
+        for row in 0..rows {
+            for col in 0..cols {
+                if row == 0 && col == 0 {
+                    continue;
+                }
+                let new_id = self.alloc();
+                let mut copy = origin.clone();
+                copy.id = new_id;
+                copy.name = format!("{} {}", origin.name, added + 2);
+                copy.position.x += dx0 + col as f32 * (w + gap);
+                copy.position.y += dy0 + row as f32 * (d + gap);
+                self.objects.push(copy);
+                self.undo.push(Undo::Added(new_id));
+                added += 1;
+            }
+        }
+        self.selection = Selection::Object(id);
+        self.touch();
+        Ok(added)
+    }
+
     pub fn auto_orient(&mut self, id: u64) {
         self.push_xform_undo(id);
         let Some(obj) = self.object(id) else {
@@ -718,4 +788,19 @@ fn ray_triangle(origin: Vec3, dir: Vec3, a: Vec3, b: Vec3, c: Vec3) -> Option<(f
     let n = ab.cross(ac).normalize();
     let n = if n.dot(dir) > 0.0 { -n } else { n };
     Some((t, origin + dir * t, n))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mesh::box_mesh;
+
+    #[test]
+    fn fill_bed_tiles_a_small_cube() {
+        let mut doc = Document::new();
+        let id = doc.add_mesh("cube".into(), box_mesh([0.0, 0.0, 0.0], [20.0, 20.0, 20.0]));
+        let added = doc.fill_bed(id, 100.0, 50.0).unwrap();
+        assert_eq!(added, 7);
+        assert_eq!(doc.objects.len(), 8);
+    }
 }

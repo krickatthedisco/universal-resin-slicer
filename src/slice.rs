@@ -452,19 +452,31 @@ fn fill_segments(segs: &[([f32; 2], [f32; 2])], machine: Machine, aa: u8) -> Ima
             continue;
         }
         hits.sort_by(|p, q| p.0.total_cmp(&q.0));
-        let mut winding = 0i32;
-        let mut start: Option<f32> = None;
-        for (x, dir) in hits {
-            let was = winding != 0;
-            winding += dir;
-            let now = winding != 0;
-            if !was && now {
-                start = Some(x);
-            } else if was && !now {
-                if let Some(s) = start.take() {
-                    paint_span(&mut pixels, width, x0, row, s, x, aa);
+        // Even-odd across unique crossings. A sculpted STL often has flipped
+        // or doubled faces; non-zero winding turns those into empty stripes.
+        // Each model is filled on its own and then unioned, so two objects
+        // that overlap still print as one solid.
+        let mut crossings: Vec<f32> = Vec::with_capacity(hits.len());
+        for (x, _) in hits {
+            if let Some(prev) = crossings.last_mut() {
+                if (x - *prev).abs() < 0.35 {
+                    continue;
                 }
             }
+            crossings.push(x);
+        }
+        let mut i = 0;
+        while i + 1 < crossings.len() {
+            paint_span(
+                &mut pixels,
+                width,
+                x0,
+                row,
+                crossings[i],
+                crossings[i + 1],
+                aa,
+            );
+            i += 2;
         }
     }
     Image {
@@ -1074,6 +1086,96 @@ mod tests {
             pixels.iter().filter(|p| **p > 0).count(),
             mid.nonzero as usize
         );
+    }
+
+    #[test]
+    fn flipped_triangles_still_fill_the_cube() {
+        let mut mesh = box_mesh([10.0, 20.0, 0.0], [20.0, 30.0, 10.0]);
+        for tri in mesh.indices.chunks_exact_mut(6) {
+            tri.swap(1, 2);
+        }
+        let solid = Solid {
+            vertices: mesh.vertices,
+            indices: mesh.indices,
+            hollow: None,
+        };
+        let mut settings = PrintSettings::default();
+        settings.layer_mm = 0.5;
+        settings.anti_alias = 1;
+        let slice = slice(Request {
+            solids: &[solid],
+            drains: &[],
+            machine: machine_no_flip(),
+            settings: &settings,
+            cancel: None,
+            progress: None,
+        })
+        .unwrap();
+        let expected = (10.0_f32 / 0.046) * (10.0 / 0.046);
+        let got = slice.layers[4].nonzero as f32;
+        assert!(
+            (got - expected).abs() / expected < 0.06,
+            "flipped nonzero {got} expected ~{expected}"
+        );
+    }
+
+    #[test]
+    fn sphere_mid_layer_is_a_disk() {
+        let mut vertices = Vec::new();
+        let mut indices = Vec::new();
+        let stacks = 12i32;
+        let slices = 18i32;
+        let radius = 8.0f32;
+        let cx = 30.0f32;
+        let cy = 30.0f32;
+        let cz = 8.0f32;
+        for stack in 0..=stacks {
+            let v = stack as f32 / stacks as f32;
+            let phi = std::f32::consts::PI * v;
+            for slice_i in 0..=slices {
+                let u = slice_i as f32 / slices as f32;
+                let theta = std::f32::consts::TAU * u;
+                vertices.push([
+                    cx + radius * phi.sin() * theta.cos(),
+                    cy + radius * phi.sin() * theta.sin(),
+                    cz + radius * phi.cos(),
+                ]);
+            }
+        }
+        let row = slices + 1;
+        for stack in 0..stacks {
+            for slice_i in 0..slices {
+                let a = stack * row + slice_i;
+                let b = a + row;
+                indices.extend_from_slice(&[a as u32, b as u32, (a + 1) as u32]);
+                indices.extend_from_slice(&[b as u32, (b + 1) as u32, (a + 1) as u32]);
+            }
+        }
+        let solid = Solid {
+            vertices,
+            indices,
+            hollow: None,
+        };
+        let mut settings = PrintSettings::default();
+        settings.layer_mm = 0.05;
+        settings.anti_alias = 1;
+        let slice = slice(Request {
+            solids: &[solid],
+            drains: &[],
+            machine: machine_no_flip(),
+            settings: &settings,
+            cancel: None,
+            progress: None,
+        })
+        .unwrap();
+        let got = slice.layers.iter().map(|l| l.nonzero).max().unwrap_or(0) as f32;
+        let expected = std::f32::consts::PI * (radius / 0.046) * (radius / 0.046);
+        assert!(
+            (got - expected).abs() / expected < 0.08,
+            "sphere {got} expected ~{expected}"
+        );
+        let islands: usize = slice.layers.iter().map(|l| l.islands.len()).sum();
+        assert!(islands < 5, "sphere broke into {islands} islands");
     }
 
     #[test]

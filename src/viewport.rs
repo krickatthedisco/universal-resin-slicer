@@ -1,6 +1,6 @@
 //! Orbit camera and the OpenGL plate view.
 
-use crate::mesh::{smooth_normals, Mesh};
+use crate::mesh::Mesh;
 use crate::scene::{Document, Selection};
 use crate::supports;
 use glam::{Mat4, Vec3};
@@ -127,31 +127,21 @@ pub fn build_draw(doc: &Document, plate: Vec3, selection: Selection) -> DrawList
 
 fn push_object(tris: &mut Vec<f32>, obj: &crate::scene::Object, color: [f32; 3]) {
     let mat = Document::matrix(obj);
-    let normal_mat = mat.inverse().transpose();
-    let normals = smooth_normals(&obj.mesh);
-    let mut world = Mesh {
-        vertices: Vec::with_capacity(obj.mesh.vertices.len()),
-        indices: obj.mesh.indices.clone(),
-    };
-    for (p, n) in obj.mesh.vertices.iter().zip(normals.iter()) {
-        let wp = mat.transform_point3(Vec3::from_array(*p));
-        let wn = normal_mat
-            .transform_vector3(Vec3::from_array(*n))
-            .normalize_or_zero();
-        world.vertices.push(wp.to_array());
-        push_vert(tris, wp.to_array(), wn.to_array(), color);
-    }
-    // Indices are not used: vertices were expanded per index above? No, I pushed
-    // one vert per mesh vertex, but the index buffer is separate. The GPU draw
-    // uses a non-indexed expanded list. Rebuild expanded.
-    tris.truncate(tris.len() - world.vertices.len() * 9);
+    // Flat face normals. Smooth normals on an unwelded or inside-out STL
+    // average to nothing and the faces disappear into the dark background.
     for tri in obj.mesh.indices.chunks_exact(3) {
-        for &id in tri {
-            let p = world.vertices[id as usize];
-            let n = normal_mat
-                .transform_vector3(Vec3::from_array(normals[id as usize]))
-                .normalize_or_zero();
-            push_vert(tris, p, n.to_array(), color);
+        let world = [
+            mat.transform_point3(Vec3::from_array(obj.mesh.vertices[tri[0] as usize])),
+            mat.transform_point3(Vec3::from_array(obj.mesh.vertices[tri[1] as usize])),
+            mat.transform_point3(Vec3::from_array(obj.mesh.vertices[tri[2] as usize])),
+        ];
+        let n = crate::mesh::face_normal(
+            world[0].to_array(),
+            world[1].to_array(),
+            world[2].to_array(),
+        );
+        for p in world {
+            push_vert(tris, p.to_array(), n, color);
         }
     }
 }
@@ -283,7 +273,7 @@ void main() {
     if (!gl_FrontFacing) { n = -n; }
     float ndl = clamp(dot(n, normalize(u_light)), 0.0, 1.0);
     float fill = clamp(dot(n, normalize(u_fill)), 0.0, 1.0);
-    float shade = 0.28 + 0.62 * ndl + 0.22 * fill;
+    float shade = 0.46 + 0.48 * ndl + 0.16 * fill;
     out_color = vec4(v_col * shade, 1.0);
 }
 "#;

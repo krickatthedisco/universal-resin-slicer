@@ -39,7 +39,7 @@ Amber is not affiliated with Anycubic. Resin times below are Anycubic's publishe
 
 - Import STL (binary or ASCII) and OBJ. Drop files on the plate.
 - Several models, with move, rotate, scale, mirror, duplicate, delete, and undo.
-- Drop to the bed, center, put the largest face down, auto-orient, and shelf-pack the plate. Models that hang off the plate are marked.
+- Drop to the bed, center, put the largest face down, auto-orient one model or all of them, shelf-pack the plate, and fill the bed with copies. Repair flips an inside-out shell and welds duplicate corners. Models that hang off the plate are marked.
 - Hollow at slice time: wall thickness, top and bottom caps, and a lattice. Drain holes are cylinders you click onto the surface.
 - Automatic supports (Light 35°, Medium 45°, Heavy 55° from vertical), a raft, braces, click-to-place supports, and supports on detected islands.
 - Layer preview with islands tinted, and a warning when a layer seals a cavity (suction).

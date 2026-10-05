@@ -31,7 +31,7 @@ impl Mesh {
         Some((min, max))
     }
 
-    pub fn volume_mm3(&self) -> f32 {
+    pub fn signed_volume_mm3(&self) -> f32 {
         let mut acc = 0.0f32;
         for tri in self.indices.chunks_exact(3) {
             let a = self.vertices[tri[0] as usize];
@@ -40,7 +40,19 @@ impl Mesh {
             acc += a[0] * (b[1] * c[2] - b[2] * c[1]) - a[1] * (b[0] * c[2] - b[2] * c[0])
                 + a[2] * (b[0] * c[1] - b[1] * c[0]);
         }
-        (acc / 6.0).abs()
+        acc / 6.0
+    }
+
+    pub fn volume_mm3(&self) -> f32 {
+        self.signed_volume_mm3().abs()
+    }
+
+    /// Flip the whole shell if it is inside out, then weld duplicate corners.
+    pub fn repair(&mut self) {
+        if self.signed_volume_mm3() < 0.0 {
+            self.flip_winding();
+        }
+        self.weld(1e-4);
     }
 
     pub fn flip_winding(&mut self) {

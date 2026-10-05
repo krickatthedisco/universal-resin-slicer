@@ -394,13 +394,13 @@ impl eframe::App for AmberApp {
 
         egui::Panel::top("menu").show(ui, |ui| self.menu(ui));
         egui::Panel::bottom("status").show(ui, |ui| self.status_bar(ui));
-        egui::Panel::left("scene")
-            .resizable(true)
-            .default_size(240.0)
-            .show(ui, |ui| self.scene_panel(ui));
+        egui::Panel::left("tools")
+            .resizable(false)
+            .exact_size(76.0)
+            .show(ui, |ui| self.tool_rail(ui));
         egui::Panel::right("props")
             .resizable(true)
-            .default_size(320.0)
+            .default_size(332.0)
             .show(ui, |ui| self.props_panel(ui));
         egui::CentralPanel::default().show(ui, |ui| self.center(ui));
     }
@@ -460,9 +460,71 @@ impl AmberApp {
                 }
             });
             ui.separator();
-            ui.heading("Amber");
-            ui.label("Photon M3 Max");
+            if ui
+                .selectable_label(self.view == View::Prepare, "Prepare")
+                .clicked()
+            {
+                self.view = View::Prepare;
+            }
+            if ui
+                .selectable_label(self.view == View::Preview, "Preview")
+                .clicked()
+            {
+                self.view = View::Preview;
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let slicing = self.job.is_some();
+                if ui
+                    .add_enabled(!slicing, egui::Button::new("Export"))
+                    .clicked()
+                {
+                    self.export_pm3m();
+                }
+                let slice = egui::Button::new("Slice").fill(egui::Color32::from_rgb(214, 122, 36));
+                if ui.add_enabled(!slicing, slice).clicked() {
+                    self.start_slice(false);
+                }
+            });
         });
+    }
+
+    fn tool_rail(&mut self, ui: &mut egui::Ui) {
+        ui.spacing_mut().button_padding = egui::vec2(4.0, 8.0);
+        for (tool, label, tip) in [
+            (
+                Tool::Orbit,
+                "View",
+                "Orbit the plate. Right-drag also orbits. Shift-drag pans.",
+            ),
+            (
+                Tool::Move,
+                "Move",
+                "Drag a model on the plate. Hold Shift to lift it.",
+            ),
+            (Tool::Rotate, "Rotate", "Drag to turn the selected model."),
+            (Tool::Scale, "Scale", "Drag to scale the selected model."),
+            (
+                Tool::Support,
+                "Support",
+                "Click an underside to drop a support.",
+            ),
+            (
+                Tool::Drain,
+                "Hole",
+                "Click the outside of a hollow to punch a drain.",
+            ),
+        ] {
+            let on = self.tool == tool;
+            let button = egui::Button::new(label).min_size(egui::vec2(64.0, 36.0));
+            let response = ui.add(if on {
+                button.fill(egui::Color32::from_rgb(92, 64, 24))
+            } else {
+                button
+            });
+            if response.on_hover_text(tip).clicked() {
+                self.tool = tool;
+            }
+        }
     }
 
     fn status_bar(&self, ui: &mut egui::Ui) {
@@ -487,12 +549,11 @@ impl AmberApp {
         });
     }
 
-    fn scene_panel(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Plate");
-        ui.label("298.08 × 165.6 × 300 mm · 6480 × 3600 · 46 µm");
-        ui.add_space(6.0);
+    fn model_list(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Models");
+        ui.label("Photon M3 Max  ·  298 × 166 × 300 mm");
         if self.doc.objects.is_empty() {
-            ui.label("No models yet.");
+            ui.label("Open an STL or OBJ, or drop it on the plate.");
         }
         let mut select = None;
         for obj in &self.doc.objects {
@@ -505,34 +566,16 @@ impl AmberApp {
             self.doc.selection = sel;
             self.doc.touch();
         }
-        ui.add_space(8.0);
-        ui.label(format!("Supports {}", self.doc.supports.len()));
-        let mut select_support = None;
-        for support in &self.doc.supports {
-            let label = format!("#{:.0} mm", support.z_top);
-            let selected = self.doc.selection == Selection::Support(support.id);
-            if ui.selectable_label(selected, label).clicked() {
-                select_support = Some(Selection::Support(support.id));
-            }
-        }
-        if let Some(sel) = select_support {
-            self.doc.selection = sel;
-            self.doc.touch();
-        }
-        ui.add_space(8.0);
-        if ui.button("Auto layout").clicked() {
-            self.doc
-                .auto_layout(self.machine.size_x, self.machine.size_y);
-            self.invalidate_slice();
-        }
-        if ui.button("Clear supports").clicked() {
-            self.doc.clear_supports();
-            self.invalidate_slice();
+        if !self.doc.supports.is_empty() {
+            ui.add_space(4.0);
+            ui.label(format!("Supports {}", self.doc.supports.len()));
         }
     }
 
     fn props_panel(&mut self, ui: &mut egui::Ui) {
         egui::ScrollArea::vertical().show(ui, |ui| {
+            self.model_list(ui);
+            ui.separator();
             self.transform_ui(ui);
             ui.separator();
             self.hollow_ui(ui);
@@ -580,7 +623,6 @@ impl AmberApp {
             self.doc.touch();
             self.invalidate_slice();
         }
-        ui.add_space(4.0);
         ui.horizontal_wrapped(|ui| {
             if ui.button("Drop to bed").clicked() {
                 self.doc.push_xform_undo(id);
@@ -591,14 +633,6 @@ impl AmberApp {
                 self.doc.push_xform_undo(id);
                 self.doc
                     .center_on_plate(id, self.machine.size_x, self.machine.size_y);
-                self.invalidate_slice();
-            }
-            if ui.button("Largest face down").clicked() {
-                self.doc.place_on_largest_face(id);
-                self.invalidate_slice();
-            }
-            if ui.button("Auto orient").clicked() {
-                self.doc.auto_orient(id);
                 self.invalidate_slice();
             }
             if ui.button("Flip normals").clicked() {
@@ -615,9 +649,57 @@ impl AmberApp {
             }
         });
         if let Some(obj) = self.doc.object(id) {
+            if let Some((min, max)) = crate::scene::Document::world_bounds(obj) {
+                ui.label(format!(
+                    "Size {:.1} × {:.1} × {:.1} mm",
+                    max.x - min.x,
+                    max.y - min.y,
+                    max.z - min.z
+                ));
+            }
             let ml = crate::scene::Document::world_mesh(obj).volume_mm3() / 1000.0;
-            ui.label(format!("Mesh volume {ml:.2} ml, before hollowing"));
+            ui.label(format!("Volume {ml:.2} ml before hollowing"));
         }
+        ui.add_space(6.0);
+        ui.label("Arrange");
+        ui.horizontal_wrapped(|ui| {
+            if ui.button("Auto orient").clicked() {
+                self.doc.auto_orient(id);
+                self.invalidate_slice();
+                self.status = "Oriented to cut overhangs, then dropped to the bed.".into();
+            }
+            if ui.button("Orient all").clicked() {
+                self.doc.auto_orient_all();
+                self.invalidate_slice();
+            }
+            if ui.button("Largest face down").clicked() {
+                self.doc.place_on_largest_face(id);
+                self.invalidate_slice();
+            }
+            if ui.button("Layout all").clicked() {
+                self.doc
+                    .auto_layout(self.machine.size_x, self.machine.size_y);
+                self.invalidate_slice();
+            }
+            if ui.button("Fill bed").clicked() {
+                match self
+                    .doc
+                    .fill_bed(id, self.machine.size_x, self.machine.size_y)
+                {
+                    Ok(n) => {
+                        self.invalidate_slice();
+                        self.status = format!("Placed {n} copies. The bed holds {} in all.", n + 1);
+                    }
+                    Err(err) => self.status = err.into(),
+                }
+            }
+            if ui.button("Repair").clicked() {
+                self.doc.repair(id);
+                self.invalidate_slice();
+                self.status =
+                    "Welded duplicate corners and flipped the shell if it was inside out.".into();
+            }
+        });
     }
 
     fn hollow_ui(&mut self, ui: &mut egui::Ui) {
@@ -701,6 +783,10 @@ impl AmberApp {
         }
         if ui.button("Auto support everything").clicked() {
             self.doc.add_auto_supports(false);
+            self.invalidate_slice();
+        }
+        if ui.button("Clear supports").clicked() {
+            self.doc.clear_supports();
             self.invalidate_slice();
         }
         let mut raft = self.doc.raft;
@@ -860,34 +946,6 @@ impl AmberApp {
     }
 
     fn center(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            for (tool, label) in [
-                (Tool::Orbit, "Orbit"),
-                (Tool::Move, "Move"),
-                (Tool::Rotate, "Rotate"),
-                (Tool::Scale, "Scale"),
-                (Tool::Support, "Support"),
-                (Tool::Drain, "Drain"),
-            ] {
-                if ui.selectable_label(self.tool == tool, label).clicked() {
-                    self.tool = tool;
-                }
-            }
-            ui.separator();
-            if ui
-                .selectable_label(self.view == View::Prepare, "Prepare")
-                .clicked()
-            {
-                self.view = View::Prepare;
-            }
-            if ui
-                .selectable_label(self.view == View::Preview, "Preview")
-                .clicked()
-            {
-                self.view = View::Preview;
-            }
-        });
-        ui.add_space(4.0);
         if self.view == View::Preview {
             self.preview(ui);
         } else {
