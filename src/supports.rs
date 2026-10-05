@@ -1416,8 +1416,7 @@ mod tests {
             let c0 = cross(points[0], points[1], [x, y]);
             let c1 = cross(points[1], points[2], [x, y]);
             let c2 = cross(points[2], points[0], [x, y]);
-            (c0 >= -1e-3 && c1 >= -1e-3 && c2 >= -1e-3)
-                || (c0 <= 1e-3 && c1 <= 1e-3 && c2 <= 1e-3)
+            (c0 >= -1e-3 && c1 >= -1e-3 && c2 >= -1e-3) || (c0 <= 1e-3 && c1 <= 1e-3 && c2 <= 1e-3)
         })
     }
 

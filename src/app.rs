@@ -162,6 +162,8 @@ pub struct AmberApp {
     measure_b: Option<Vec3>,
     measure_gen: u64,
     measure_drawn: u64,
+    /// Round a dragged move to whole millimetres.
+    snap_mm: bool,
 }
 
 impl AmberApp {
@@ -280,6 +282,7 @@ impl AmberApp {
             measure_b: None,
             measure_gen: 0,
             measure_drawn: 0,
+            snap_mm: false,
         }
     }
 
@@ -534,8 +537,12 @@ impl AmberApp {
         let slice_now = ctx.input(|i| i.key_pressed(egui::Key::Enter) && i.modifiers.command);
         let save = ctx.input(|i| i.key_pressed(egui::Key::S) && i.modifiers.command);
         let help = ctx.input(|i| i.key_pressed(egui::Key::F1));
+        let fit = ctx.input(|i| i.key_pressed(egui::Key::F));
         if help {
             self.help_open = true;
+        }
+        if fit {
+            self.fit_view();
         }
         if open {
             self.open_dialog();
@@ -558,6 +565,38 @@ impl AmberApp {
             if duplicate {
                 self.doc.duplicate(id);
                 self.invalidate_slice();
+            }
+        }
+        if self.view == View::Prepare {
+            let step = if ctx.input(|i| i.modifiers.shift) {
+                0.1
+            } else {
+                1.0
+            };
+            let dx = if ctx.input(|i| i.key_pressed(egui::Key::ArrowLeft)) {
+                -step
+            } else if ctx.input(|i| i.key_pressed(egui::Key::ArrowRight)) {
+                step
+            } else {
+                0.0
+            };
+            let dy = if ctx.input(|i| i.key_pressed(egui::Key::ArrowDown)) {
+                -step
+            } else if ctx.input(|i| i.key_pressed(egui::Key::ArrowUp)) {
+                step
+            } else {
+                0.0
+            };
+            if dx != 0.0 || dy != 0.0 {
+                if let Selection::Object(id) = self.doc.selection {
+                    self.doc.push_xform_undo(id);
+                    if let Some(obj) = self.doc.object_mut(id) {
+                        obj.position.x += dx;
+                        obj.position.y += dy;
+                    }
+                    self.doc.touch_xform();
+                    self.invalidate_slice();
+                }
             }
         }
         if self.view == View::Preview {
@@ -739,6 +778,10 @@ impl AmberApp {
                 if ui.button("Right").clicked() {
                     self.camera.pitch = 8.0;
                     self.camera.yaw = 90.0;
+                    ui.close();
+                }
+                if ui.button("Fit to selection").clicked() {
+                    self.fit_view();
                     ui.close();
                 }
             });
@@ -1368,6 +1411,31 @@ impl AmberApp {
     fn select_ui(&mut self, ui: &mut egui::Ui) {
         ui.heading("Select");
         ui.label("Left-drag moves the selected model in X and Y. Right-drag orbits, and can swing under the bed. Right-click the model for hollow, holes, supports, and the rest.");
+        ui.checkbox(&mut self.snap_mm, "Snap moves to 1 mm");
+        if let Selection::Support(id) = self.doc.selection {
+            if let Some(support) = self.doc.supports.iter().find(|s| s.id == id).copied() {
+                ui.label(format!(
+                    "Tip at {:.1}, {:.1} mm, {:.1} mm up. Foot at {:.1} mm.",
+                    support.x, support.y, support.z_top, support.z_base
+                ));
+                if ui.button("Delete this support").clicked() {
+                    self.doc.delete_selection();
+                    self.invalidate_slice();
+                }
+            }
+            return;
+        }
+        if let Selection::Drain(id) = self.doc.selection {
+            if let Some(drain) = self.doc.drains.iter().find(|d| d.id == id).copied() {
+                ui.label(format!(
+                    "Hole {:.1} mm across, {:.1} mm deep.",
+                    drain.radius_mm * 2.0,
+                    drain.depth_mm
+                ));
+                ui.label("Switch to Hole to change the size. Delete removes it.");
+            }
+            return;
+        }
         let Selection::Object(id) = self.doc.selection else {
             ui.label("Click a model on the plate, or pick one in the list.");
             self.arrange_ui(ui);
@@ -1404,6 +1472,7 @@ impl AmberApp {
     fn move_ui(&mut self, ui: &mut egui::Ui) {
         ui.heading("Move");
         ui.label("Drag on the plate. Hold Shift and drag to lift.");
+        ui.checkbox(&mut self.snap_mm, "Snap moves to 1 mm");
         let Selection::Object(id) = self.doc.selection else {
             ui.label("Select a model first.");
             return;
@@ -1426,7 +1495,7 @@ impl AmberApp {
 
     fn rotate_ui(&mut self, ui: &mut egui::Ui) {
         ui.heading("Rotate");
-        ui.label("Drag to turn. Values are degrees.");
+        ui.label("Drag to turn. Values are degrees. Hold Ctrl while dragging to snap to 15°.");
         let Selection::Object(id) = self.doc.selection else {
             ui.label("Select a model first.");
             return;
@@ -1487,7 +1556,7 @@ impl AmberApp {
 
     fn scale_ui(&mut self, ui: &mut egui::Ui) {
         ui.heading("Scale");
-        ui.label("1.00 is the size in the file. Drag up to enlarge.");
+        ui.label("1.00 is the size in the file. Drag up to enlarge. A drag scales all three axes together. The numbers change one axis.");
         let Selection::Object(id) = self.doc.selection else {
             ui.label("Select a model first.");
             return;
@@ -2485,6 +2554,31 @@ impl AmberApp {
         }
     }
 
+    fn fit_view(&mut self) {
+        let bounds = if let Selection::Object(id) = self.doc.selection {
+            self.doc.object(id).and_then(Document::display_bounds)
+        } else {
+            let mut lo = Vec3::splat(f32::MAX);
+            let mut hi = Vec3::splat(f32::MIN);
+            let mut any = false;
+            for obj in &self.doc.objects {
+                if let Some((min, max)) = Document::display_bounds(obj) {
+                    lo = lo.min(min);
+                    hi = hi.max(max);
+                    any = true;
+                }
+            }
+            any.then_some((lo, hi))
+        };
+        let Some((min, max)) = bounds else {
+            self.camera = Camera::looking_at_plate(self.plate());
+            return;
+        };
+        let span = (max - min).max_element().max(8.0);
+        self.camera.target = (min + max) * 0.5;
+        self.camera.distance = (span * 2.4).clamp(30.0, 2500.0);
+    }
+
     fn drag_transform(&mut self, response: &egui::Response) {
         let Selection::Object(id) = self.doc.selection else {
             return;
@@ -2517,14 +2611,23 @@ impl AmberApp {
                         if let Some(obj) = self.doc.object_mut(id) {
                             obj.position.x += b.x - a.x;
                             obj.position.y += b.y - a.y;
+                            if self.snap_mm {
+                                obj.position.x = obj.position.x.round();
+                                obj.position.y = obj.position.y.round();
+                            }
                         }
                     }
                 }
             }
             Tool::Rotate => {
+                let snap = response.ctx.input(|i| i.modifiers.command);
                 if let Some(obj) = self.doc.object_mut(id) {
                     obj.rotation_deg.z += delta.x * 0.4;
                     obj.rotation_deg.x += delta.y * 0.4;
+                    if snap {
+                        obj.rotation_deg.x = (obj.rotation_deg.x / 15.0).round() * 15.0;
+                        obj.rotation_deg.z = (obj.rotation_deg.z / 15.0).round() * 15.0;
+                    }
                 }
             }
             Tool::Scale => {
@@ -2580,7 +2683,7 @@ impl AmberApp {
                 ui.separator();
                 ui.label("Ctrl+O open    Ctrl+Z undo    Ctrl+D duplicate    Delete remove");
                 ui.label("Ctrl+Enter slice    Ctrl+S save    F1 this page");
-                ui.label("In the layer view, the arrow keys step through layers.");
+                ui.label("On the plate, the arrow keys nudge the model by 1 mm (Shift is 0.1 mm). F fits the camera. In the layer view, the arrows step through layers.");
                 ui.separator();
                 ui.label(format!(
                     "Amber {}  ·  built for the Anycubic Photon M3 Max, and the other printers in the list.",
@@ -2848,7 +2951,13 @@ impl AmberApp {
         }
         self.preview_index = self.preview_index.min(count - 1);
         let clock = slice_clock(slice);
-        ui.label(egui::RichText::new(&clock).strong());
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new(&clock).strong());
+            if ui.button("Copy").clicked() {
+                ui.ctx().copy_text(clock.clone());
+                self.status = "Copied the print summary.".into();
+            }
+        });
         let (caption, seals) = {
             let layer = &slice.layers[self.preview_index];
             (

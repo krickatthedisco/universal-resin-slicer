@@ -22,8 +22,12 @@ pub fn start() -> anyhow::Result<()> {
     if args.first().map(String::as_str) == Some("slice") {
         return cli::run(&args[1..]);
     }
-    if args.first().map(String::as_str) == Some("--help") {
-        println!("Amber resin slicer\n  amber                 open the window\n  amber slice <mesh> -o <file.pm3m> [--printer anycubic-photon-m3-max]");
+    if args.first().map(String::as_str) == Some("--help")
+        || args.first().map(String::as_str) == Some("--version")
+    {
+        println!("Amber {VERSION}");
+        println!("  amber                 open the window");
+        println!("  amber slice <mesh> -o <file.pm3m> [--printer anycubic-photon-m3-max]");
         return Ok(());
     }
     app::run().map_err(|err| anyhow::anyhow!("{err}"))
