@@ -17,10 +17,12 @@ use std::sync::{Arc, Mutex};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tool {
-    Orbit,
+    Select,
     Move,
     Rotate,
     Scale,
+    Mirror,
+    Hollow,
     Support,
     Drain,
 }
@@ -48,6 +50,10 @@ struct Persist {
     mirror_y: bool,
     preset: usize,
     raft: bool,
+    #[serde(default)]
+    style: Option<crate::supports::SupportStyle>,
+    #[serde(default)]
+    platform_only: bool,
 }
 
 pub struct AmberApp {
@@ -69,6 +75,7 @@ pub struct AmberApp {
     preview_tex: Option<egui::TextureHandle>,
     gesture: bool,
     export_name: String,
+    keep_original: bool,
 }
 
 impl AmberApp {
@@ -78,6 +85,8 @@ impl AmberApp {
         let mut settings = PrintSettings::default();
         let mut preset = 1usize;
         let mut raft = true;
+        let mut saved_style = None;
+        let mut platform_only = false;
         if let Some(storage) = cc.storage {
             if let Some(raw) = storage.get_string("amber.print") {
                 if let Ok(saved) = serde_json::from_str::<Persist>(&raw) {
@@ -87,12 +96,18 @@ impl AmberApp {
                     machine.mirror_y = saved.mirror_y;
                     preset = saved.preset;
                     raft = saved.raft;
+                    saved_style = saved.style;
+                    platform_only = saved.platform_only;
                 }
             }
         }
         let mut doc = Document::new();
-        doc.preset = preset.min(PRESETS.len() - 1);
+        doc.set_preset(preset);
+        if let Some(style) = saved_style {
+            doc.style = style.sanitized();
+        }
         doc.raft = raft;
+        doc.platform_only = platform_only;
         let plate = Vec3::new(machine.size_x, machine.size_y, machine.size_z);
         let renderer = cc.gl.as_ref().and_then(|gl| {
             Renderer::new(gl.as_ref())
@@ -104,7 +119,7 @@ impl AmberApp {
             settings,
             doc,
             camera: Camera::looking_at_plate(plate),
-            tool: Tool::Orbit,
+            tool: Tool::Select,
             view: View::Prepare,
             renderer,
             draw: None,
@@ -118,6 +133,7 @@ impl AmberApp {
             preview_tex: None,
             gesture: false,
             export_name: "print.pm3m".into(),
+            keep_original: false,
         }
     }
 
@@ -347,6 +363,25 @@ impl AmberApp {
                 self.invalidate_slice();
             }
         }
+        if self.view == View::Preview {
+            if let Some(slice) = &self.slice {
+                let count = slice.layers.len();
+                if count > 0 {
+                    let up = ctx.input(|i| {
+                        i.key_pressed(egui::Key::ArrowUp) || i.key_pressed(egui::Key::ArrowRight)
+                    });
+                    let down = ctx.input(|i| {
+                        i.key_pressed(egui::Key::ArrowDown) || i.key_pressed(egui::Key::ArrowLeft)
+                    });
+                    if up {
+                        self.preview_index = (self.preview_index + 1).min(count - 1);
+                    }
+                    if down {
+                        self.preview_index = self.preview_index.saturating_sub(1);
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -359,6 +394,8 @@ impl eframe::App for AmberApp {
             mirror_y: self.machine.mirror_y,
             preset: self.doc.preset,
             raft: self.doc.raft,
+            style: Some(self.doc.style),
+            platform_only: self.doc.platform_only,
         };
         if let Ok(raw) = serde_json::to_string(&saved) {
             storage.set_string("amber.print", raw);
@@ -445,6 +482,42 @@ impl AmberApp {
                     ui.close();
                 }
             });
+            ui.menu_button("View", |ui| {
+                if ui.button("Home").clicked() {
+                    self.camera = Camera::looking_at_plate(self.plate());
+                    ui.close();
+                }
+                if ui.button("Top").clicked() {
+                    self.camera.pitch = 89.0;
+                    self.camera.yaw = 0.0;
+                    ui.close();
+                }
+                if ui.button("Front").clicked() {
+                    self.camera.pitch = 8.0;
+                    self.camera.yaw = 0.0;
+                    ui.close();
+                }
+                if ui.button("Right").clicked() {
+                    self.camera.pitch = 8.0;
+                    self.camera.yaw = 90.0;
+                    ui.close();
+                }
+            });
+            ui.menu_button("Setting", |ui| {
+                let mut changed = false;
+                changed |= ui
+                    .checkbox(&mut self.machine.rotate_180, "Rotate exposure 180°")
+                    .changed();
+                changed |= ui
+                    .checkbox(&mut self.machine.mirror_x, "Mirror X")
+                    .changed();
+                changed |= ui
+                    .checkbox(&mut self.machine.mirror_y, "Mirror Y")
+                    .changed();
+                if changed {
+                    self.invalidate_slice();
+                }
+            });
             ui.menu_button("Slice", |ui| {
                 if ui.button("Slice").clicked() {
                     self.start_slice(false);
@@ -480,7 +553,7 @@ impl AmberApp {
                 {
                     self.export_pm3m();
                 }
-                let slice = egui::Button::new("Slice").fill(egui::Color32::from_rgb(214, 122, 36));
+                let slice = egui::Button::new("Slice").fill(egui::Color32::from_rgb(224, 122, 47));
                 if ui.add_enabled(!slicing, slice).clicked() {
                     self.start_slice(false);
                 }
@@ -492,9 +565,9 @@ impl AmberApp {
         ui.spacing_mut().button_padding = egui::vec2(4.0, 8.0);
         for (tool, label, tip) in [
             (
-                Tool::Orbit,
-                "View",
-                "Orbit the plate. Right-drag also orbits. Shift-drag pans.",
+                Tool::Select,
+                "Select",
+                "Click a model. Right-drag orbits. Shift-drag or middle-drag pans.",
             ),
             (
                 Tool::Move,
@@ -504,20 +577,30 @@ impl AmberApp {
             (Tool::Rotate, "Rotate", "Drag to turn the selected model."),
             (Tool::Scale, "Scale", "Drag to scale the selected model."),
             (
-                Tool::Support,
-                "Support",
-                "Click an underside to drop a support.",
+                Tool::Mirror,
+                "Mirror",
+                "Mirror the selected model. Turn on Keep original to leave a copy.",
+            ),
+            (
+                Tool::Hollow,
+                "Hollow",
+                "Shell the selected model when it slices.",
             ),
             (
                 Tool::Drain,
                 "Hole",
                 "Click the outside of a hollow to punch a drain.",
             ),
+            (
+                Tool::Support,
+                "Support",
+                "Click an underside to plant a tree support.",
+            ),
         ] {
             let on = self.tool == tool;
-            let button = egui::Button::new(label).min_size(egui::vec2(64.0, 36.0));
+            let button = egui::Button::new(label).min_size(egui::vec2(64.0, 32.0));
             let response = ui.add(if on {
-                button.fill(egui::Color32::from_rgb(92, 64, 24))
+                button.fill(egui::Color32::from_rgb(176, 92, 32))
             } else {
                 button
             });
@@ -576,39 +659,43 @@ impl AmberApp {
         egui::ScrollArea::vertical().show(ui, |ui| {
             self.model_list(ui);
             ui.separator();
-            self.transform_ui(ui);
+            match self.tool {
+                Tool::Select => self.select_ui(ui),
+                Tool::Move => self.move_ui(ui),
+                Tool::Rotate => self.rotate_ui(ui),
+                Tool::Scale => self.scale_ui(ui),
+                Tool::Mirror => self.mirror_ui(ui),
+                Tool::Hollow => self.hollow_ui(ui),
+                Tool::Drain => self.drain_ui(ui),
+                Tool::Support => self.support_ui(ui),
+            }
             ui.separator();
-            self.hollow_ui(ui);
-            ui.separator();
-            self.support_ui(ui);
-            ui.separator();
-            self.slice_ui(ui);
+            ui.collapsing("Print settings", |ui| self.slice_ui(ui));
         });
     }
 
-    fn transform_ui(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Model");
-        let Selection::Object(id) = self.doc.selection else {
-            ui.label("Select a model on the plate or in the list.");
-            return;
-        };
+    fn edit_vec(
+        &mut self,
+        ui: &mut egui::Ui,
+        id: u64,
+        kind: &'static str,
+        speed: f32,
+        suffix: &str,
+    ) {
         let Some(obj) = self.doc.object(id) else {
             return;
         };
         let before_pos = obj.position;
         let before_rot = obj.rotation_deg;
         let before_scale = obj.scale;
-        let mut position = obj.position;
-        let mut rotation = obj.rotation_deg;
-        let mut scale = obj.scale;
+        let mut value = match kind {
+            "pos" => obj.position,
+            "rot" => obj.rotation_deg,
+            _ => obj.scale,
+        };
         let mut started = false;
         let mut changed = false;
-        ui.label("Position");
-        grid_drag(ui, &mut position, 0.1, "mm", &mut started, &mut changed);
-        ui.label("Rotation");
-        grid_drag(ui, &mut rotation, 0.5, "°", &mut started, &mut changed);
-        ui.label("Scale");
-        grid_drag(ui, &mut scale, 0.005, "", &mut started, &mut changed);
+        grid_drag(ui, &mut value, speed, suffix, &mut started, &mut changed);
         if started && !self.gesture {
             self.doc
                 .remember_xform(id, before_pos, before_rot, before_scale);
@@ -616,13 +703,29 @@ impl AmberApp {
         }
         if changed {
             if let Some(obj) = self.doc.object_mut(id) {
-                obj.position = position;
-                obj.rotation_deg = rotation;
-                obj.scale = Vec3::new(nonzero(scale.x), nonzero(scale.y), nonzero(scale.z));
+                match kind {
+                    "pos" => obj.position = value,
+                    "rot" => obj.rotation_deg = value,
+                    _ => {
+                        obj.scale = Vec3::new(nonzero(value.x), nonzero(value.y), nonzero(value.z))
+                    }
+                }
             }
             self.doc.touch();
             self.invalidate_slice();
         }
+    }
+
+    fn select_ui(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Select");
+        let Selection::Object(id) = self.doc.selection else {
+            ui.label("Click a model on the plate, or pick one in the list.");
+            self.arrange_ui(ui);
+            return;
+        };
+        self.size_label(ui, id);
+        ui.add_space(6.0);
+        self.arrange_ui(ui);
         ui.horizontal_wrapped(|ui| {
             if ui.button("Drop to bed").clicked() {
                 self.doc.push_xform_undo(id);
@@ -639,15 +742,123 @@ impl AmberApp {
                 self.doc.flip_normals(id);
                 self.invalidate_slice();
             }
-            if ui.button("Mirror X").clicked() {
-                self.doc.mirror(id, 0);
+            if ui.button("Repair").clicked() {
+                self.doc.repair(id);
+                self.invalidate_slice();
+                self.status =
+                    "Welded duplicate corners and flipped the shell if it was inside out.".into();
+            }
+        });
+    }
+
+    fn move_ui(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Move");
+        ui.label("Drag on the plate. Hold Shift and drag to lift.");
+        let Selection::Object(id) = self.doc.selection else {
+            ui.label("Select a model first.");
+            return;
+        };
+        self.edit_vec(ui, id, "pos", 0.1, "mm");
+        ui.horizontal(|ui| {
+            if ui.button("Put on plate").clicked() {
+                self.doc.push_xform_undo(id);
+                self.doc.drop_object(id);
                 self.invalidate_slice();
             }
-            if ui.button("Mirror Y").clicked() {
-                self.doc.mirror(id, 1);
+            if ui.button("Center").clicked() {
+                self.doc.push_xform_undo(id);
+                self.doc
+                    .center_on_plate(id, self.machine.size_x, self.machine.size_y);
                 self.invalidate_slice();
             }
         });
+    }
+
+    fn rotate_ui(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Rotate");
+        ui.label("Drag to turn. Values are degrees.");
+        let Selection::Object(id) = self.doc.selection else {
+            ui.label("Select a model first.");
+            return;
+        };
+        self.edit_vec(ui, id, "rot", 0.5, "°");
+        ui.horizontal_wrapped(|ui| {
+            if ui.button("Auto orient").clicked() {
+                self.doc.auto_orient(id);
+                self.invalidate_slice();
+                self.status = "Oriented to cut overhangs, then dropped to the bed.".into();
+            }
+            if ui.button("Largest face down").clicked() {
+                self.doc.place_on_largest_face(id);
+                self.invalidate_slice();
+            }
+            if ui.button("Orient all").clicked() {
+                self.doc.auto_orient_all();
+                self.invalidate_slice();
+            }
+        });
+    }
+
+    fn scale_ui(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Scale");
+        ui.label("1.00 is the size in the file. Drag up to enlarge.");
+        let Selection::Object(id) = self.doc.selection else {
+            ui.label("Select a model first.");
+            return;
+        };
+        self.edit_vec(ui, id, "scale", 0.005, "");
+        if ui.button("Reset to 100%").clicked() {
+            self.doc.push_xform_undo(id);
+            if let Some(obj) = self.doc.object_mut(id) {
+                obj.scale = Vec3::ONE;
+            }
+            self.doc.touch();
+            self.invalidate_slice();
+        }
+        self.size_label(ui, id);
+    }
+
+    fn mirror_ui(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Mirror");
+        ui.checkbox(&mut self.keep_original, "Keep the original model");
+        let Selection::Object(id) = self.doc.selection else {
+            ui.label("Select a model first.");
+            return;
+        };
+        ui.horizontal(|ui| {
+            if ui.button("Mirror X").clicked() {
+                self.apply_mirror(id, 0);
+            }
+            if ui.button("Mirror Y").clicked() {
+                self.apply_mirror(id, 1);
+            }
+            if ui.button("Mirror Z").clicked() {
+                self.apply_mirror(id, 2);
+            }
+        });
+        ui.label(
+            "Mirroring flips a scale axis. Repair afterwards if the shell comes out inside out.",
+        );
+    }
+
+    fn apply_mirror(&mut self, id: u64, axis: usize) {
+        if self.keep_original {
+            if let Some(copy) = self.doc.duplicate(id) {
+                self.doc.mirror(copy, axis);
+            }
+        } else {
+            self.doc.mirror(id, axis);
+        }
+        self.invalidate_slice();
+    }
+
+    fn drain_ui(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Dig hole");
+        ui.label("Click the outside of a hollow. The hole points inward so resin can drain and air can enter.");
+        ui.label("Put at least one hole near the lowest point of a cup, or the layer that seals it will suction onto the film.");
+    }
+
+    fn size_label(&self, ui: &mut egui::Ui, id: u64) {
         if let Some(obj) = self.doc.object(id) {
             if let Some((min, max)) = crate::scene::Document::world_bounds(obj) {
                 ui.label(format!(
@@ -660,28 +871,21 @@ impl AmberApp {
             let ml = crate::scene::Document::world_mesh(obj).volume_mm3() / 1000.0;
             ui.label(format!("Volume {ml:.2} ml before hollowing"));
         }
-        ui.add_space(6.0);
-        ui.label("Arrange");
+    }
+
+    fn arrange_ui(&mut self, ui: &mut egui::Ui) {
+        ui.label("Layout");
         ui.horizontal_wrapped(|ui| {
-            if ui.button("Auto orient").clicked() {
-                self.doc.auto_orient(id);
-                self.invalidate_slice();
-                self.status = "Oriented to cut overhangs, then dropped to the bed.".into();
-            }
-            if ui.button("Orient all").clicked() {
-                self.doc.auto_orient_all();
-                self.invalidate_slice();
-            }
-            if ui.button("Largest face down").clicked() {
-                self.doc.place_on_largest_face(id);
-                self.invalidate_slice();
-            }
             if ui.button("Layout all").clicked() {
                 self.doc
                     .auto_layout(self.machine.size_x, self.machine.size_y);
                 self.invalidate_slice();
             }
             if ui.button("Fill bed").clicked() {
+                let Selection::Object(id) = self.doc.selection else {
+                    self.status = "Select the model you want copied across the bed.".into();
+                    return;
+                };
                 match self
                     .doc
                     .fill_bed(id, self.machine.size_x, self.machine.size_y)
@@ -692,12 +896,6 @@ impl AmberApp {
                     }
                     Err(err) => self.status = err.into(),
                 }
-            }
-            if ui.button("Repair").clicked() {
-                self.doc.repair(id);
-                self.invalidate_slice();
-                self.status =
-                    "Welded duplicate corners and flipped the shell if it was inside out.".into();
             }
         });
     }
@@ -753,7 +951,8 @@ impl AmberApp {
     }
 
     fn support_ui(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Supports");
+        ui.heading("Support");
+        ui.label("Tips branch into a shared trunk. Click an underside to add one by hand.");
         let mut preset = self.doc.preset.min(PRESETS.len() - 1);
         let before = preset;
         egui::ComboBox::from_label("Preset")
@@ -763,44 +962,162 @@ impl AmberApp {
                     ui.selectable_value(&mut preset, i, preset_def.name);
                 }
             });
-        self.doc.preset = preset;
         if preset != before {
+            self.doc.set_preset(preset);
+            self.invalidate_slice();
+        }
+        let mut style = self.doc.style;
+        let mut changed = false;
+        changed |= drag_f32(
+            ui,
+            "Overhang angle",
+            &mut style.overhang_deg,
+            0.5,
+            5.0,
+            85.0,
+            "°",
+        );
+        changed |= drag_f32(
+            ui,
+            "Tip distance",
+            &mut style.spacing_mm,
+            0.05,
+            0.6,
+            12.0,
+            "mm",
+        );
+        changed |= ui.checkbox(&mut style.ball, "Ball contact").changed();
+        ui.label(if style.ball {
+            "Ball contact: a sphere bitten into the surface."
+        } else {
+            "Point contact: a cone bitten into the surface."
+        });
+        changed |= drag_f32(
+            ui,
+            "Contact diameter",
+            &mut style.contact_mm,
+            0.01,
+            0.08,
+            2.0,
+            "mm",
+        );
+        changed |= drag_f32(
+            ui,
+            "Contact depth",
+            &mut style.contact_depth,
+            0.01,
+            0.05,
+            1.5,
+            "mm",
+        );
+        changed |= drag_f32(
+            ui,
+            "Upper diameter",
+            &mut style.tip_upper_mm,
+            0.01,
+            0.1,
+            3.0,
+            "mm",
+        );
+        changed |= drag_f32(
+            ui,
+            "Lower diameter",
+            &mut style.tip_lower_mm,
+            0.01,
+            0.15,
+            4.0,
+            "mm",
+        );
+        changed |= drag_f32(
+            ui,
+            "Connection length",
+            &mut style.tip_len_mm,
+            0.05,
+            0.4,
+            8.0,
+            "mm",
+        );
+        changed |= drag_f32(
+            ui,
+            "Trunk diameter",
+            &mut style.trunk_mm,
+            0.02,
+            0.3,
+            5.0,
+            "mm",
+        );
+        changed |= drag_f32(
+            ui,
+            "Branch angle",
+            &mut style.branch_deg,
+            0.5,
+            10.0,
+            75.0,
+            "°",
+        );
+        changed |= drag_f32(
+            ui,
+            "Trunk spacing",
+            &mut style.cluster_mm,
+            0.1,
+            1.5,
+            20.0,
+            "mm",
+        );
+        changed |= drag_f32(ui, "Foot height", &mut style.foot_mm, 0.02, 0.2, 3.0, "mm");
+        changed |= drag_f32(
+            ui,
+            "Brace diameter",
+            &mut style.brace_mm,
+            0.01,
+            0.1,
+            2.0,
+            "mm",
+        );
+        let mut platform_only = self.doc.platform_only;
+        if ui
+            .checkbox(&mut platform_only, "To the platform only")
+            .changed()
+        {
+            self.doc.platform_only = platform_only;
             self.doc.touch();
         }
-        let current = PRESETS[self.doc.preset];
-        ui.label(format!(
-            "{} · overhang {:.0}° from vertical · spacing {:.1} mm · tip {:.2} / shaft {:.2} mm",
-            current.name,
-            current.overhang_deg,
-            current.spacing_mm,
-            current.tip_mm,
-            current.shaft_mm
-        ));
-        ui.label("A higher overhang angle leaves steep walls alone and uses fewer supports.");
-        if ui.button("Auto support selected").clicked() {
-            self.doc.add_auto_supports(true);
+        ui.label("Branch angle is the lean off vertical. Trunk spacing is how far apart tips must be before they get their own trunk.");
+        if changed {
+            self.doc.style = style.sanitized();
+            self.doc.touch();
             self.invalidate_slice();
         }
-        if ui.button("Auto support everything").clicked() {
-            self.doc.add_auto_supports(false);
-            self.invalidate_slice();
-        }
-        if ui.button("Clear supports").clicked() {
-            self.doc.clear_supports();
-            self.invalidate_slice();
-        }
+        ui.horizontal_wrapped(|ui| {
+            if ui.button("+ All").clicked() {
+                self.doc.platform_only = false;
+                self.doc.add_auto_supports(true);
+                self.invalidate_slice();
+            }
+            if ui.button("+ Platform").clicked() {
+                self.doc.platform_only = true;
+                self.doc.add_auto_supports(true);
+                self.invalidate_slice();
+            }
+            if ui.button("+ Everything").clicked() {
+                self.doc.add_auto_supports(false);
+                self.invalidate_slice();
+            }
+            if ui.button("Clear").clicked() {
+                self.doc.clear_supports();
+                self.invalidate_slice();
+            }
+        });
         let mut raft = self.doc.raft;
         let mut braces = self.doc.braces_on;
         let mut raft_mm = self.doc.raft_mm;
         let mut brace_dist = self.doc.brace_dist;
-        let mut changed = false;
-        changed |= ui.checkbox(&mut raft, "Raft under bed supports").changed();
-        changed |= drag_f32(ui, "Raft thickness", &mut raft_mm, 0.05, 0.4, 3.0, "mm");
-        changed |= ui
-            .checkbox(&mut braces, "Braces between neighbours")
-            .changed();
-        changed |= drag_f32(ui, "Brace distance", &mut brace_dist, 0.1, 2.0, 20.0, "mm");
-        if changed {
+        let mut raft_changed = false;
+        raft_changed |= ui.checkbox(&mut raft, "Raft").changed();
+        raft_changed |= drag_f32(ui, "Raft thickness", &mut raft_mm, 0.05, 0.4, 3.0, "mm");
+        raft_changed |= ui.checkbox(&mut braces, "Cross bracing").changed();
+        raft_changed |= drag_f32(ui, "Brace spacing", &mut brace_dist, 0.1, 2.0, 20.0, "mm");
+        if raft_changed {
             self.doc.raft = raft;
             self.doc.raft_mm = raft_mm;
             self.doc.braces_on = braces;
@@ -808,7 +1125,6 @@ impl AmberApp {
             self.doc.touch();
             self.invalidate_slice();
         }
-        ui.label("Support tool: click an underside. Drain tool: click the outside of a hollow.");
         if ui.button("Support islands from last slice").clicked() {
             if let Some(slice) = &self.slice {
                 let points: Vec<(f32, f32, f32)> = slice
@@ -964,7 +1280,7 @@ impl AmberApp {
             }
         }
         if response.dragged_by(egui::PointerButton::Secondary)
-            || (response.dragged_by(egui::PointerButton::Primary) && self.tool == Tool::Orbit)
+            || (response.dragged_by(egui::PointerButton::Primary) && self.tool == Tool::Select)
         {
             let d = response.drag_delta();
             self.camera.yaw += d.x * 0.4;
@@ -973,7 +1289,7 @@ impl AmberApp {
         if response.dragged_by(egui::PointerButton::Middle)
             || (response.dragged_by(egui::PointerButton::Primary)
                 && ui.input(|i| i.modifiers.shift)
-                && self.tool == Tool::Orbit)
+                && self.tool == Tool::Select)
         {
             let d = response.drag_delta();
             self.camera.pan(d.x, d.y);
@@ -986,7 +1302,14 @@ impl AmberApp {
         if response.clicked_by(egui::PointerButton::Primary)
             && matches!(
                 self.tool,
-                Tool::Orbit | Tool::Move | Tool::Support | Tool::Drain
+                Tool::Support
+                    | Tool::Drain
+                    | Tool::Select
+                    | Tool::Move
+                    | Tool::Rotate
+                    | Tool::Scale
+                    | Tool::Mirror
+                    | Tool::Hollow
             )
         {
             self.click_plate(&response);
@@ -1035,6 +1358,19 @@ impl AmberApp {
                 "Drop an STL or OBJ here",
                 egui::FontId::proportional(22.0),
                 egui::Color32::from_rgb(180, 164, 140),
+            );
+        } else if self
+            .doc
+            .objects
+            .iter()
+            .any(|obj| obj.mesh.triangle_count() > 280_000)
+        {
+            ui.painter().text(
+                rect.left_bottom() + egui::vec2(12.0, -16.0),
+                egui::Align2::LEFT_BOTTOM,
+                "Dense mesh: the plate view is simplified so the surface stays solid. Slicing still uses every triangle.",
+                egui::FontId::proportional(13.0),
+                egui::Color32::from_rgb(190, 176, 150),
             );
         }
     }
@@ -1138,31 +1474,93 @@ impl AmberApp {
             return;
         }
         self.preview_index = self.preview_index.min(count - 1);
+        let (caption, seals) = {
+            let layer = &slice.layers[self.preview_index];
+            (
+                format!(
+                    "Layer {} / {}    z {:.2} mm    {:.2} s    {} px    {} islands",
+                    layer.index + 1,
+                    count,
+                    layer.z_top_mm,
+                    layer.exposure_s,
+                    layer.nonzero,
+                    layer.islands.len()
+                ),
+                layer.seals_cavity_px,
+            )
+        };
+        let avail = ui.available_size();
+        let bar_w = 92.0;
         ui.horizontal(|ui| {
-            ui.label("Layer");
-            ui.add(egui::Slider::new(&mut self.preview_index, 0..=count - 1).show_value(false));
-            let layer = &slice.layers[self.preview_index];
-            ui.label(format!(
-                "{} / {}  z {:.2} mm  {:.2} s  {} px  {} islands",
-                layer.index + 1,
-                count,
-                layer.z_top_mm,
-                layer.exposure_s,
-                layer.nonzero,
-                layer.islands.len()
-            ));
-            if layer.seals_cavity_px > 0 {
-                ui.colored_label(
-                    egui::Color32::from_rgb(90, 160, 220),
-                    format!("seals a cavity ({} px)", layer.seals_cavity_px),
-                );
-            }
+            ui.allocate_ui_with_layout(
+                egui::vec2((avail.x - bar_w - 8.0).max(1.0), avail.y),
+                egui::Layout::top_down(egui::Align::Center),
+                |ui| {
+                    ui.label(caption);
+                    if seals > 0 {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(90, 160, 220),
+                            format!("seals a cavity ({seals} px)"),
+                        );
+                    }
+                    self.preview_image(ui);
+                },
+            );
+            ui.allocate_ui_with_layout(
+                egui::vec2(bar_w, avail.y),
+                egui::Layout::top_down(egui::Align::Center),
+                |ui| self.layer_bar(ui, count),
+            );
         });
+    }
+
+    fn layer_bar(&mut self, ui: &mut egui::Ui, count: usize) {
+        ui.label("Layer");
+        if ui
+            .add(egui::Button::new("▲").min_size(egui::vec2(64.0, 28.0)))
+            .on_hover_text("Up one layer")
+            .clicked()
+        {
+            self.preview_index = (self.preview_index + 1).min(count - 1);
+        }
+        let slider_h = (ui.available_height() - 128.0).max(80.0);
+        let mut layer = self.preview_index;
+        ui.add_sized(
+            [28.0, slider_h],
+            egui::Slider::new(&mut layer, 0..=count - 1)
+                .vertical()
+                .show_value(false),
+        );
+        self.preview_index = layer;
+        if ui
+            .add(egui::Button::new("▼").min_size(egui::vec2(64.0, 28.0)))
+            .on_hover_text("Down one layer")
+            .clicked()
+        {
+            self.preview_index = self.preview_index.saturating_sub(1);
+        }
+        ui.add_space(4.0);
+        ui.label("Go to");
+        let mut text = format!("{}", self.preview_index + 1);
+        let response = ui.add(egui::TextEdit::singleline(&mut text).desired_width(64.0));
+        if response.changed() {
+            if let Ok(n) = text.trim().parse::<usize>() {
+                if n >= 1 {
+                    self.preview_index = (n - 1).min(count - 1);
+                }
+            }
+        }
+        ui.label(format!("/ {count}"));
+    }
+
+    fn preview_image(&mut self, ui: &mut egui::Ui) {
         if self.preview_for != Some(self.preview_index) {
-            let layer = &slice.layers[self.preview_index];
-            if let Ok((w, h, rgba)) =
+            let decoded = self.slice.as_ref().and_then(|slice| {
+                let layer = slice.layers.get(self.preview_index)?;
                 slice::preview_rgba(&layer.rle, slice.width, slice.height, 1400, &layer.islands)
-            {
+                    .ok()
+            });
+            if let Some((w, h, rgba)) = decoded {
                 let image =
                     egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &rgba);
                 self.preview_tex = Some(ui.ctx().load_texture(
@@ -1295,12 +1693,12 @@ fn apply_theme(ctx: &egui::Context) {
     visuals.window_fill = bg;
     visuals.extreme_bg_color = egui::Color32::from_rgb(16, 17, 19);
     visuals.faint_bg_color = egui::Color32::from_rgb(38, 41, 46);
-    visuals.selection.bg_fill = egui::Color32::from_rgb(92, 64, 24);
+    visuals.selection.bg_fill = egui::Color32::from_rgb(176, 92, 32);
     visuals.selection.stroke.color = amber;
     visuals.hyperlink_color = amber;
     visuals.widgets.inactive.bg_fill = egui::Color32::from_rgb(42, 46, 51);
     visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(58, 52, 40);
-    visuals.widgets.active.bg_fill = egui::Color32::from_rgb(92, 68, 32);
+    visuals.widgets.active.bg_fill = egui::Color32::from_rgb(176, 92, 32);
     visuals.widgets.inactive.fg_stroke.color = egui::Color32::from_rgb(228, 220, 206);
     visuals.override_text_color = Some(egui::Color32::from_rgb(232, 224, 210));
     ctx.set_visuals(visuals);

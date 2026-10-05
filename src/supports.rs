@@ -1,58 +1,118 @@
-//! Overhang supports, braces, and the raft those supports stand on.
+//! Branching resin supports: a contact tip, a short neck, and a branch into a trunk.
 //!
-//! Auto supports sample downward faces on a spacing grid and drop a column
-//! to the bed, or to the model if the column hits it on the way down.
-//! The overhang angle is measured from vertical: a higher angle keeps supports
-//! off of steeper walls and leaves fewer of them.
+//! Auto supports sample downward faces on a spacing grid. Nearby tips share one
+//! trunk, the way a classic resin tree does, instead of each tip growing its
+//! own column to the bed. The overhang angle is measured from vertical: a
+//! higher angle keeps supports off of steeper walls.
 
 use crate::mesh::{face_normal, Mesh};
 use glam::Vec3;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct SupportStyle {
+    pub overhang_deg: f32,
+    pub spacing_mm: f32,
+    pub contact_mm: f32,
+    pub contact_depth: f32,
+    pub ball: bool,
+    pub tip_upper_mm: f32,
+    pub tip_lower_mm: f32,
+    pub tip_len_mm: f32,
+    pub trunk_mm: f32,
+    pub branch_deg: f32,
+    pub cluster_mm: f32,
+    pub foot_mm: f32,
+    pub brace_mm: f32,
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct SupportPreset {
     pub name: &'static str,
-    pub overhang_deg: f32,
-    pub spacing_mm: f32,
-    pub tip_mm: f32,
-    pub shaft_mm: f32,
-    pub penetration_mm: f32,
-    pub tip_len_mm: f32,
-    pub foot_mm: f32,
+    pub style: SupportStyle,
 }
 
 pub const PRESETS: &[SupportPreset] = &[
     SupportPreset {
         name: "Light",
-        overhang_deg: 35.0,
-        spacing_mm: 2.2,
-        tip_mm: 0.30,
-        shaft_mm: 0.80,
-        penetration_mm: 0.25,
-        tip_len_mm: 2.0,
-        foot_mm: 0.6,
+        style: SupportStyle {
+            overhang_deg: 35.0,
+            spacing_mm: 2.0,
+            contact_mm: 0.25,
+            contact_depth: 0.20,
+            ball: false,
+            tip_upper_mm: 0.30,
+            tip_lower_mm: 0.55,
+            tip_len_mm: 2.0,
+            trunk_mm: 0.90,
+            branch_deg: 40.0,
+            cluster_mm: 5.5,
+            foot_mm: 0.6,
+            brace_mm: 0.32,
+        },
     },
     SupportPreset {
         name: "Medium",
-        overhang_deg: 45.0,
-        spacing_mm: 3.2,
-        tip_mm: 0.40,
-        shaft_mm: 1.15,
-        penetration_mm: 0.35,
-        tip_len_mm: 2.4,
-        foot_mm: 0.8,
+        style: SupportStyle {
+            overhang_deg: 45.0,
+            spacing_mm: 3.0,
+            contact_mm: 0.40,
+            contact_depth: 0.30,
+            ball: false,
+            tip_upper_mm: 0.45,
+            tip_lower_mm: 0.80,
+            tip_len_mm: 2.4,
+            trunk_mm: 1.20,
+            branch_deg: 45.0,
+            cluster_mm: 7.0,
+            foot_mm: 0.8,
+            brace_mm: 0.42,
+        },
     },
     SupportPreset {
         name: "Heavy",
-        overhang_deg: 55.0,
-        spacing_mm: 4.5,
-        tip_mm: 0.60,
-        shaft_mm: 1.70,
-        penetration_mm: 0.45,
-        tip_len_mm: 3.0,
-        foot_mm: 1.1,
+        style: SupportStyle {
+            overhang_deg: 55.0,
+            spacing_mm: 4.2,
+            contact_mm: 0.60,
+            contact_depth: 0.40,
+            ball: false,
+            tip_upper_mm: 0.70,
+            tip_lower_mm: 1.10,
+            tip_len_mm: 3.0,
+            trunk_mm: 1.70,
+            branch_deg: 50.0,
+            cluster_mm: 9.0,
+            foot_mm: 1.1,
+            brace_mm: 0.55,
+        },
     },
 ];
+
+impl SupportStyle {
+    pub fn from_preset(preset: &SupportPreset) -> Self {
+        preset.style
+    }
+
+    pub fn sanitized(self) -> Self {
+        Self {
+            overhang_deg: self.overhang_deg.clamp(5.0, 85.0),
+            spacing_mm: self.spacing_mm.clamp(0.6, 12.0),
+            contact_mm: self.contact_mm.clamp(0.08, 2.0),
+            contact_depth: self.contact_depth.clamp(0.05, 1.5),
+            ball: self.ball,
+            tip_upper_mm: self.tip_upper_mm.clamp(0.1, 3.0),
+            tip_lower_mm: self.tip_lower_mm.clamp(0.15, 4.0),
+            tip_len_mm: self.tip_len_mm.clamp(0.4, 8.0),
+            trunk_mm: self.trunk_mm.clamp(0.3, 5.0),
+            branch_deg: self.branch_deg.clamp(10.0, 75.0),
+            cluster_mm: self.cluster_mm.clamp(1.5, 20.0),
+            foot_mm: self.foot_mm.clamp(0.2, 3.0),
+            brace_mm: self.brace_mm.clamp(0.1, 2.0),
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct Support {
@@ -61,11 +121,6 @@ pub struct Support {
     pub y: f32,
     pub z_top: f32,
     pub z_base: f32,
-    pub preset_tip: f32,
-    pub preset_shaft: f32,
-    pub penetration: f32,
-    pub tip_len: f32,
-    pub foot: f32,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -175,18 +230,20 @@ fn vertical_hit(x: f32, y: f32, a: [f32; 3], b: [f32; 3], c: [f32; 3]) -> Option
 pub fn auto_supports(
     verts: &[[f32; 3]],
     indices: &[u32],
-    preset: &SupportPreset,
+    style: &SupportStyle,
+    platform_only: bool,
     next_id: &mut u64,
 ) -> Vec<Support> {
+    let style = style.sanitized();
     let grid = TriGrid::build(verts, indices);
     let mut cells: HashMap<(i32, i32), [f32; 3]> = HashMap::new();
-    let spacing = preset.spacing_mm.max(0.6);
+    let spacing = style.spacing_mm;
     for tri in indices.chunks_exact(3) {
         let a = verts[tri[0] as usize];
         let b = verts[tri[1] as usize];
         let c = verts[tri[2] as usize];
         let n = face_normal(a, b, c);
-        if !needs_support(n, preset.overhang_deg) {
+        if !needs_support(n, style.overhang_deg) {
             continue;
         }
         let min_x = a[0].min(b[0]).min(c[0]);
@@ -234,8 +291,12 @@ pub fn auto_supports(
     }
     let mut out = Vec::new();
     for s in cells.into_values() {
-        let base = grid.highest_below(s[0], s[1], s[2]).unwrap_or(0.0).max(0.0);
-        if s[2] - base < 0.8 {
+        let landed = if platform_only {
+            0.0
+        } else {
+            grid.highest_below(s[0], s[1], s[2]).unwrap_or(0.0).max(0.0)
+        };
+        if s[2] - landed < 0.8 {
             continue;
         }
         let id = *next_id;
@@ -245,12 +306,7 @@ pub fn auto_supports(
             x: s[0],
             y: s[1],
             z_top: s[2],
-            z_base: base,
-            preset_tip: preset.tip_mm,
-            preset_shaft: preset.shaft_mm,
-            penetration: preset.penetration_mm,
-            tip_len: preset.tip_len_mm,
-            foot: preset.foot_mm,
+            z_base: landed,
         });
     }
     out
@@ -262,94 +318,271 @@ pub fn manual_support(
     z: f32,
     verts: &[[f32; 3]],
     indices: &[u32],
-    preset: &SupportPreset,
+    platform_only: bool,
     id: u64,
 ) -> Support {
-    let grid = TriGrid::build(verts, indices);
-    let base = grid.highest_below(x, y, z).unwrap_or(0.0).max(0.0);
+    let base = if platform_only {
+        0.0
+    } else {
+        let grid = TriGrid::build(verts, indices);
+        grid.highest_below(x, y, z).unwrap_or(0.0).max(0.0)
+    };
     Support {
         id,
         x,
         y,
         z_top: z,
         z_base: base,
-        preset_tip: preset.tip_mm,
-        preset_shaft: preset.shaft_mm,
-        penetration: preset.penetration_mm,
-        tip_len: preset.tip_len_mm,
-        foot: preset.foot_mm,
     }
 }
 
-pub fn support_mesh(support: &Support, raft_top: f32) -> Mesh {
+struct Trunk {
+    x: f32,
+    y: f32,
+    z_base: f32,
+    z_top: f32,
+    radius: f32,
+}
+
+/// Tips, angled branches, shared trunks, feet, and cross-braces for the whole plate.
+pub fn forest_mesh(
+    supports: &[Support],
+    style: &SupportStyle,
+    raft_top: f32,
+    braces_on: bool,
+    brace_dist: f32,
+) -> Mesh {
+    let style = style.sanitized();
     let mut mesh = Mesh {
         vertices: vec![],
         indices: vec![],
     };
-    let mut z_base = support.z_base;
-    let on_bed = z_base <= 0.05;
-    if on_bed && raft_top > 0.0 {
-        z_base = raft_top - 0.15;
+    if supports.is_empty() {
+        return mesh;
     }
-    let z_top = support.z_top;
-    let shaft_r = support.preset_shaft * 0.5;
-    let tip_r = support.preset_tip * 0.5;
-    let available = (z_top - z_base).max(0.4);
-    let tip_len = support.tip_len.min(available * 0.55).max(0.4);
-    let cone_base_z = z_top - tip_len;
-    let apex_z = z_top + support.penetration;
-    mesh.append(&tapered(
-        Vec3::new(support.x, support.y, cone_base_z),
-        shaft_r,
-        Vec3::new(support.x, support.y, apex_z),
-        tip_r.max(0.08),
-        10,
-    ));
-    let foot_h = if on_bed {
-        support.foot.min((cone_base_z - z_base).max(0.0) * 0.45)
-    } else {
-        0.0
-    };
-    let shaft_bottom = z_base + foot_h;
-    if cone_base_z - shaft_bottom > 0.15 {
-        mesh.append(&tapered(
-            Vec3::new(support.x, support.y, shaft_bottom),
-            shaft_r,
-            Vec3::new(support.x, support.y, cone_base_z),
-            shaft_r,
-            10,
-        ));
+    let mut trunks = Vec::new();
+    for group in cluster(supports, style.cluster_mm) {
+        let anchor = anchor_index(supports, &group);
+        let host = &supports[anchor];
+        let mut z_base = host.z_base.max(0.0);
+        let on_bed = z_base <= 0.35;
+        if on_bed && raft_top > 0.0 {
+            z_base = raft_top - 0.12;
+        }
+        let trunk_r = style.trunk_mm * 0.5;
+        let tip_end = tip_end_z(host, z_base, &style);
+        add_tip(&mut mesh, host, tip_end, &style);
+        let shaft_top = tip_end;
+        add_foot_and_shaft(
+            &mut mesh, host.x, host.y, z_base, shaft_top, trunk_r, on_bed, &style,
+        );
+        trunks.push(Trunk {
+            x: host.x,
+            y: host.y,
+            z_base,
+            z_top: host.z_top,
+            radius: trunk_r,
+        });
+        let ceiling = shaft_top;
+        let floor = z_base + style.foot_mm + 0.25;
+        for &idx in &group {
+            if idx == anchor {
+                continue;
+            }
+            let tip = &supports[idx];
+            let branch_end = tip_end_z(tip, z_base, &style);
+            add_tip(&mut mesh, tip, branch_end, &style);
+            let horiz = ((tip.x - host.x).powi(2) + (tip.y - host.y).powi(2)).sqrt();
+            let drop = horiz / style.branch_deg.to_radians().tan().max(0.15);
+            let join_z = if branch_end > ceiling {
+                ceiling
+            } else {
+                (branch_end - drop).clamp(floor.min(ceiling), ceiling)
+            };
+            let from = Vec3::new(tip.x, tip.y, branch_end);
+            let to = Vec3::new(host.x, host.y, join_z);
+            if from.distance(to) > 0.2 {
+                mesh.append(&tapered(
+                    from,
+                    style.tip_lower_mm * 0.5,
+                    to,
+                    trunk_r * 0.92,
+                    8,
+                ));
+                mesh.append(&sphere(to, trunk_r * 0.85, 5, 7));
+            }
+        }
     }
-    if foot_h > 0.1 {
-        mesh.append(&tapered(
-            Vec3::new(support.x, support.y, z_base),
-            shaft_r * 1.8,
-            Vec3::new(support.x, support.y, shaft_bottom),
-            shaft_r,
-            10,
-        ));
+    if braces_on {
+        for brace in trunk_braces(&trunks, brace_dist, style.brace_mm * 0.5) {
+            mesh.append(&tapered(brace.a, brace.radius, brace.b, brace.radius, 6));
+        }
     }
     mesh
 }
 
-pub fn braces(supports: &[Support], max_dist: f32) -> Vec<Brace> {
+/// The contact alone, used to highlight the support under the cursor.
+pub fn tip_marker(support: &Support, style: &SupportStyle) -> Mesh {
+    let style = style.sanitized();
+    let mut mesh = Mesh {
+        vertices: vec![],
+        indices: vec![],
+    };
+    let end = tip_end_z(support, support.z_base.max(0.0), &style);
+    add_tip(&mut mesh, support, end, &style);
+    mesh
+}
+
+fn tip_end_z(support: &Support, z_base: f32, style: &SupportStyle) -> f32 {
+    let span = (support.z_top - z_base).max(0.5);
+    let len = style.tip_len_mm.min(span * 0.55).max(0.35);
+    (support.z_top - len).max(z_base + 0.2)
+}
+
+fn add_tip(mesh: &mut Mesh, support: &Support, tip_end_z: f32, style: &SupportStyle) {
+    let contact_r = style.contact_mm * 0.5;
+    let upper_r = (style.tip_upper_mm * 0.5).max(contact_r);
+    let lower_r = (style.tip_lower_mm * 0.5).max(upper_r * 0.8);
+    if style.ball {
+        let r = contact_r.max(0.08);
+        let center = Vec3::new(
+            support.x,
+            support.y,
+            support.z_top + style.contact_depth * 0.45,
+        );
+        mesh.append(&sphere(center, r, 6, 8));
+        let neck = Vec3::new(
+            support.x,
+            support.y,
+            (center.z - r * 0.65).min(support.z_top),
+        );
+        let end = Vec3::new(support.x, support.y, tip_end_z.min(neck.z - 0.05));
+        if neck.z - end.z > 0.12 {
+            mesh.append(&tapered(neck, r * 0.9, end, lower_r, 8));
+        }
+        return;
+    }
+    let apex = Vec3::new(support.x, support.y, support.z_top + style.contact_depth);
+    let surface = Vec3::new(support.x, support.y, support.z_top);
+    let end = Vec3::new(support.x, support.y, tip_end_z);
+    mesh.append(&tapered(
+        apex,
+        (contact_r * 0.35).max(0.04),
+        surface,
+        contact_r.max(0.06),
+        8,
+    ));
+    if surface.z - end.z > 0.12 {
+        mesh.append(&tapered(surface, upper_r, end, lower_r, 8));
+    }
+}
+
+fn add_foot_and_shaft(
+    mesh: &mut Mesh,
+    x: f32,
+    y: f32,
+    z_base: f32,
+    shaft_top: f32,
+    trunk_r: f32,
+    on_bed: bool,
+    style: &SupportStyle,
+) {
+    let foot_h = if on_bed {
+        style.foot_mm.min((shaft_top - z_base).max(0.0) * 0.45)
+    } else {
+        style.contact_depth.min(0.4)
+    };
+    let shaft_bottom = if foot_h > 0.12 {
+        z_base + foot_h
+    } else {
+        z_base
+    };
+    if shaft_top - shaft_bottom > 0.15 {
+        mesh.append(&tapered(
+            Vec3::new(x, y, shaft_bottom),
+            trunk_r,
+            Vec3::new(x, y, shaft_top),
+            trunk_r,
+            10,
+        ));
+    }
+    if on_bed && foot_h > 0.12 {
+        mesh.append(&tapered(
+            Vec3::new(x, y, z_base),
+            trunk_r * 2.1,
+            Vec3::new(x, y, shaft_bottom),
+            trunk_r,
+            10,
+        ));
+    } else if !on_bed && foot_h > 0.08 {
+        // Lower contact where the trunk lands on the model.
+        let sole = Vec3::new(x, y, z_base - style.contact_depth * 0.5);
+        mesh.append(&tapered(
+            sole,
+            style.contact_mm * 0.22,
+            Vec3::new(x, y, shaft_bottom),
+            trunk_r,
+            8,
+        ));
+    }
+}
+
+fn cluster(supports: &[Support], cell: f32) -> Vec<Vec<usize>> {
+    let cell = cell.max(1.0);
+    let mut map: HashMap<(i32, i32, i32), Vec<usize>> = HashMap::new();
+    for (i, s) in supports.iter().enumerate() {
+        let bed = if s.z_base <= 0.35 { 0 } else { 1 };
+        let band = if bed == 0 {
+            0
+        } else {
+            (s.z_base / cell).floor() as i32
+        };
+        let key = (
+            (s.x / cell).floor() as i32,
+            (s.y / cell).floor() as i32,
+            bed * 10_000 + band,
+        );
+        map.entry(key).or_default().push(i);
+    }
+    map.into_values().collect()
+}
+
+fn anchor_index(supports: &[Support], group: &[usize]) -> usize {
+    let (cx, cy) = group.iter().fold((0.0f32, 0.0f32), |(x, y), &i| {
+        (x + supports[i].x, y + supports[i].y)
+    });
+    let n = group.len() as f32;
+    let (cx, cy) = (cx / n, cy / n);
+    group
+        .iter()
+        .copied()
+        .min_by(|&a, &b| {
+            let da = (supports[a].x - cx).powi(2) + (supports[a].y - cy).powi(2);
+            let db = (supports[b].x - cx).powi(2) + (supports[b].y - cy).powi(2);
+            da.total_cmp(&db)
+                .then_with(|| supports[a].z_base.total_cmp(&supports[b].z_base))
+        })
+        .unwrap_or(group[0])
+}
+
+fn trunk_braces(trunks: &[Trunk], max_dist: f32, radius: f32) -> Vec<Brace> {
     let mut out = Vec::new();
-    let mut used = vec![0u8; supports.len()];
-    for i in 0..supports.len() {
+    let mut used = vec![0u8; trunks.len()];
+    for i in 0..trunks.len() {
         if used[i] >= 2 {
             continue;
         }
-        let a = &supports[i];
+        let a = &trunks[i];
         let mut best: Option<(usize, f32)> = None;
-        for j in (i + 1)..supports.len() {
+        for j in (i + 1)..trunks.len() {
             if used[j] >= 2 {
                 continue;
             }
-            let b = &supports[j];
+            let b = &trunks[j];
             let dx = a.x - b.x;
             let dy = a.y - b.y;
             let dist = (dx * dx + dy * dy).sqrt();
-            if dist < a.preset_shaft || dist > max_dist {
+            if dist < a.radius * 2.0 || dist > max_dist {
                 continue;
             }
             let overlap_top = a.z_top.min(b.z_top) - 2.0;
@@ -364,25 +597,22 @@ pub fn braces(supports: &[Support], max_dist: f32) -> Vec<Brace> {
         if let Some((j, _)) = best {
             used[i] += 1;
             used[j] += 1;
-            let b = &supports[j];
-            let z = ((a.z_base + a.z_top) * 0.5).min((b.z_base + b.z_top) * 0.5);
-            let z = z.clamp(a.z_base.max(b.z_base) + 1.2, a.z_top.min(b.z_top) - 1.5);
+            let b = &trunks[j];
+            let z = ((a.z_base + a.z_top) * 0.5)
+                .min((b.z_base + b.z_top) * 0.5)
+                .clamp(a.z_base.max(b.z_base) + 1.2, a.z_top.min(b.z_top) - 1.5);
             out.push(Brace {
                 a: Vec3::new(a.x, a.y, z),
                 b: Vec3::new(b.x, b.y, z),
-                radius: a.preset_shaft.min(b.preset_shaft) * 0.28,
+                radius,
             });
         }
     }
     out
 }
 
-pub fn brace_mesh(brace: &Brace) -> Mesh {
-    tapered(brace.a, brace.radius, brace.b, brace.radius, 8)
-}
-
-pub fn raft_mesh(supports: &[Support], margin: f32, thickness: f32) -> Option<Mesh> {
-    let bed: Vec<&Support> = supports.iter().filter(|s| s.z_base <= 0.2).collect();
+pub fn raft_mesh(supports: &[Support], margin: f32, thickness: f32, reach: f32) -> Option<Mesh> {
+    let bed: Vec<&Support> = supports.iter().filter(|s| s.z_base <= 0.35).collect();
     if bed.is_empty() || thickness <= 0.0 {
         return None;
     }
@@ -391,16 +621,53 @@ pub fn raft_mesh(supports: &[Support], margin: f32, thickness: f32) -> Option<Me
     let mut max_x = f32::MIN;
     let mut max_y = f32::MIN;
     for s in bed {
-        let r = s.preset_shaft;
-        min_x = min_x.min(s.x - r);
-        min_y = min_y.min(s.y - r);
-        max_x = max_x.max(s.x + r);
-        max_y = max_y.max(s.y + r);
+        min_x = min_x.min(s.x - reach);
+        min_y = min_y.min(s.y - reach);
+        max_x = max_x.max(s.x + reach);
+        max_y = max_y.max(s.y + reach);
     }
     Some(crate::mesh::box_mesh(
         [min_x - margin, min_y - margin, 0.0],
         [max_x + margin, max_y + margin, thickness],
     ))
+}
+
+pub fn brace_mesh(brace: &Brace) -> Mesh {
+    tapered(brace.a, brace.radius, brace.b, brace.radius, 8)
+}
+
+fn sphere(center: Vec3, radius: f32, stacks: usize, slices: usize) -> Mesh {
+    let stacks = stacks.max(2);
+    let slices = slices.max(3);
+    let mut vertices = Vec::new();
+    for stack in 0..=stacks {
+        let v = stack as f32 / stacks as f32;
+        let phi = std::f32::consts::PI * v;
+        for slice_i in 0..=slices {
+            let u = slice_i as f32 / slices as f32;
+            let theta = std::f32::consts::TAU * u;
+            vertices.push(
+                (center
+                    + Vec3::new(
+                        radius * phi.sin() * theta.cos(),
+                        radius * phi.sin() * theta.sin(),
+                        radius * phi.cos(),
+                    ))
+                .to_array(),
+            );
+        }
+    }
+    let row = slices + 1;
+    let mut indices = Vec::new();
+    for stack in 0..stacks {
+        for slice_i in 0..slices {
+            let a = stack * row + slice_i;
+            let b = a + row;
+            indices.extend_from_slice(&[a as u32, b as u32, (a + 1) as u32]);
+            indices.extend_from_slice(&[b as u32, (b + 1) as u32, (a + 1) as u32]);
+        }
+    }
+    Mesh { vertices, indices }
 }
 
 fn tapered(a: Vec3, ra: f32, b: Vec3, rb: f32, seg: usize) -> Mesh {
@@ -460,12 +727,45 @@ mod tests {
         let plate_y = 80.0;
         let mesh = crate::mesh::overhang_bridge(plate_x, plate_y);
         let mut id = 1u64;
-        let supports = auto_supports(&mesh.vertices, &mesh.indices, &PRESETS[1], &mut id);
+        let style = PRESETS[1].style;
+        let supports = auto_supports(&mesh.vertices, &mesh.indices, &style, false, &mut id);
         assert!(
             supports.len() >= 3,
             "expected several supports under the bridge, got {}",
             supports.len()
         );
         assert!(supports.iter().all(|s| s.z_top > s.z_base));
+    }
+
+    #[test]
+    fn nearby_tips_share_a_trunk_and_grow_a_branch() {
+        let supports = [
+            Support {
+                id: 1,
+                x: 0.0,
+                y: 0.0,
+                z_top: 22.0,
+                z_base: 0.0,
+            },
+            Support {
+                id: 2,
+                x: 3.2,
+                y: 0.4,
+                z_top: 20.0,
+                z_base: 0.0,
+            },
+        ];
+        let mesh = forest_mesh(&supports, &PRESETS[1].style, 0.0, true, 8.0);
+        assert!(mesh.triangle_count() > 40);
+        let joint = mesh
+            .vertices
+            .iter()
+            .any(|v| (v[0] - 0.0).abs() < 0.35 && v[1].abs() < 0.8 && v[2] > 2.0 && v[2] < 19.0);
+        assert!(joint, "expected the branch to meet the trunk");
+        let reached = mesh
+            .vertices
+            .iter()
+            .any(|v| (v[0] - 3.2).abs() < 0.3 && v[2] > 18.0);
+        assert!(reached, "expected a tip on the second contact");
     }
 }

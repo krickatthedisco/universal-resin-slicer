@@ -63,7 +63,7 @@ pub fn run(args: &[String]) -> Result<()> {
             "heavy" => 2,
             other => bail!("--supports expected none, light, medium, or heavy, got {other}"),
         };
-        doc.preset = index;
+        doc.set_preset(index);
         doc.add_auto_supports(true);
     }
     let mut settings = PrintSettings::default();

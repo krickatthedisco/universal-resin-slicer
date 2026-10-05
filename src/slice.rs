@@ -355,54 +355,38 @@ fn from_px(x: f32, y: f32, machine: Machine) -> [f32; 2] {
     [px * machine.pixel_mm(), py * machine.pixel_mm()]
 }
 
-/// Intersection of a triangle with a horizontal plane, oriented along the
-/// triangle boundary. Scanline fill uses that direction as the winding.
-/// An edge that lies on the plane is kept only when the third vertex is above
-/// it, so the neighbouring triangle does not draw the same edge again.
+/// Intersection of a triangle with a horizontal plane.
+///
+/// A vertex that lands exactly on the plane counts as above it. The wall under
+/// a flat face then emits that edge, and the face itself does not emit it a
+/// second time. Treating the hit as "on the plane, drop it" left a missing
+/// scanline whenever a vertex sat on the layer.
 fn clip_triangle(v0: [f32; 3], v1: [f32; 3], v2: [f32; 3], z: f32) -> Option<([f32; 2], [f32; 2])> {
-    const EPS: f32 = 1e-5;
     let vs = [v0, v1, v2];
-    let mut side = [0i8; 3];
+    let above = |v: [f32; 3]| v[2] >= z;
+    let mut pts = Vec::with_capacity(3);
     for i in 0..3 {
-        let d = vs[i][2] - z;
-        side[i] = if d > EPS {
-            1
-        } else if d < -EPS {
-            -1
-        } else {
-            0
-        };
+        let a = vs[i];
+        let b = vs[(i + 1) % 3];
+        if above(a) == above(b) {
+            continue;
+        }
+        let denom = b[2] - a[2];
+        if denom.abs() < 1e-12 {
+            continue;
+        }
+        let t = ((z - a[2]) / denom).clamp(0.0, 1.0);
+        pts.push([a[0] + t * (b[0] - a[0]), a[1] + t * (b[1] - a[1])]);
     }
-    if side.iter().all(|s| *s == 0) {
+    if pts.len() < 2 {
         return None;
     }
-    for i in 0..3 {
-        let j = (i + 1) % 3;
-        if side[i] == 0 && side[j] == 0 {
-            let k = (i + 2) % 3;
-            if side[k] > 0 {
-                return Some(([vs[i][0], vs[i][1]], [vs[j][0], vs[j][1]]));
-            }
-            return None;
-        }
-    }
-    let mut pts = Vec::with_capacity(2);
-    for i in 0..3 {
-        let j = (i + 1) % 3;
-        let (sa, sb) = (side[i], side[j]);
-        if sa == 0 && sb != 0 {
-            pts.push([vs[i][0], vs[i][1]]);
-        } else if sa != 0 && sb != 0 && sa != sb {
-            let a = vs[i];
-            let b = vs[j];
-            let t = (z - a[2]) / (b[2] - a[2]);
-            pts.push([a[0] + t * (b[0] - a[0]), a[1] + t * (b[1] - a[1])]);
-        }
-    }
-    if pts.len() == 2 {
-        Some((pts[0], pts[1]))
-    } else {
+    let p0 = pts[0];
+    let p1 = pts[pts.len() - 1];
+    if (p0[0] - p1[0]).abs() + (p0[1] - p1[1]).abs() < 1e-6 {
         None
+    } else {
+        Some((p0, p1))
     }
 }
 
@@ -456,14 +440,34 @@ fn fill_segments(segs: &[([f32; 2], [f32; 2])], machine: Machine, aa: u8) -> Ima
         // or doubled faces; non-zero winding turns those into empty stripes.
         // Each model is filled on its own and then unioned, so two objects
         // that overlap still print as one solid.
+        //
+        // Only exact duplicate hits are merged. A wider merge was collapsing
+        // two real walls into one crossing and leaving the rest of that
+        // scanline blank. An odd leftover is a numerical double: drop the
+        // tighter of the two until the row pairs up.
         let mut crossings: Vec<f32> = Vec::with_capacity(hits.len());
         for (x, _) in hits {
-            if let Some(prev) = crossings.last_mut() {
-                if (x - *prev).abs() < 0.35 {
+            if let Some(prev) = crossings.last() {
+                if (x - *prev).abs() < 0.02 {
                     continue;
                 }
             }
             crossings.push(x);
+        }
+        while crossings.len() % 2 == 1 && crossings.len() >= 3 {
+            let mut best_i = 0usize;
+            let mut best_d = f32::MAX;
+            for i in 0..crossings.len() - 1 {
+                let d = crossings[i + 1] - crossings[i];
+                if d < best_d {
+                    best_d = d;
+                    best_i = i;
+                }
+            }
+            crossings.remove(best_i + 1);
+        }
+        if crossings.len() < 2 {
+            continue;
         }
         let mut i = 0;
         while i + 1 < crossings.len() {
@@ -1116,6 +1120,50 @@ mod tests {
         assert!(
             (got - expected).abs() / expected < 0.06,
             "flipped nonzero {got} expected ~{expected}"
+        );
+    }
+
+    #[test]
+    fn edge_on_the_slice_plane_still_draws() {
+        let seg = clip_triangle([0.0, 0.0, 5.0], [8.0, 0.0, 5.0], [0.0, 4.0, 0.0], 5.0);
+        let (a, b) = seg.expect("a wall under a flat edge must cross the plane");
+        let span = (a[0] - b[0]).abs() + (a[1] - b[1]).abs();
+        assert!(span > 1.0, "segment collapsed to {a:?} {b:?}");
+    }
+
+    #[test]
+    fn top_of_a_box_is_not_a_blank_layer() {
+        let h = 0.5f32;
+        let index = 8u32;
+        let plane = (index as f32 + 0.5) * h;
+        let mesh = box_mesh([10.0, 20.0, 0.0], [20.0, 30.0, plane]);
+        let solid = Solid {
+            vertices: mesh.vertices,
+            indices: mesh.indices,
+            hollow: None,
+        };
+        let mut settings = PrintSettings::default();
+        settings.layer_mm = h;
+        settings.anti_alias = 1;
+        let slice = slice(Request {
+            solids: &[solid],
+            drains: &[],
+            machine: machine_no_flip(),
+            settings: &settings,
+            cancel: None,
+            progress: None,
+        })
+        .unwrap();
+        let top = slice
+            .layers
+            .iter()
+            .find(|layer| layer.index == index)
+            .expect("the layer whose plane is the top face");
+        let expected = (10.0_f32 / 0.046) * (10.0 / 0.046);
+        let got = top.nonzero as f32;
+        assert!(
+            (got - expected).abs() / expected < 0.08,
+            "top layer nonzero {got} expected ~{expected}"
         );
     }
 

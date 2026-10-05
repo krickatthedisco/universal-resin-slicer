@@ -2,7 +2,7 @@
 
 use crate::mesh::{face_normal, load_mesh, Mesh};
 use crate::slice::{Drain, Hollow, Solid};
-use crate::supports::{self, Brace, Support, SupportPreset};
+use crate::supports::{self, Support, SupportStyle};
 use anyhow::Result;
 use glam::{EulerRot, Mat4, Quat, Vec3};
 use std::path::Path;
@@ -65,6 +65,8 @@ pub struct Document {
     pub braces_on: bool,
     pub brace_dist: f32,
     pub preset: usize,
+    pub style: SupportStyle,
+    pub platform_only: bool,
     next_id: u64,
     undo: Vec<Undo>,
     pub changed: u64,
@@ -83,6 +85,8 @@ impl Document {
             braces_on: true,
             brace_dist: 8.0,
             preset: 1,
+            style: supports::PRESETS[1].style,
+            platform_only: false,
             next_id: 1,
             undo: Vec::new(),
             changed: 1,
@@ -99,8 +103,10 @@ impl Document {
         id
     }
 
-    pub fn preset(&self) -> &'static SupportPreset {
-        &supports::PRESETS[self.preset.min(supports::PRESETS.len() - 1)]
+    pub fn set_preset(&mut self, index: usize) {
+        self.preset = index.min(supports::PRESETS.len() - 1);
+        self.style = supports::PRESETS[self.preset].style;
+        self.touch();
     }
 
     pub fn add_mesh(&mut self, name: String, mesh: Mesh) -> u64 {
@@ -513,7 +519,8 @@ impl Document {
 
     pub fn add_auto_supports(&mut self, only_selected: bool) {
         self.undo.push(Undo::Supports(self.supports.clone()));
-        let preset = *self.preset();
+        let style = self.style;
+        let platform_only = self.platform_only;
         let ids: Vec<u64> = if only_selected {
             self.selected_object().map(|o| o.id).into_iter().collect()
         } else {
@@ -523,8 +530,13 @@ impl Document {
             let Some(obj) = self.object(id) else { continue };
             let world = Self::world_mesh(obj);
             let mut id_gen = self.next_id;
-            let found =
-                supports::auto_supports(&world.vertices, &world.indices, &preset, &mut id_gen);
+            let found = supports::auto_supports(
+                &world.vertices,
+                &world.indices,
+                &style,
+                platform_only,
+                &mut id_gen,
+            );
             self.next_id = id_gen;
             self.supports.extend(found);
         }
@@ -544,7 +556,7 @@ impl Document {
             point.z,
             &world.vertices,
             &world.indices,
-            self.preset(),
+            self.platform_only,
             id,
         );
         self.supports.push(support);
@@ -557,7 +569,7 @@ impl Document {
             return;
         }
         self.undo.push(Undo::Supports(self.supports.clone()));
-        let preset = *self.preset();
+        let platform_only = self.platform_only;
         // Hit-testing the whole scene is enough to land the foot.
         let mut verts = Vec::new();
         let mut indices = Vec::new();
@@ -570,7 +582,13 @@ impl Document {
         for (x, y, z) in islands {
             let id = self.alloc();
             self.supports.push(supports::manual_support(
-                *x, *y, *z, &verts, &indices, &preset, id,
+                *x,
+                *y,
+                *z,
+                &verts,
+                &indices,
+                platform_only,
+                id,
             ));
         }
         self.touch();
@@ -602,13 +620,6 @@ impl Document {
         });
         self.selection = Selection::Drain(id);
         self.touch();
-    }
-
-    pub fn brace_list(&self) -> Vec<Brace> {
-        if !self.braces_on {
-            return Vec::new();
-        }
-        supports::braces(&self.supports, self.brace_dist)
     }
 
     pub fn raft_top(&self) -> f32 {
@@ -649,8 +660,12 @@ impl Document {
         }
         let raft_top = self.raft_top();
         if raft_top > 0.0 {
-            if let Some(raft) = supports::raft_mesh(&self.supports, self.raft_margin, self.raft_mm)
-            {
+            if let Some(raft) = supports::raft_mesh(
+                &self.supports,
+                self.raft_margin,
+                self.raft_mm,
+                self.style.trunk_mm,
+            ) {
                 solids.push(Solid {
                     vertices: raft.vertices,
                     indices: raft.indices,
@@ -658,19 +673,17 @@ impl Document {
                 });
             }
         }
-        for support in &self.supports {
-            let mesh = supports::support_mesh(support, raft_top);
+        let forest = supports::forest_mesh(
+            &self.supports,
+            &self.style,
+            raft_top,
+            self.braces_on,
+            self.brace_dist,
+        );
+        if forest.triangle_count() > 0 {
             solids.push(Solid {
-                vertices: mesh.vertices,
-                indices: mesh.indices,
-                hollow: None,
-            });
-        }
-        for brace in self.brace_list() {
-            let mesh = supports::brace_mesh(&brace);
-            solids.push(Solid {
-                vertices: mesh.vertices,
-                indices: mesh.indices,
+                vertices: forest.vertices,
+                indices: forest.indices,
                 hollow: None,
             });
         }

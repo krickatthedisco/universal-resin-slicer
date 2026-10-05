@@ -41,8 +41,10 @@ Amber is not affiliated with Anycubic. Resin times below are Anycubic's publishe
 - Several models, with move, rotate, scale, mirror, duplicate, delete, and undo.
 - Drop to the bed, center, put the largest face down, auto-orient one model or all of them, shelf-pack the plate, and fill the bed with copies. Repair flips an inside-out shell and welds duplicate corners. Models that hang off the plate are marked.
 - Hollow at slice time: wall thickness, top and bottom caps, and a lattice. Drain holes are cylinders you click onto the surface.
-- Automatic supports (Light 35°, Medium 45°, Heavy 55° from vertical), a raft, braces, click-to-place supports, and supports on detected islands.
-- Layer preview with islands tinted, and a warning when a layer seals a cavity (suction).
+- The prepare window follows the classic Chitubox layout: a top menu, a left tool rail (Select, Move, Rotate, Scale, Mirror, Hollow, Hole, Support), and a right panel that changes with the tool. Print settings stay in the panel under that name.
+- Automatic tree supports (Light, Medium, Heavy). Nearby tips share a trunk. Each tip has a point or ball contact, contact diameter and depth, upper and lower diameter, connection length, trunk diameter, branch angle, and a foot. Cross-braces and a raft are optional. You can also click an underside, send supports only to the platform, or drop them on islands from the last slice.
+- Layer preview with a vertical bar on the right: step up or down one layer, drag the bar, or type a layer number. Islands are tinted, and a layer that seals a cavity is called out.
+- A very dense sculpt is drawn with a coarser plate mesh so triangles smaller than a pixel do not vanish. The slice still uses every triangle in the file.
 - Volume, weight, and a time estimate. Export `.pm3m` or one layer as PNG.
 - Settings persist between launches.
 
@@ -89,8 +91,7 @@ Output is Photon Workshop v516 with `pw0Img` run-length layers, 6480 × 3600 pix
 
 ## Not in this version
 
-- Tree supports. Braces are horizontal cylinders between columns.
-- 3MF, and mesh-boolean union. Overlapping solids are unioned in the raster with a non-zero winding fill.
+- 3MF, and mesh-boolean union. Overlapping solids are unioned in the raster.
 - Variable layer height, two-stage lift as its own mode, and printers other than the Photon M3 Max.
 - Live re-slice while you drag a model.
 
