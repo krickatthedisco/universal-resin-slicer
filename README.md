@@ -39,15 +39,15 @@ Amber is not affiliated with Anycubic or Elegoo. A resin row is copied from a ma
 
 - Import STL (binary or ASCII), OBJ, and 3MF. Drop files on the plate.
 - Printer list with search. Picking a printer sets the plate, the pixel size, and that machine's lift defaults. It does not invent an exposure.
-- Resin list with search. A dot means this printer has a published starting point. Elegoo rows are the 2023-12-11 official sheet (Mars, Saturn, and Jupiter, including color). Anycubic rows are the Photon M3 Max store guide from November 2023. Other bottles are named so you can find them, without a guessed cure time.
+- Resin list with search. It starts filtered to resins that have a published profile for the printer you picked; uncheck that to see the whole library. A dot means this printer has a published starting point. Elegoo rows are the 2023-12-11 official sheet (Mars, Saturn, and Jupiter, including color). Anycubic rows are the Photon M3 Max store guide from November 2023. Other bottles are named so you can find them, without a guessed cure time.
 - Several models, with move, rotate, scale, mirror, duplicate, delete, and undo.
 - Drop to the bed, center, put the largest face down, auto-orient one model or all of them, shelf-pack the plate, and fill the bed with copies. Repair flips an inside-out shell and welds duplicate corners. Models that hang off the plate are marked.
 - Hollow at slice time: wall thickness, top and bottom caps, and a grid or gyroid lattice. Drain holes are cylinders you click onto the surface.
 - XY offset, an elephant-foot inset on the bottom layers, and XY/Z shrink compensation. A price per litre shows a cost after the slice.
-- The prepare window follows the classic Chitubox layout: a top menu, a left tool rail (Select, Move, Rotate, Scale, Mirror, Hollow, Hole, Support), and a right panel that changes with the tool. Print settings stay in the panel under that name.
+- The prepare window follows the classic Chitubox layout: a top menu, a left tool rail (Select, Move, Rotate, Scale, Mirror, Hollow, Hole, Support), and a right panel that changes with the tool. Print settings stay in that panel and open with the printer and resin you are using.
 - Automatic tree supports (Light, Medium, Heavy). Nearby tips share a trunk. Each tip has a point or ball contact, contact diameter and depth, upper and lower diameter, connection length, trunk diameter, branch angle, and a foot. Cross-braces and a raft are optional. You can also click an underside, send supports only to the platform, or drop them on islands from the last slice.
 - Layer preview with a vertical bar on the right: step up or down one layer, drag the bar, or type a layer number. A new slice opens on the last layer. Islands are tinted, and a layer that seals a cavity is called out.
-- The plate draws every triangle and grows faces that would be smaller than a pixel, so a dense sculpt stays solid instead of looking full of holes.
+- The plate draws every triangle. A face thinner than a pixel is drawn as a short ribbon along its long edge, so feathers and fur stay solid instead of looking full of holes. Faces that already cover pixels only overlap their neighbors by a fraction of a pixel. Dragging right in the plate view turns the build plate to the right.
 - Volume, weight, and a time estimate. Export the native v516 file when the printer has one, or `.sl1` for every machine, or one layer as PNG.
 - Large meshes stay on the CPU path that only clips triangles crossing the current layer, and each scanline only tests the edges that cross it. Layers stay in order because islands and sealed pockets depend on the previous layer.
 - Settings persist between launches.

@@ -323,13 +323,14 @@ void main() {
 }
 "#;
 
-// A sculpt's faces are often smaller than one pixel, so the rasterizer
-// skips them and the surface looks full of holes. Grow each face just
-// enough to cover a pixel, and give every edge a fraction of a pixel of
-// overlap so shared borders don't leave a crack.
+// A sculpt's faces are often thinner than one pixel, so the rasterizer
+// skips them and feathers look full of holes. A long sliver has a large
+// radius, so growing it from the center does not make it wider. Thin faces
+// are drawn as a short ribbon. Faces that already cover pixels only gain a
+// fraction of a pixel so shared edges do not crack.
 const GEOM: &str = r#"
 layout(triangles) in;
-layout(triangle_strip, max_vertices = 3) out;
+layout(triangle_strip, max_vertices = 4) out;
 in vec3 v_nrm[];
 in vec3 v_col[];
 out vec3 g_nrm;
@@ -351,11 +352,55 @@ vec2 outward(vec2 d) {
     return len > 1e-4 ? d / len : vec2(1.0, 0.0);
 }
 
-void emit_vert(int i, vec4 clip) {
+void emit_at(int i, vec4 clip, vec2 screen) {
+    g_nrm = v_nrm[i];
+    g_col = v_col[i];
+    gl_Position = clip_from_screen(screen, clip);
+    EmitVertex();
+}
+
+void emit_raw(int i, vec4 clip) {
     g_nrm = v_nrm[i];
     g_col = v_col[i];
     gl_Position = clip;
     EmitVertex();
+}
+
+void emit_dot(vec2 center, vec4 clip) {
+    // A square covers the pixel under a face smaller than a pixel. An
+    // equilateral of the same radius leaves the corners of that pixel empty.
+    float h = 1.7;
+    emit_at(0, clip, center + vec2(-h, -h));
+    emit_at(0, clip, center + vec2( h, -h));
+    emit_at(0, clip, center + vec2(-h,  h));
+    emit_at(0, clip, center + vec2( h,  h));
+    EndPrimitive();
+}
+
+void emit_stroke(int ia, int ib, vec4 ca, vec4 cb, vec2 a, vec2 b, float span) {
+    vec2 dir = outward(b - a);
+    vec2 n = vec2(-dir.y, dir.x);
+    float ext = 1.0;
+    vec2 a2 = a - dir * ext;
+    vec2 b2 = b + dir * ext;
+    emit_at(ia, ca, a2 + n * span);
+    emit_at(ia, ca, a2 - n * span);
+    emit_at(ib, cb, b2 + n * span);
+    emit_at(ib, cb, b2 - n * span);
+    EndPrimitive();
+}
+
+vec2 push_corner(vec2 s, vec2 n0, vec2 n1) {
+    float pad = 0.9;
+    vec2 m = n0 + n1;
+    float ml = length(m);
+    if (ml < 1e-3) {
+        return s + n0 * pad;
+    }
+    m /= ml;
+    float denom = abs(dot(m, n0));
+    float mag = min(pad / max(denom, 0.35), pad * 3.0);
+    return s + m * mag;
 }
 
 void main() {
@@ -365,40 +410,48 @@ void main() {
     // A vertex behind the camera has a nonsense screen position. Let the
     // clipper handle that triangle instead of exploding it.
     if (c0.w <= 1e-4 || c1.w <= 1e-4 || c2.w <= 1e-4) {
-        emit_vert(0, c0);
-        emit_vert(1, c1);
-        emit_vert(2, c2);
+        emit_raw(0, c0);
+        emit_raw(1, c1);
+        emit_raw(2, c2);
         EndPrimitive();
-        return;
-    }
-    vec2 s0 = screen_of(c0);
-    vec2 s1 = screen_of(c1);
-    vec2 s2 = screen_of(c2);
-    vec2 center = (s0 + s1 + s2) / 3.0;
-    vec2 d0 = s0 - center;
-    vec2 d1 = s1 - center;
-    vec2 d2 = s2 - center;
-    float r = max(length(d0), max(length(d1), length(d2)));
-    // Inradius of an equilateral triangle is half the vertex radius. 1.6 px
-    // of vertex radius keeps a pixel center inside even when the face sits
-    // between pixels. The extra outward step closes cracks on thin faces.
-    vec2 n0;
-    vec2 n1;
-    vec2 n2;
-    if (r < 0.05) {
-        n0 = center + vec2(1.7, 0.0);
-        n1 = center + vec2(-0.85, 1.47);
-        n2 = center + vec2(-0.85, -1.47);
     } else {
-        float scale = min(max(r, 1.6) / r, 32.0);
-        n0 = center + d0 * scale + outward(d0) * 0.85;
-        n1 = center + d1 * scale + outward(d1) * 0.85;
-        n2 = center + d2 * scale + outward(d2) * 0.85;
+        vec2 s0 = screen_of(c0);
+        vec2 s1 = screen_of(c1);
+        vec2 s2 = screen_of(c2);
+        vec2 e01 = s1 - s0;
+        vec2 e12 = s2 - s1;
+        vec2 e20 = s0 - s2;
+        float l01 = length(e01);
+        float l12 = length(e12);
+        float l20 = length(e20);
+        float longest = max(l01, max(l12, l20));
+        float crossz = e01.x * (s2.y - s0.y) - e01.y * (s2.x - s0.x);
+        float alt = abs(crossz) / max(longest, 1e-4);
+        // Half the ribbon has to reach the third vertex, or the tip of a
+        // skinny face is still a hole. Faces already a few pixels tall keep
+        // their real outline and only overlap their neighbors a little.
+        float halfw = max(1.85, alt + 0.55);
+        if (longest < 1.2) {
+            emit_dot((s0 + s1 + s2) / 3.0, c0);
+        } else if (alt < 2.4) {
+            if (l01 >= l12 && l01 >= l20) {
+                emit_stroke(0, 1, c0, c1, s0, s1, halfw);
+            } else if (l12 >= l20) {
+                emit_stroke(1, 2, c1, c2, s1, s2, halfw);
+            } else {
+                emit_stroke(2, 0, c2, c0, s2, s0, halfw);
+            }
+        } else {
+            float wind = crossz < 0.0 ? -1.0 : 1.0;
+            vec2 n01 = outward(vec2(e01.y, -e01.x) * wind);
+            vec2 n12 = outward(vec2(e12.y, -e12.x) * wind);
+            vec2 n20 = outward(vec2(e20.y, -e20.x) * wind);
+            emit_at(0, c0, push_corner(s0, n20, n01));
+            emit_at(1, c1, push_corner(s1, n01, n12));
+            emit_at(2, c2, push_corner(s2, n12, n20));
+            EndPrimitive();
+        }
     }
-    emit_vert(0, clip_from_screen(n0, c0));
-    emit_vert(1, clip_from_screen(n1, c1));
-    emit_vert(2, clip_from_screen(n2, c2));
-    EndPrimitive();
 }
 "#;
 

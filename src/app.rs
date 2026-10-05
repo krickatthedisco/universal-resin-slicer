@@ -50,6 +50,10 @@ fn default_machine_id() -> String {
     "anycubic-photon-m3-max".into()
 }
 
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Serialize, Deserialize)]
 struct Persist {
     settings: PrintSettings,
@@ -64,6 +68,10 @@ struct Persist {
     platform_only: bool,
     #[serde(default = "default_machine_id")]
     machine_id: String,
+    /// Hide resins that have no published time for the selected printer.
+    /// Missing on older saves, so those installs start filtered.
+    #[serde(default = "default_true")]
+    only_profiled: bool,
 }
 
 pub struct AmberApp {
@@ -89,6 +97,7 @@ pub struct AmberApp {
     printer_filter: String,
     resin_filter: String,
     profile_note: String,
+    only_profiled: bool,
 }
 
 impl AmberApp {
@@ -100,6 +109,7 @@ impl AmberApp {
         let mut raft = true;
         let mut saved_style = None;
         let mut platform_only = false;
+        let mut only_profiled = true;
         if let Some(storage) = cc.storage {
             if let Some(raw) = storage.get_string("amber.print") {
                 if let Ok(saved) = serde_json::from_str::<Persist>(&raw) {
@@ -114,6 +124,7 @@ impl AmberApp {
                     raft = saved.raft;
                     saved_style = saved.style;
                     platform_only = saved.platform_only;
+                    only_profiled = saved.only_profiled;
                 }
             }
         }
@@ -169,6 +180,7 @@ impl AmberApp {
             printer_filter: String::new(),
             resin_filter: String::new(),
             profile_note: String::new(),
+            only_profiled,
         }
     }
 
@@ -464,6 +476,7 @@ impl eframe::App for AmberApp {
             style: Some(self.doc.style),
             platform_only: self.doc.platform_only,
             machine_id: self.machine.id.to_string(),
+            only_profiled: self.only_profiled,
         };
         if let Ok(raw) = serde_json::to_string(&saved) {
             storage.set_string("amber.print", raw);
@@ -515,7 +528,7 @@ impl AmberApp {
     fn menu(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.menu_button("File", |ui| {
-                if ui.button("Open STL or OBJ…").clicked() {
+                if ui.button("Open STL, OBJ, or 3MF…").clicked() {
                     self.open_dialog();
                     ui.close();
                 }
@@ -644,7 +657,7 @@ impl AmberApp {
             (
                 Tool::Select,
                 "Select",
-                "Click a model. Right-drag orbits. Shift-drag or middle-drag pans.",
+                "Click a model. Right-drag orbits: drag right to turn the plate right. Shift-drag or middle-drag pans.",
             ),
             (
                 Tool::Move,
@@ -711,9 +724,12 @@ impl AmberApp {
 
     fn model_list(&mut self, ui: &mut egui::Ui) {
         ui.heading("Models");
-        ui.label("Photon M3 Max  ·  298 × 166 × 300 mm");
+        ui.label(format!(
+            "{}  ·  {:.0} × {:.0} × {:.0} mm",
+            self.machine.name, self.machine.size_x, self.machine.size_y, self.machine.size_z
+        ));
         if self.doc.objects.is_empty() {
-            ui.label("Open an STL or OBJ, or drop it on the plate.");
+            ui.label("Open an STL, OBJ, or 3MF, or drop it on the plate.");
         }
         let mut select = None;
         for obj in &self.doc.objects {
@@ -747,7 +763,9 @@ impl AmberApp {
                 Tool::Support => self.support_ui(ui),
             }
             ui.separator();
-            ui.collapsing("Print settings", |ui| self.slice_ui(ui));
+            egui::CollapsingHeader::new("Print settings")
+                .default_open(true)
+                .show(ui, |ui| self.slice_ui(ui));
         });
     }
 
@@ -1288,7 +1306,7 @@ impl AmberApp {
 
     fn slice_ui(&mut self, ui: &mut egui::Ui) {
         ui.heading("Slice");
-        ui.label("A published table fills the times when this printer and resin have one. Otherwise the times stay put and you should run a RERF. Amber does not invent a cure time.");
+        ui.label("Times are filled from a published table for this printer. With no row, they stay as they are — run a RERF.");
         let px = if (self.machine.pixel_um - self.machine.pixel_um_y).abs() < 0.05 {
             format!("{:.0} µm", self.machine.pixel_um)
         } else {
@@ -1317,8 +1335,12 @@ impl AmberApp {
                 self.machine.printer_extension, self.machine.format_name
             ));
         }
-        ui.label("Printer");
-        ui.text_edit_singleline(&mut self.printer_filter);
+        ui.strong("Printer");
+        ui.add(
+            egui::TextEdit::singleline(&mut self.printer_filter)
+                .hint_text("Search printers")
+                .desired_width(f32::INFINITY),
+        );
         let machine_id = self.machine.id;
         let filter = self.printer_filter.to_ascii_lowercase();
         let mut pick_printer: Option<&'static str> = None;
@@ -1342,9 +1364,19 @@ impl AmberApp {
                     }
                 }
             });
-        ui.label("Resin");
-        ui.text_edit_singleline(&mut self.resin_filter);
+        ui.strong("Resin");
+        ui.checkbox(
+            &mut self.only_profiled,
+            "Only resins with settings for this printer",
+        )
+        .on_hover_text("Hides bottles that have no published time for the printer above. Uncheck it to browse the whole library.");
+        ui.add(
+            egui::TextEdit::singleline(&mut self.resin_filter)
+                .hint_text("Search resins")
+                .desired_width(f32::INFINITY),
+        );
         let resin_filter = self.resin_filter.to_ascii_lowercase();
+        let only_profiled = self.only_profiled;
         let mut with_profile = std::collections::HashSet::new();
         for profile in resins::PROFILES.iter().chain(community::PROFILES.iter()) {
             if profile.machine_id == machine_id {
@@ -1354,6 +1386,9 @@ impl AmberApp {
         let current_resin = self.settings.resin.clone();
         let mut listed: Vec<&Resin> = resin_catalog()
             .filter(|resin| {
+                if only_profiled && !with_profile.contains(resin.id) {
+                    return false;
+                }
                 if resin_filter.is_empty() {
                     return true;
                 }
@@ -1373,9 +1408,26 @@ impl AmberApp {
             .iter()
             .filter(|r| with_profile.contains(r.id))
             .count();
-        ui.label(format!(
-            "{shown} resins · {matched} with a published profile on this printer"
-        ));
+        if only_profiled {
+            ui.label(format!("{shown} with a published profile on this printer"));
+        } else {
+            ui.label(format!(
+                "{shown} resins · {matched} with a published profile on this printer"
+            ));
+        }
+        if shown == 0 {
+            ui.colored_label(
+                egui::Color32::from_rgb(214, 154, 62),
+                "Nothing published for this printer. Uncheck the filter to pick a resin by name, then run a RERF.",
+            );
+        } else if only_profiled
+            && !current_resin.is_empty()
+            && !listed.iter().any(|r| r.name == current_resin)
+        {
+            ui.label(format!(
+                "Current resin “{current_resin}” has no profile here, so it is hidden."
+            ));
+        }
         let mut pick_resin: Option<&'static str> = None;
         egui::ScrollArea::vertical()
             .id_salt("resins")
@@ -1396,8 +1448,18 @@ impl AmberApp {
                     }
                 }
             });
-        if !self.profile_note.is_empty() {
-            ui.label(self.profile_note.as_str());
+        if self.profile_note.starts_with("No published") {
+            ui.colored_label(
+                egui::Color32::from_rgb(214, 154, 62),
+                self.profile_note.as_str(),
+            );
+        } else if !self.profile_note.is_empty() {
+            egui::CollapsingHeader::new("Where these times come from")
+                .default_open(false)
+                .id_salt("profile-source")
+                .show(ui, |ui| {
+                    ui.add(egui::Label::new(self.profile_note.as_str()).wrap());
+                });
         }
         if let Some(id) = pick_printer {
             self.select_printer(id);
@@ -1545,7 +1607,9 @@ impl AmberApp {
             || (response.dragged_by(egui::PointerButton::Primary) && self.tool == Tool::Select)
         {
             let d = response.drag_delta();
-            self.camera.yaw += d.x * 0.4;
+            // Dragging right turns the plate to the right, the same way a
+            // grabbed model moves in Chitubox.
+            self.camera.yaw -= d.x * 0.4;
             self.camera.pitch = (self.camera.pitch + d.y * 0.3).clamp(4.0, 89.0);
         }
         if response.dragged_by(egui::PointerButton::Middle)
