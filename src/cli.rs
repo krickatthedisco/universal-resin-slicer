@@ -2,9 +2,11 @@
 //! and for the test printer workflow:
 //! `amber slice model.stl -o model.pm3m`
 
+use crate::catalog;
 use crate::pm3m::write_pm3m;
 use crate::printer::{Machine, PrintSettings};
 use crate::scene::Document;
+use crate::sl1::write_sl1;
 use crate::slice::{slice, Request};
 use crate::supports;
 use anyhow::{bail, Context, Result};
@@ -17,6 +19,7 @@ pub fn run(args: &[String]) -> Result<()> {
     let mut exposure: Option<f32> = None;
     let mut supports_name = "none".to_string();
     let mut hollow = 0.0f32;
+    let mut printer_id = "anycubic-photon-m3-max".to_string();
     let mut i = 0;
     while i < args.len() {
         let arg = &args[i];
@@ -32,6 +35,7 @@ pub fn run(args: &[String]) -> Result<()> {
             "--exposure" => exposure = Some(next()?.parse().context("--exposure")?),
             "--supports" => supports_name = next()?,
             "--hollow" => hollow = next()?.parse().context("--hollow")?,
+            "--printer" => printer_id = next()?,
             "-h" | "--help" => {
                 print_help();
                 return Ok(());
@@ -45,7 +49,10 @@ pub fn run(args: &[String]) -> Result<()> {
     }
     let input = input.context("usage: amber slice model.stl -o model.pm3m")?;
     let output = output.unwrap_or_else(|| input.with_extension("pm3m"));
-    let machine = Machine::photon_m3_max();
+    let profile = catalog::find(&printer_id).with_context(|| {
+        format!("unknown printer {printer_id}. See the printer list in the window.")
+    })?;
+    let machine = Machine::from_profile(profile);
     let mut doc = Document::new();
     let id = doc.import(&input)?;
     doc.center_on_plate(id, machine.size_x, machine.size_y);
@@ -61,7 +68,10 @@ pub fn run(args: &[String]) -> Result<()> {
             "light" => 0,
             "medium" => 1,
             "heavy" => 2,
-            other => bail!("--supports expected none, light, medium, or heavy, got {other}"),
+            "hairpin" => 3,
+            other => {
+                bail!("--supports expected none, light, medium, heavy, or hairpin, got {other}")
+            }
         };
         doc.set_preset(index);
         doc.add_auto_supports(true);
@@ -82,7 +92,21 @@ pub fn run(args: &[String]) -> Result<()> {
         progress: None,
     })
     .map_err(|e| anyhow::anyhow!(e))?;
-    write_pm3m(&output, &sliced, machine, &settings)?;
+    let want_sl1 = output
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("sl1"));
+    if machine.native_photon && !want_sl1 {
+        write_pm3m(&output, &sliced, machine, &settings)?;
+    } else {
+        write_sl1(&output, &sliced, machine, &settings)?;
+        if !want_sl1 {
+            println!(
+                "{} reads .{}, which Amber does not encode. Wrote an .sl1 zip to this path instead.",
+                machine.name, machine.printer_extension
+            );
+        }
+    }
     println!(
         "wrote {}  {} layers  {:.2} ml  {} min  {} supports",
         output.display(),
@@ -101,6 +125,6 @@ pub fn run(args: &[String]) -> Result<()> {
 
 fn print_help() {
     println!(
-        "amber slice <model.stl|obj> -o <file.pm3m> [--layer 0.05] [--exposure 3] [--supports light|medium|heavy] [--hollow 2.0]"
+        "amber slice <model.stl|obj|3mf> -o <file> [--printer anycubic-photon-m3-max] [--layer 0.05] [--exposure 3] [--supports light|medium|heavy|hairpin] [--hollow 2.0]"
     );
 }

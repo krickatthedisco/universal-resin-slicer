@@ -6,6 +6,7 @@
 //! the Photon exposes layer 0 on the plate and then steps by the layer height.
 
 use crate::printer::{layer_motion, move_seconds, Machine, PrintSettings};
+use rayon::prelude::*;
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
@@ -24,6 +25,7 @@ pub struct Hollow {
     pub top_cap_mm: f32,
     pub infill_spacing_mm: f32,
     pub infill_thickness_mm: f32,
+    pub gyroid: bool,
     pub z_min: f32,
     pub z_max: f32,
 }
@@ -72,6 +74,10 @@ pub struct Slice {
     pub warnings: Vec<String>,
     /// 224×168 silhouette, row-major gray.
     pub thumbnail: Vec<u8>,
+    /// Interior air summed over the slice, in millilitres.
+    pub cavity_ml: f32,
+    /// Layers that closed over an interior pocket.
+    pub sealed_layers: u32,
 }
 
 pub struct Request<'a> {
@@ -154,12 +160,14 @@ pub fn slice(req: Request<'_>) -> Result<Slice, String> {
     let settings = req.settings.sanitized();
     let machine = req.machine;
     let h = settings.layer_mm;
-    if req.solids.is_empty() {
+    let scaled = shrink_solids(req.solids, &settings);
+    let solids: &[Solid] = scaled.as_deref().unwrap_or(req.solids);
+    if solids.is_empty() {
         return Err("Nothing on the plate to slice.".into());
     }
     let mut max_z = 0.0f32;
     let mut min_z = f32::MAX;
-    for solid in req.solids {
+    for solid in solids {
         for v in &solid.vertices {
             max_z = max_z.max(v[2]);
             min_z = min_z.min(v[2]);
@@ -171,13 +179,13 @@ pub fn slice(req: Request<'_>) -> Result<Slice, String> {
     let mut warnings = Vec::new();
     if max_z > machine.size_z + 0.05 {
         warnings.push(format!(
-            "The scene is {max_z:.1} mm tall and the Photon M3 Max stops at {:.0} mm. The slice is clipped.",
-            machine.size_z
+            "The scene is {max_z:.1} mm tall and {} stops at {:.0} mm. The slice is clipped.",
+            machine.name, machine.size_z
         ));
         max_z = machine.size_z;
     }
     let mut outside = false;
-    for solid in req.solids {
+    for solid in solids {
         for v in &solid.vertices {
             if v[0] < -0.05
                 || v[1] < -0.05
@@ -190,18 +198,22 @@ pub fn slice(req: Request<'_>) -> Result<Slice, String> {
         }
     }
     if outside {
-        warnings.push(
-            "Part of a model hangs off the 298.08 × 165.6 mm plate. Those pixels are clipped."
-                .into(),
-        );
+        warnings.push(format!(
+            "Part of a model hangs off the {:.2} × {:.2} mm plate. Those pixels are clipped.",
+            machine.size_x, machine.size_y
+        ));
     }
 
     let layer_count = ((max_z / h).ceil() as u32).max(1);
+    // Each solid keeps the triangles that can still cross the plane. A tall
+    // mesh then only clips the band around the current layer.
+    let mut sweeps: Vec<Sweep> = solids.iter().map(Sweep::build).collect();
     let mut layers = Vec::with_capacity(layer_count as usize);
     let mut prev_solid = Bits::new(machine.res_x as usize, machine.res_y as usize);
     let mut prev_enclosed: Vec<(i32, i32, u32)> = Vec::new();
     let mut thumb = vec![0u8; 224 * 168];
-    let px = machine.pixel_mm();
+    let mut cavity_px_layers = 0.0f64;
+    let mut sealed_layers = 0u32;
 
     let mut last_solid = 0u32;
     let mut raw: Vec<Option<Layer>> = Vec::with_capacity(layer_count as usize);
@@ -216,16 +228,22 @@ pub fn slice(req: Request<'_>) -> Result<Slice, String> {
         }
         let z = (index as f32 + 0.5) * h;
         let mut image = Image::empty();
-        for solid in req.solids {
-            let mut part = raster_solid(solid, z, machine, settings.anti_alias);
+        for (solid, sweep) in solids.iter().zip(sweeps.iter_mut()) {
+            let active = sweep.activate(z);
+            let mut part = raster_solid(solid, z, machine, settings.anti_alias, active);
             if let Some(hollow) = solid.hollow {
                 let cap = z <= hollow.z_min + hollow.bottom_cap_mm
                     || z >= hollow.z_max - hollow.top_cap_mm;
-                apply_shell(&mut part, hollow, machine, cap);
+                apply_shell(&mut part, hollow, machine, cap, z);
             }
             blit_max(&mut image, &part);
         }
-        // Supports and other non-hollow solids are already in `solids`.
+        // Grow or shrink the cured shape, then punch drains so the hole
+        // stays the diameter you asked for.
+        offset_image(&mut image, settings.xy_offset_mm, machine);
+        if index < settings.bottom_layers {
+            offset_image(&mut image, -settings.elephant_foot_mm, machine);
+        }
         apply_drains(&mut image, req.drains, z, machine);
         let (exposure, lift, lift_speed, retract) = layer_motion(&settings, index);
         let _ = retract;
@@ -241,7 +259,11 @@ pub fn slice(req: Request<'_>) -> Result<Slice, String> {
                     seals += *area;
                 }
             }
+            if seals > 0 {
+                sealed_layers += 1;
+            }
             prev_enclosed = enclosed_centroids(&image);
+            cavity_px_layers += prev_enclosed.iter().map(|p| p.2 as f64).sum::<f64>();
             paint_bits(&mut prev_solid, &image);
             splat_thumb(&mut thumb, &image, machine);
         } else if index > 0 {
@@ -280,7 +302,7 @@ pub fn slice(req: Request<'_>) -> Result<Slice, String> {
         return Err("The slice produced no exposed pixels. The mesh may be below the bed or inside out. Try Flip normals.".into());
     }
 
-    let pixel_area = (px as f64) * (px as f64);
+    let pixel_area = (machine.pixel_mm() as f64) * (machine.pixel_mm_y() as f64);
     let mut cured_mm3 = 0.0f64;
     let mut seconds = 0.0f32;
     for layer in &layers {
@@ -289,6 +311,12 @@ pub fn slice(req: Request<'_>) -> Result<Slice, String> {
         seconds += layer.exposure_s + move_seconds(lift, lift_speed, retract, settings.light_off_s);
     }
     let cured_ml = (cured_mm3 / 1000.0) as f32;
+    let cavity_ml = (cavity_px_layers * pixel_area * h as f64 / 1000.0) as f32;
+    if sealed_layers > 0 {
+        warnings.push(format!(
+            "{sealed_layers} layers seal an interior pocket ({cavity_ml:.2} ml of air in the slice). Add a drain at the bottom of a cup or it can suction onto the film."
+        ));
+    }
     Ok(Slice {
         width: machine.res_x,
         height: machine.res_y,
@@ -298,26 +326,101 @@ pub fn slice(req: Request<'_>) -> Result<Slice, String> {
         seconds: seconds.round() as u32,
         warnings,
         thumbnail: thumb,
+        cavity_ml,
+        sealed_layers,
     })
 }
 
-fn raster_solid(solid: &Solid, z: f32, machine: Machine, aa: u8) -> Image {
-    let mut segs: Vec<([f32; 2], [f32; 2])> = Vec::new();
-    let verts = &solid.vertices;
-    for tri in solid.indices.chunks_exact(3) {
-        let a = verts[tri[0] as usize];
-        let b = verts[tri[1] as usize];
-        let c = verts[tri[2] as usize];
-        if let Some(seg) = clip_triangle(a, b, c, z) {
-            let p0 = to_px(seg.0, machine);
-            let p1 = to_px(seg.1, machine);
-            if (p0[0] - p1[0]).abs() + (p0[1] - p1[1]).abs() > 1e-5 {
-                segs.push((snap_px(p0), snap_px(p1)));
+/// Triangles sorted by the lowest vertex so a layer can skip the rest of a tall mesh.
+struct Sweep {
+    zmin: Vec<f32>,
+    zmax: Vec<f32>,
+    order: Vec<u32>,
+    cursor: usize,
+    active: Vec<u32>,
+}
+
+impl Sweep {
+    fn build(solid: &Solid) -> Self {
+        let n = solid.indices.len() / 3;
+        let mut zmin = Vec::with_capacity(n);
+        let mut zmax = Vec::with_capacity(n);
+        let verts = &solid.vertices;
+        for tri in solid.indices.chunks_exact(3) {
+            let z_of = |i: u32| verts.get(i as usize).map(|v| v[2]).unwrap_or(f32::NAN);
+            let z0 = z_of(tri[0]);
+            let z1 = z_of(tri[1]);
+            let z2 = z_of(tri[2]);
+            if z0.is_finite() && z1.is_finite() && z2.is_finite() {
+                zmin.push(z0.min(z1).min(z2));
+                zmax.push(z0.max(z1).max(z2));
+            } else {
+                zmin.push(f32::INFINITY);
+                zmax.push(f32::NEG_INFINITY);
             }
         }
+        let mut order: Vec<u32> = (0..n as u32).collect();
+        order.sort_by(|&a, &b| zmin[a as usize].total_cmp(&zmin[b as usize]));
+        Self {
+            zmin,
+            zmax,
+            order,
+            cursor: 0,
+            active: Vec::new(),
+        }
     }
+
+    /// Triangles with a vertex below `z` and a vertex on or above it.
+    /// That is the same test `clip_triangle` uses (`z` counts as above).
+    fn activate(&mut self, z: f32) -> &[u32] {
+        while self.cursor < self.order.len() {
+            let i = self.order[self.cursor] as usize;
+            if self.zmin[i] >= z {
+                break;
+            }
+            if self.zmax[i] >= z {
+                self.active.push(self.order[self.cursor]);
+            }
+            self.cursor += 1;
+        }
+        let zmax = &self.zmax;
+        self.active.retain(|&i| zmax[i as usize] >= z);
+        &self.active
+    }
+}
+
+fn raster_solid(solid: &Solid, z: f32, machine: Machine, aa: u8, tris: &[u32]) -> Image {
+    let mut segs = clip_tris(solid, z, machine, tris);
     stitch_open_ends(&mut segs);
     fill_segments(&segs, machine, aa)
+}
+
+fn clip_tris(solid: &Solid, z: f32, machine: Machine, tris: &[u32]) -> Vec<([f32; 2], [f32; 2])> {
+    let verts = &solid.vertices;
+    let indices = &solid.indices;
+    let one = |ti: u32| -> Option<([f32; 2], [f32; 2])> {
+        let base = ti as usize * 3;
+        if base + 2 >= indices.len() {
+            return None;
+        }
+        let a = *verts.get(indices[base] as usize)?;
+        let b = *verts.get(indices[base + 1] as usize)?;
+        let c = *verts.get(indices[base + 2] as usize)?;
+        let seg = clip_triangle(a, b, c, z)?;
+        let p0 = snap_px(to_px(seg.0, machine));
+        let p1 = snap_px(to_px(seg.1, machine));
+        if (p0[0] - p1[0]).abs() + (p0[1] - p1[1]).abs() > 1e-5 {
+            Some((p0, p1))
+        } else {
+            None
+        }
+    };
+    // Order is preserved so a cracked contour still stitches the same way.
+    if tris.len() >= 4096 {
+        tris.par_iter().copied().filter_map(one).collect()
+    } else {
+        tris.iter().copied().filter_map(one).collect()
+    }
 }
 
 fn snap_px(p: [f32; 2]) -> [f32; 2] {
@@ -416,7 +519,7 @@ fn to_px(p: [f32; 2], machine: Machine) -> [f32; 2] {
     let w = machine.res_x as f32;
     let h = machine.res_y as f32;
     let mut x = p[0] / machine.pixel_mm();
-    let mut y = p[1] / machine.pixel_mm();
+    let mut y = p[1] / machine.pixel_mm_y();
     if machine.mirror_x {
         x = w - x;
     }
@@ -445,7 +548,7 @@ fn from_px(x: f32, y: f32, machine: Machine) -> [f32; 2] {
     if machine.mirror_y {
         py = h - py;
     }
-    [px * machine.pixel_mm(), py * machine.pixel_mm()]
+    [px * machine.pixel_mm(), py * machine.pixel_mm_y()]
 }
 
 /// Intersection of a triangle with a horizontal plane.
@@ -513,17 +616,70 @@ fn fill_segments(segs: &[([f32; 2], [f32; 2])], machine: Machine, aa: u8) -> Ima
         8 => 8,
         _ => 1,
     };
+    // Active edges. A row only tests segments that cross it, which is the
+    // same half-open rule as walking every segment: y in [min(y), max(y)).
+    #[derive(Clone, Copy)]
+    struct Edge {
+        ax: f32,
+        ay: f32,
+        bx: f32,
+        by: f32,
+        y_lo: f32,
+        y_hi: f32,
+    }
+    let y0f = y0 as f32;
+    let mut buckets: Vec<Vec<Edge>> = vec![Vec::new(); height as usize];
+    for (a, b) in segs {
+        let y_lo = a[1].min(b[1]);
+        let y_hi = a[1].max(b[1]);
+        if y_hi - y_lo < 1e-8 {
+            continue;
+        }
+        let mut row = ((y_lo - y0f - 0.5).ceil() as i32).max(0);
+        if row >= height {
+            continue;
+        }
+        let y_here = y0f + row as f32 + 0.5;
+        if y_here < y_lo {
+            row += 1;
+        }
+        if row >= height {
+            continue;
+        }
+        let y_here = y0f + row as f32 + 0.5;
+        if y_here >= y_hi {
+            continue;
+        }
+        buckets[row as usize].push(Edge {
+            ax: a[0],
+            ay: a[1],
+            bx: b[0],
+            by: b[1],
+            y_lo,
+            y_hi,
+        });
+    }
+    let mut active: Vec<Edge> = Vec::new();
     for row in 0..height {
-        let y = y0 as f32 + row as f32 + 0.5;
-        let mut hits: Vec<(f32, i32)> = Vec::new();
-        for (a, b) in segs {
-            let (y0e, y1e) = (a[1], b[1]);
-            if (y0e <= y && y1e > y) || (y1e <= y && y0e > y) {
-                let t = (y - y0e) / (y1e - y0e);
-                let x = a[0] + t * (b[0] - a[0]);
-                let dir = if y1e > y0e { 1 } else { -1 };
-                hits.push((x, dir));
+        let y = y0f + row as f32 + 0.5;
+        active.retain(|e| y >= e.y_lo && y < e.y_hi);
+        for edge in &buckets[row as usize] {
+            if y >= edge.y_lo && y < edge.y_hi {
+                active.push(*edge);
             }
+        }
+        if active.is_empty() {
+            continue;
+        }
+        let mut hits: Vec<(f32, i32)> = Vec::with_capacity(active.len());
+        for edge in &active {
+            let denom = edge.by - edge.ay;
+            if denom.abs() < 1e-12 {
+                continue;
+            }
+            let t = (y - edge.ay) / denom;
+            let x = edge.ax + t * (edge.bx - edge.ax);
+            hits.push((x, 0));
         }
         if hits.is_empty() {
             continue;
@@ -700,7 +856,201 @@ fn blit_max(dst: &mut Image, src: &Image) {
     };
 }
 
-fn apply_shell(img: &mut Image, hollow: Hollow, machine: Machine, cap: bool) {
+fn shrink_solids(solids: &[Solid], settings: &PrintSettings) -> Option<Vec<Solid>> {
+    let xy = settings.shrink_xy_pct;
+    let z = settings.shrink_z_pct;
+    if xy.abs() < 0.01 && z.abs() < 0.01 {
+        return None;
+    }
+    let sx = 1.0 / (1.0 - xy / 100.0);
+    let sz = 1.0 / (1.0 - z / 100.0);
+    let mut n = 0.0f32;
+    let mut cx = 0.0f32;
+    let mut cy = 0.0f32;
+    for solid in solids {
+        for v in &solid.vertices {
+            cx += v[0];
+            cy += v[1];
+            n += 1.0;
+        }
+    }
+    if n < 1.0 {
+        return None;
+    }
+    cx /= n;
+    cy /= n;
+    Some(
+        solids
+            .iter()
+            .map(|solid| {
+                let vertices = solid
+                    .vertices
+                    .iter()
+                    .map(|v| [cx + (v[0] - cx) * sx, cy + (v[1] - cy) * sx, v[2] * sz])
+                    .collect();
+                let mut hollow = solid.hollow;
+                if let Some(h) = hollow.as_mut() {
+                    h.z_min *= sz;
+                    h.z_max *= sz;
+                }
+                Solid {
+                    vertices,
+                    indices: solid.indices.clone(),
+                    hollow,
+                }
+            })
+            .collect(),
+    )
+}
+
+fn gyroid_wall(x: f32, y: f32, z: f32, spacing: f32, thickness: f32) -> bool {
+    let period = spacing.max(0.4);
+    let freq = std::f32::consts::TAU / period;
+    let g = (freq * x).sin() * (freq * y).cos()
+        + (freq * y).sin() * (freq * z).cos()
+        + (freq * z).sin() * (freq * x).cos();
+    let band = (thickness / period * 3.0).clamp(0.08, 1.2);
+    g.abs() < band
+}
+
+fn offset_image(img: &mut Image, delta_mm: f32, machine: Machine) {
+    if img.width == 0 || delta_mm.abs() < 0.001 {
+        return;
+    }
+    let px = (machine.pixel_mm() + machine.pixel_mm_y()) * 0.5;
+    let radius = delta_mm.abs() / px.max(1e-4);
+    let limit = (radius * 3.0).round().max(1.0) as u32;
+    if delta_mm > 0.0 {
+        dilate_image(
+            img,
+            radius.ceil() as i32 + 1,
+            limit,
+            machine.res_x as i32,
+            machine.res_y as i32,
+        );
+    } else {
+        erode_image(img, limit);
+    }
+}
+
+fn dilate_image(img: &mut Image, pad: i32, limit: u32, plate_w: i32, plate_h: i32) {
+    let pad = pad.max(1);
+    let x0 = (img.x0 - pad).clamp(0, plate_w);
+    let y0 = (img.y0 - pad).clamp(0, plate_h);
+    let x1 = (img.x0 + img.width + pad).clamp(0, plate_w);
+    let y1 = (img.y0 + img.height + pad).clamp(0, plate_h);
+    let w = (x1 - x0) as usize;
+    let h = (y1 - y0) as usize;
+    if w == 0 || h == 0 {
+        return;
+    }
+    const INF: u32 = 1_000_000;
+    let mut dist = vec![INF; w * h];
+    let mut gray = vec![0u8; w * h];
+    for y in 0..img.height {
+        for x in 0..img.width {
+            let v = img.pixels[(y * img.width + x) as usize];
+            if v == 0 {
+                continue;
+            }
+            let nx = (img.x0 + x - x0) as usize;
+            let ny = (img.y0 + y - y0) as usize;
+            let i = ny * w + nx;
+            dist[i] = 0;
+            gray[i] = v;
+        }
+    }
+    chamfer(&mut dist, w, h);
+    let mut pixels = vec![0u8; w * h];
+    for i in 0..w * h {
+        if dist[i] == 0 {
+            pixels[i] = gray[i];
+        } else if dist[i] <= limit {
+            pixels[i] = 255;
+        }
+    }
+    *img = Image {
+        x0,
+        y0,
+        width: w as i32,
+        height: h as i32,
+        pixels,
+    };
+}
+
+fn erode_image(img: &mut Image, limit: u32) {
+    let w = img.width as usize;
+    let h = img.height as usize;
+    if w == 0 || h == 0 {
+        return;
+    }
+    const INF: u32 = 1_000_000;
+    let mut dist = vec![0u32; w * h];
+    for i in 0..w * h {
+        if img.pixels[i] > 0 {
+            dist[i] = INF;
+        }
+    }
+    chamfer(&mut dist, w, h);
+    for i in 0..w * h {
+        if dist[i] <= limit {
+            img.pixels[i] = 0;
+        }
+    }
+}
+
+/// Chamfer distance. Orthogonal steps cost 3, diagonals cost 4.
+fn chamfer(dist: &mut [u32], w: usize, h: usize) {
+    if w == 0 || h == 0 {
+        return;
+    }
+    for y in 0..h {
+        for x in 0..w {
+            let i = y * w + x;
+            if dist[i] == 0 {
+                continue;
+            }
+            let mut d = dist[i];
+            if x > 0 {
+                d = d.min(dist[i - 1].saturating_add(3));
+            }
+            if y > 0 {
+                d = d.min(dist[i - w].saturating_add(3));
+            }
+            if x > 0 && y > 0 {
+                d = d.min(dist[i - w - 1].saturating_add(4));
+            }
+            if x + 1 < w && y > 0 {
+                d = d.min(dist[i - w + 1].saturating_add(4));
+            }
+            dist[i] = d;
+        }
+    }
+    for y in (0..h).rev() {
+        for x in (0..w).rev() {
+            let i = y * w + x;
+            if dist[i] == 0 {
+                continue;
+            }
+            let mut d = dist[i];
+            if x + 1 < w {
+                d = d.min(dist[i + 1].saturating_add(3));
+            }
+            if y + 1 < h {
+                d = d.min(dist[i + w].saturating_add(3));
+            }
+            if x + 1 < w && y + 1 < h {
+                d = d.min(dist[i + w + 1].saturating_add(4));
+            }
+            if x > 0 && y + 1 < h {
+                d = d.min(dist[i + w - 1].saturating_add(4));
+            }
+            dist[i] = d;
+        }
+    }
+}
+
+fn apply_shell(img: &mut Image, hollow: Hollow, machine: Machine, cap: bool, z: f32) {
     if img.width == 0 || cap || hollow.wall_mm <= 0.0 {
         return;
     }
@@ -780,7 +1130,20 @@ fn apply_shell(img: &mut Image, hollow: Hollow, machine: Machine, cap: bool) {
             if dist[i] <= threshold {
                 continue;
             }
-            let keep_infill = if period > 0 {
+            let keep_infill = if period > 0 && hollow.gyroid {
+                let mm = from_px(
+                    (img.x0 + x) as f32 + 0.5,
+                    (img.y0 + y) as f32 + 0.5,
+                    machine,
+                );
+                gyroid_wall(
+                    mm[0],
+                    mm[1],
+                    z,
+                    hollow.infill_spacing_mm,
+                    hollow.infill_thickness_mm,
+                )
+            } else if period > 0 {
                 let gx = img.x0 + x;
                 let gy = img.y0 + y;
                 gx.rem_euclid(period) < thick || gy.rem_euclid(period) < thick
@@ -1403,6 +1766,7 @@ mod tests {
                 top_cap_mm: 0.0,
                 infill_spacing_mm: 0.0,
                 infill_thickness_mm: 0.4,
+                gyroid: false,
                 z_min: 0.0,
                 z_max: 10.0,
             }),
@@ -1468,6 +1832,58 @@ mod tests {
             "floating block was not flagged, layer {}",
             floating.index
         );
+    }
+
+    #[test]
+    fn stacked_boxes_keep_each_band_and_skip_the_gaps() {
+        let mut vertices = Vec::new();
+        let mut indices = Vec::new();
+        // Layer height is clamped to 0.20 mm, so the gaps are wider than that.
+        for i in 0..40 {
+            let z0 = i as f32;
+            let mesh = box_mesh([0.0, 0.0, z0], [10.0, 10.0, z0 + 0.4]);
+            let base = vertices.len() as u32;
+            vertices.extend(mesh.vertices);
+            indices.extend(mesh.indices.into_iter().map(|idx| idx + base));
+        }
+        let solid = Solid {
+            vertices,
+            indices,
+            hollow: None,
+        };
+        let mut settings = PrintSettings::default();
+        settings.layer_mm = 0.2;
+        settings.anti_alias = 1;
+        let slice = slice(Request {
+            solids: &[solid],
+            drains: &[],
+            machine: machine_no_flip(),
+            settings: &settings,
+            cancel: None,
+            progress: None,
+        })
+        .unwrap();
+        let expected = (10.0_f32 / 0.046) * (10.0 / 0.046);
+        let check = |index: u32, solid_band: bool| {
+            let layer = slice
+                .layers
+                .iter()
+                .find(|layer| layer.index == index)
+                .unwrap_or_else(|| panic!("missing layer {index}"));
+            if solid_band {
+                let got = layer.nonzero as f32;
+                assert!(
+                    (got - expected).abs() / expected < 0.06,
+                    "layer {index} nonzero {got} expected ~{expected}"
+                );
+            } else {
+                assert_eq!(layer.nonzero, 0, "gap layer {index} has pixels");
+            }
+        };
+        check(0, true);
+        check(2, false);
+        check(5, true);
+        check(195, true);
     }
 
     #[test]

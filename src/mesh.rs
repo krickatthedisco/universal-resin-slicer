@@ -3,7 +3,7 @@
 use anyhow::{anyhow, bail, Result};
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
 
 #[derive(Clone, Debug)]
@@ -109,21 +109,49 @@ impl Mesh {
 }
 
 pub fn load_mesh(path: &Path) -> Result<Mesh> {
+    let mut meshes = load_meshes(path)?;
+    if meshes.is_empty() {
+        bail!("That file has no triangles.");
+    }
+    if meshes.len() == 1 {
+        return Ok(meshes.remove(0).1);
+    }
+    let mut mesh = Mesh {
+        vertices: Vec::new(),
+        indices: Vec::new(),
+    };
+    for (_, part) in meshes {
+        mesh.append(&part);
+    }
+    Ok(mesh)
+}
+
+pub fn load_meshes(path: &Path) -> Result<Vec<(String, Mesh)>> {
     let ext = path
         .extension()
         .and_then(|e| e.to_str())
         .unwrap_or("")
         .to_ascii_lowercase();
-    let mut mesh = match ext.as_str() {
-        "stl" => load_stl(path)?,
-        "obj" => load_obj(path)?,
-        _ => bail!("Amber imports STL and OBJ. `{ext}` is not one of those."),
+    let mut meshes = match ext.as_str() {
+        "stl" => vec![("model".into(), load_stl(path)?)],
+        "obj" => vec![("model".into(), load_obj(path)?)],
+        "3mf" => load_3mf(path)?,
+        _ => bail!("Amber imports STL, OBJ, and 3MF. `{ext}` is not one of those."),
     };
-    if mesh.triangle_count() == 0 {
+    meshes.retain(|(_, mesh)| mesh.triangle_count() > 0);
+    if meshes.is_empty() {
         bail!("That file has no triangles.");
     }
-    mesh.weld(1e-4);
-    Ok(mesh)
+    for (_, mesh) in &mut meshes {
+        mesh.weld(1e-4);
+    }
+    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("model");
+    for (name, _) in &mut meshes {
+        if name == "model" || name.is_empty() {
+            *name = stem.to_string();
+        }
+    }
+    Ok(meshes)
 }
 
 fn load_stl(path: &Path) -> Result<Mesh> {
@@ -238,6 +266,93 @@ fn load_obj(path: &Path) -> Result<Mesh> {
         bail!("OBJ file has no faces.");
     }
     Ok(Mesh { vertices, indices })
+}
+
+fn load_3mf(path: &Path) -> Result<Vec<(String, Mesh)>> {
+    let file = File::open(path)?;
+    let mut archive = zip::ZipArchive::new(file).map_err(|err| anyhow!("3MF zip: {err}"))?;
+    let mut xml = String::new();
+    let mut found = false;
+    for i in 0..archive.len() {
+        let mut entry = archive
+            .by_index(i)
+            .map_err(|err| anyhow!("3MF entry: {err}"))?;
+        let name = entry.name().to_string();
+        if name.ends_with(".model") {
+            entry
+                .read_to_string(&mut xml)
+                .map_err(|err| anyhow!("3MF read: {err}"))?;
+            found = true;
+            break;
+        }
+    }
+    if !found {
+        bail!("3MF archive has no model part.");
+    }
+    let scale = unit_scale(&xml);
+    let mut meshes = Vec::new();
+    for (index, object) in xml.split("<object").skip(1).enumerate() {
+        let body = object.split("</object").next().unwrap_or(object);
+        let name = attr_str(body, "name").unwrap_or_else(|| format!("part {}", index + 1));
+        let mut vertices = Vec::new();
+        for tag in body.split("<vertex").skip(1) {
+            let tag = tag.split('>').next().unwrap_or(tag);
+            let Some(x) = attr_f32(tag, "x") else {
+                continue;
+            };
+            let Some(y) = attr_f32(tag, "y") else {
+                continue;
+            };
+            let Some(z) = attr_f32(tag, "z") else {
+                continue;
+            };
+            vertices.push([x * scale, y * scale, z * scale]);
+        }
+        let mut indices = Vec::new();
+        for tag in body.split("<triangle").skip(1) {
+            let tag = tag.split('>').next().unwrap_or(tag);
+            let Some(a) = attr_f32(tag, "v1") else {
+                continue;
+            };
+            let Some(b) = attr_f32(tag, "v2") else {
+                continue;
+            };
+            let Some(c) = attr_f32(tag, "v3") else {
+                continue;
+            };
+            indices.extend_from_slice(&[a as u32, b as u32, c as u32]);
+        }
+        if !indices.is_empty() {
+            meshes.push((name, Mesh { vertices, indices }));
+        }
+    }
+    if meshes.is_empty() {
+        bail!("3MF model has no triangles.");
+    }
+    Ok(meshes)
+}
+
+fn unit_scale(xml: &str) -> f32 {
+    let unit = attr_str(xml, "unit").unwrap_or_else(|| "millimeter".into());
+    match unit.to_ascii_lowercase().as_str() {
+        "inch" => 25.4,
+        "foot" => 304.8,
+        "meter" => 1000.0,
+        "micron" => 0.001,
+        "centimeter" => 10.0,
+        _ => 1.0,
+    }
+}
+
+fn attr_str(tag: &str, key: &str) -> Option<String> {
+    let needle = format!("{key}=\"");
+    let rest = tag.split(&needle).nth(1)?;
+    let value = rest.split('"').next()?;
+    Some(value.to_string())
+}
+
+fn attr_f32(tag: &str, key: &str) -> Option<f32> {
+    attr_str(tag, key)?.parse().ok()
 }
 
 pub fn box_mesh(min: [f32; 3], max: [f32; 3]) -> Mesh {

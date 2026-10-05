@@ -88,6 +88,24 @@ pub const PRESETS: &[SupportPreset] = &[
             brace_mm: 0.55,
         },
     },
+    SupportPreset {
+        name: "Hairpin",
+        style: SupportStyle {
+            overhang_deg: 30.0,
+            spacing_mm: 1.2,
+            contact_mm: 0.15,
+            contact_depth: 0.12,
+            ball: false,
+            tip_upper_mm: 0.18,
+            tip_lower_mm: 0.32,
+            tip_len_mm: 1.2,
+            trunk_mm: 0.50,
+            branch_deg: 35.0,
+            cluster_mm: 3.5,
+            foot_mm: 0.4,
+            brace_mm: 0.18,
+        },
+    },
 ];
 
 impl SupportStyle {

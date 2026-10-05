@@ -1,21 +1,29 @@
-//! Photon M3 Max machine profile and the resin starting points Anycubic publishes for it.
+//! The selected printer and the exposure settings for the current job.
 
+use crate::catalog::{self, PrinterProfile};
 use serde::{Deserialize, Serialize};
 
-/// Build volume is exactly the pixel grid times 46 µm:
-/// 6480 × 0.046 = 298.08 mm, 3600 × 0.046 = 165.6 mm, Z = 300 mm.
-/// Those figures match Anycubic's 7K panel and the SoulCrafted M3 Max profile.
+/// One printer from the catalog, plus the orientation toggles for this job.
+///
+/// `extension` is what Amber writes. `printer_extension` is the suffix the
+/// machine's own slicer would use. Those match for Photon Workshop v516.
 #[derive(Clone, Copy, Debug)]
 pub struct Machine {
+    pub id: &'static str,
     pub name: &'static str,
+    pub vendor: &'static str,
     pub extension: &'static str,
+    pub printer_extension: &'static str,
+    pub format_name: &'static str,
     pub file_version: u32,
+    pub native_photon: bool,
     pub size_x: f32,
     pub size_y: f32,
     pub size_z: f32,
     pub res_x: u32,
     pub res_y: u32,
     pub pixel_um: f32,
+    pub pixel_um_y: f32,
     pub rotate_180: bool,
     pub mirror_x: bool,
     pub mirror_y: bool,
@@ -23,26 +31,49 @@ pub struct Machine {
 
 impl Machine {
     pub fn photon_m3_max() -> Self {
+        Self::from_profile(
+            catalog::find("anycubic-photon-m3-max")
+                .expect("Photon M3 Max is in the printer catalog"),
+        )
+    }
+
+    pub fn from_profile(profile: &PrinterProfile) -> Self {
+        // The M3 Max file the printer accepts is rotated 180°, matching
+        // Photonic Etcher. The community mirror flag is a different convention.
+        let m3 = profile.id == "anycubic-photon-m3-max";
+        let native = profile.native_photon;
         Self {
-            name: "Anycubic Photon M3 Max",
-            extension: "pm3m",
-            file_version: 516,
-            size_x: 298.08,
-            size_y: 165.6,
-            size_z: 300.0,
-            res_x: 6480,
-            res_y: 3600,
-            pixel_um: 46.0,
-            // Photonic Etcher's M3 Max profile rotates the exposure 180°.
-            // The prepare view can flip this before the first real print.
-            rotate_180: true,
-            mirror_x: false,
-            mirror_y: false,
+            id: profile.id,
+            name: profile.name,
+            vendor: profile.vendor,
+            extension: if native {
+                profile.printer_extension
+            } else {
+                "sl1"
+            },
+            printer_extension: profile.printer_extension,
+            format_name: profile.format_name,
+            file_version: if native { 516 } else { profile.file_version },
+            native_photon: native,
+            size_x: profile.size_x,
+            size_y: profile.size_y,
+            size_z: profile.size_z,
+            res_x: profile.res_x,
+            res_y: profile.res_y,
+            pixel_um: profile.pixel_x_um,
+            pixel_um_y: profile.pixel_y_um,
+            rotate_180: m3,
+            mirror_x: if m3 { false } else { profile.mirror_x },
+            mirror_y: if m3 { false } else { profile.mirror_y },
         }
     }
 
     pub fn pixel_mm(self) -> f32 {
         self.pixel_um / 1000.0
+    }
+
+    pub fn pixel_mm_y(self) -> f32 {
+        self.pixel_um_y / 1000.0
     }
 }
 
@@ -64,6 +95,21 @@ pub struct PrintSettings {
     /// 1, 2, 4, or 8. 1 is a hard edge.
     pub anti_alias: u8,
     pub density_g_ml: f32,
+    /// Positive grows the solid (and shrinks holes). Millimetres.
+    #[serde(default)]
+    pub xy_offset_mm: f32,
+    /// Extra inset on the bottom layers, against elephant's foot.
+    #[serde(default)]
+    pub elephant_foot_mm: f32,
+    /// How much the resin shrinks in XY. The slice is scaled up to match.
+    #[serde(default)]
+    pub shrink_xy_pct: f32,
+    /// How much the resin shrinks in Z.
+    #[serde(default)]
+    pub shrink_z_pct: f32,
+    /// Currency per litre. Zero hides the cost.
+    #[serde(default)]
+    pub price_per_liter: f32,
 }
 
 impl Default for PrintSettings {
@@ -90,6 +136,11 @@ impl PrintSettings {
             bottom_retract_speed: preset.retract_speed,
             anti_alias: 4,
             density_g_ml: 1.10,
+            xy_offset_mm: 0.0,
+            elephant_foot_mm: 0.0,
+            shrink_xy_pct: 0.0,
+            shrink_z_pct: 0.0,
+            price_per_liter: 0.0,
         }
     }
 
@@ -114,6 +165,11 @@ impl PrintSettings {
             _ => 1,
         };
         s.density_g_ml = s.density_g_ml.clamp(0.8, 2.0);
+        s.xy_offset_mm = s.xy_offset_mm.clamp(-1.0, 1.0);
+        s.elephant_foot_mm = s.elephant_foot_mm.clamp(0.0, 1.0);
+        s.shrink_xy_pct = s.shrink_xy_pct.clamp(-2.0, 8.0);
+        s.shrink_z_pct = s.shrink_z_pct.clamp(-2.0, 8.0);
+        s.price_per_liter = s.price_per_liter.clamp(0.0, 500.0);
         s
     }
 }

@@ -1,9 +1,13 @@
 //! Prepare and preview window.
 
+use crate::catalog;
+use crate::community;
 use crate::mesh::{calibration_cube, overhang_bridge};
 use crate::pm3m::write_pm3m;
-use crate::printer::{Machine, PrintSettings, RESIN_PRESETS};
+use crate::printer::{Machine, PrintSettings};
+use crate::resins::{self, Resin, ResinProfile};
 use crate::scene::{Document, Selection};
+use crate::sl1::write_sl1;
 use crate::slice::{self, Slice};
 use crate::supports::PRESETS;
 use crate::viewport::{self, Camera, DrawLists, Renderer};
@@ -42,6 +46,10 @@ struct Job {
     export_after: bool,
 }
 
+fn default_machine_id() -> String {
+    "anycubic-photon-m3-max".into()
+}
+
 #[derive(Serialize, Deserialize)]
 struct Persist {
     settings: PrintSettings,
@@ -54,6 +62,8 @@ struct Persist {
     style: Option<crate::supports::SupportStyle>,
     #[serde(default)]
     platform_only: bool,
+    #[serde(default = "default_machine_id")]
+    machine_id: String,
 }
 
 pub struct AmberApp {
@@ -76,6 +86,9 @@ pub struct AmberApp {
     gesture: bool,
     export_name: String,
     keep_original: bool,
+    printer_filter: String,
+    resin_filter: String,
+    profile_note: String,
 }
 
 impl AmberApp {
@@ -91,6 +104,9 @@ impl AmberApp {
             if let Some(raw) = storage.get_string("amber.print") {
                 if let Ok(saved) = serde_json::from_str::<Persist>(&raw) {
                     settings = saved.settings;
+                    if let Some(profile) = catalog::find(&saved.machine_id) {
+                        machine = Machine::from_profile(profile);
+                    }
                     machine.rotate_180 = saved.rotate_180;
                     machine.mirror_x = saved.mirror_x;
                     machine.mirror_y = saved.mirror_y;
@@ -110,6 +126,11 @@ impl AmberApp {
         doc.platform_only = platform_only;
         let plate = Vec3::new(machine.size_x, machine.size_y, machine.size_z);
         let mut gpu_note = None;
+        let startup = format!(
+            "{} · {} printers in the list · drop an STL, OBJ, or 3MF",
+            machine.name,
+            catalog::PRINTERS.len()
+        );
         let renderer = cc.gl.as_ref().and_then(|gl| match Renderer::new(gl.as_ref()) {
             Ok(renderer) => {
                 if !renderer.covers_pixels {
@@ -135,9 +156,7 @@ impl AmberApp {
             renderer,
             draw: None,
             draw_gen: 0,
-            status: gpu_note.unwrap_or_else(|| {
-                "Photon M3 Max · drop an STL or OBJ, or add the overhang bridge.".into()
-            }),
+            status: gpu_note.unwrap_or(startup),
             job: None,
             slice: None,
             slice_gen: 0,
@@ -145,8 +164,11 @@ impl AmberApp {
             preview_for: None,
             preview_tex: None,
             gesture: false,
-            export_name: "print.pm3m".into(),
+            export_name: format!("print.{}", machine.extension),
             keep_original: false,
+            printer_filter: String::new(),
+            resin_filter: String::new(),
+            profile_note: String::new(),
         }
     }
 
@@ -184,10 +206,18 @@ impl AmberApp {
                 let layers = slice.layers.len();
                 let islands: usize = slice.layers.iter().map(|l| l.islands.len()).sum();
                 let minutes = slice.seconds / 60;
-                self.status = format!(
+                let mut line = format!(
                     "Sliced {layers} layers · {:.2} ml · {minutes} min · {islands} islands",
                     slice.cured_ml
                 );
+                if self.settings.price_per_liter > 0.0 {
+                    let cost = slice.cured_ml / 1000.0 * self.settings.price_per_liter;
+                    line = format!(
+                        "{line} · {cost:.2} at {:.2}/L",
+                        self.settings.price_per_liter
+                    );
+                }
+                self.status = line;
                 if !slice.warnings.is_empty() {
                     self.status = format!("{} · {}", self.status, slice.warnings.join(" "));
                 }
@@ -197,7 +227,7 @@ impl AmberApp {
                 self.preview_for = None;
                 self.view = View::Preview;
                 if export_after {
-                    self.export_pm3m();
+                    self.export_print(false);
                 }
             }
             Ok(_) => {
@@ -255,7 +285,7 @@ impl AmberApp {
         self.status = "Slicing…".into();
     }
 
-    fn export_pm3m(&mut self) {
+    fn export_print(&mut self, force_sl1: bool) {
         let Some(slice) = &self.slice else {
             self.start_slice(true);
             return;
@@ -264,23 +294,47 @@ impl AmberApp {
             self.start_slice(true);
             return;
         }
-        let name = sanitize_filename(&self.export_name);
-        if name.len() > 24 {
-            self.status =
-                "Keep the file name short. The M3 Max skips very long names on the USB stick."
-                    .into();
+        let native = self.machine.native_photon && !force_sl1;
+        let ext = if native {
+            self.machine.extension
+        } else {
+            "sl1"
+        };
+        let name = sanitize_filename(&self.export_name, ext);
+        if native && name.len() > 24 {
+            self.status = format!(
+                "Keep the file name short. {} skips very long names on the USB stick.",
+                self.machine.name
+            );
         }
+        let filter_name = if native {
+            format!("Photon Workshop v516 (.{})", self.machine.extension)
+        } else {
+            "Prusa SL1".into()
+        };
         let Some(path) = rfd::FileDialog::new()
             .set_file_name(&name)
-            .add_filter("Photon M3 Max", &["pm3m"])
+            .add_filter(&filter_name, &[ext])
             .save_file()
         else {
             return;
         };
-        match write_pm3m(&path, slice, self.machine, &self.settings) {
+        let written = if native {
+            write_pm3m(&path, slice, self.machine, &self.settings)
+        } else {
+            write_sl1(&path, slice, self.machine, &self.settings)
+        };
+        match written {
             Ok(()) => {
+                let note = if native {
+                    "copy it to a USB stick and print from the machine"
+                } else if self.machine.native_photon {
+                    "open .sl1 in a converter if you want a different file"
+                } else {
+                    "this printer does not read .sl1 directly; convert it, or use it to check the layers"
+                };
                 self.status = format!(
-                    "Wrote {} · {:.1} MB · copy it to a USB stick and print from the machine.",
+                    "Wrote {} · {:.1} MB · {note}.",
                     path.display(),
                     slice_bytes(slice) as f64 / 1_048_576.0
                 );
@@ -320,7 +374,7 @@ impl AmberApp {
                 self.doc
                     .center_on_plate(id, self.machine.size_x, self.machine.size_y);
                 self.doc.drop_object(id);
-                self.export_name = default_export_name(&self.doc);
+                self.export_name = default_export_name(&self.doc, self.machine.extension);
                 self.invalidate_slice();
                 self.status = format!("Imported {}", path.display());
                 self.view = View::Prepare;
@@ -331,7 +385,7 @@ impl AmberApp {
 
     fn open_dialog(&mut self) {
         if let Some(path) = rfd::FileDialog::new()
-            .add_filter("Meshes", &["stl", "obj", "STL", "OBJ"])
+            .add_filter("Meshes", &["stl", "obj", "3mf", "STL", "OBJ", "3MF"])
             .pick_file()
         {
             self.import_path(path);
@@ -349,7 +403,7 @@ impl AmberApp {
             )
         };
         self.doc.add_mesh(name, mesh);
-        self.export_name = default_export_name(&self.doc);
+        self.export_name = default_export_name(&self.doc, self.machine.extension);
         self.invalidate_slice();
         self.view = View::Prepare;
     }
@@ -409,6 +463,7 @@ impl eframe::App for AmberApp {
             raft: self.doc.raft,
             style: Some(self.doc.style),
             platform_only: self.doc.platform_only,
+            machine_id: self.machine.id.to_string(),
         };
         if let Ok(raw) = serde_json::to_string(&saved) {
             storage.set_string("amber.print", raw);
@@ -536,8 +591,17 @@ impl AmberApp {
                     self.start_slice(false);
                     ui.close();
                 }
-                if ui.button("Export .pm3m…").clicked() {
-                    self.export_pm3m();
+                let export_label = if self.machine.native_photon {
+                    format!("Export .{}…", self.machine.extension)
+                } else {
+                    "Export .sl1…".into()
+                };
+                if ui.button(export_label).clicked() {
+                    self.export_print(false);
+                    ui.close();
+                }
+                if self.machine.native_photon && ui.button("Export .sl1…").clicked() {
+                    self.export_print(true);
                     ui.close();
                 }
                 if ui.button("Export preview PNG…").clicked() {
@@ -564,7 +628,7 @@ impl AmberApp {
                     .add_enabled(!slicing, egui::Button::new("Export"))
                     .clicked()
                 {
-                    self.export_pm3m();
+                    self.export_print(false);
                 }
                 let slice = egui::Button::new("Slice").fill(egui::Color32::from_rgb(224, 122, 47));
                 if ui.add_enabled(!slicing, slice).clicked() {
@@ -937,6 +1001,9 @@ impl AmberApp {
             );
             changed |= drag_f32(ui, "Top cap", &mut obj.top_cap_mm, 0.05, 0.0, 20.0, "mm");
             changed |= ui.checkbox(&mut obj.infill, "Lattice infill").changed();
+            changed |= ui
+                .checkbox(&mut obj.infill_gyroid, "Gyroid instead of a grid")
+                .changed();
             changed |= drag_f32(
                 ui,
                 "Infill spacing",
@@ -1161,28 +1228,182 @@ impl AmberApp {
         }
     }
 
+    fn select_printer(&mut self, id: &str) {
+        if self.machine.id == id {
+            return;
+        }
+        let Some(profile) = catalog::find(id) else {
+            return;
+        };
+        self.machine = Machine::from_profile(profile);
+        self.settings.light_off_s = profile.light_off_s;
+        self.settings.lift_mm = profile.lift_mm.max(1.0);
+        self.settings.lift_speed = profile.lift_speed;
+        self.settings.retract_speed = profile.retract_speed;
+        self.settings.bottom_lift_mm = self.settings.lift_mm;
+        self.settings.bottom_lift_speed = profile.lift_speed;
+        self.settings.bottom_retract_speed = profile.retract_speed;
+        self.camera = Camera::looking_at_plate(self.plate());
+        self.doc.touch();
+        self.export_name = default_export_name(&self.doc, self.machine.extension);
+        let name = self.settings.resin.clone();
+        self.apply_resin(&name);
+    }
+
+    fn apply_resin(&mut self, name: &str) {
+        let Some(resin) = find_resin(name) else {
+            self.settings.resin = name.to_string();
+            self.profile_note.clear();
+            self.invalidate_slice();
+            return;
+        };
+        self.settings.resin = resin.name.to_string();
+        self.settings.density_g_ml = resin.density_g_ml;
+        if let Some(profile) = lookup_profile(resin.id, self.machine.id, self.settings.layer_mm) {
+            self.settings.layer_mm = profile.layer_mm;
+            self.settings.exposure_s = profile.exposure_s;
+            self.settings.bottom_exposure_s = profile.bottom_exposure_s;
+            self.settings.bottom_layers = profile.bottom_layers;
+            self.settings.light_off_s = profile.light_off_s;
+            self.settings.lift_mm = profile.lift_mm;
+            self.settings.lift_speed = profile.lift_speed;
+            self.settings.retract_speed = profile.retract_speed;
+            self.settings.bottom_lift_mm = profile.lift_mm;
+            self.settings.bottom_lift_speed = profile.lift_speed;
+            self.settings.bottom_retract_speed = profile.retract_speed;
+            self.profile_note = profile.source.to_string();
+            self.status = format!(
+                "{} on {}: {:.2} s normal, {:.0} s bottom.",
+                resin.name, self.machine.name, profile.exposure_s, profile.bottom_exposure_s
+            );
+        } else {
+            self.profile_note = format!(
+                "No published profile for {} on {}. Times were left as they are. Run a RERF before a long print.",
+                resin.name, self.machine.name
+            );
+            self.status = self.profile_note.clone();
+        }
+        self.invalidate_slice();
+    }
+
     fn slice_ui(&mut self, ui: &mut egui::Ui) {
         ui.heading("Slice");
-        ui.label("Resin starting points are Anycubic's Photon M3 Max table. Run a RERF on your bottle before a long print.");
-        let mut resin = self.settings.resin.clone();
-        egui::ComboBox::from_label("Resin")
-            .selected_text(&resin)
-            .show_ui(ui, |ui| {
-                for preset in RESIN_PRESETS {
-                    ui.selectable_value(&mut resin, preset.name.to_string(), preset.name);
+        ui.label("A published table fills the times when this printer and resin have one. Otherwise the times stay put and you should run a RERF. Amber does not invent a cure time.");
+        let px = if (self.machine.pixel_um - self.machine.pixel_um_y).abs() < 0.05 {
+            format!("{:.0} µm", self.machine.pixel_um)
+        } else {
+            format!(
+                "{:.0}×{:.0} µm",
+                self.machine.pixel_um, self.machine.pixel_um_y
+            )
+        };
+        ui.label(format!(
+            "{} · {}×{} · {:.2} × {:.2} × {:.0} mm · {px}",
+            self.machine.name,
+            self.machine.res_x,
+            self.machine.res_y,
+            self.machine.size_x,
+            self.machine.size_y,
+            self.machine.size_z
+        ));
+        if self.machine.native_photon {
+            ui.label(format!(
+                "Writes Photon Workshop v{} .{}",
+                self.machine.file_version, self.machine.extension
+            ));
+        } else {
+            ui.label(format!(
+                "Writes .sl1. This printer reads .{} ({}), which Amber does not encode.",
+                self.machine.printer_extension, self.machine.format_name
+            ));
+        }
+        ui.label("Printer");
+        ui.text_edit_singleline(&mut self.printer_filter);
+        let machine_id = self.machine.id;
+        let filter = self.printer_filter.to_ascii_lowercase();
+        let mut pick_printer: Option<&'static str> = None;
+        egui::ScrollArea::vertical()
+            .id_salt("printers")
+            .max_height(130.0)
+            .show(ui, |ui| {
+                for printer in catalog::PRINTERS {
+                    if !filter.is_empty()
+                        && !printer.name.to_ascii_lowercase().contains(&filter)
+                        && !printer.vendor.to_ascii_lowercase().contains(&filter)
+                    {
+                        continue;
+                    }
+                    let label = format!("{}  {}×{}", printer.name, printer.res_x, printer.res_y);
+                    if ui
+                        .selectable_label(printer.id == machine_id, label)
+                        .clicked()
+                    {
+                        pick_printer = Some(printer.id);
+                    }
                 }
             });
-        if resin != self.settings.resin {
-            if let Some(preset) = RESIN_PRESETS.iter().find(|p| p.name == resin) {
-                let aa = self.settings.anti_alias;
-                let density = self.settings.density_g_ml;
-                let transition = self.settings.transition_layers;
-                self.settings = PrintSettings::from_preset(preset);
-                self.settings.anti_alias = aa;
-                self.settings.density_g_ml = density;
-                self.settings.transition_layers = transition;
-                self.invalidate_slice();
+        ui.label("Resin");
+        ui.text_edit_singleline(&mut self.resin_filter);
+        let resin_filter = self.resin_filter.to_ascii_lowercase();
+        let mut with_profile = std::collections::HashSet::new();
+        for profile in resins::PROFILES.iter().chain(community::PROFILES.iter()) {
+            if profile.machine_id == machine_id {
+                with_profile.insert(profile.resin_id);
             }
+        }
+        let current_resin = self.settings.resin.clone();
+        let mut listed: Vec<&Resin> = resin_catalog()
+            .filter(|resin| {
+                if resin_filter.is_empty() {
+                    return true;
+                }
+                let blob = format!("{} {} {}", resin.vendor, resin.name, resin.family);
+                blob.to_ascii_lowercase().contains(&resin_filter)
+            })
+            .collect();
+        listed.sort_by(|a, b| {
+            let ha = with_profile.contains(a.id);
+            let hb = with_profile.contains(b.id);
+            hb.cmp(&ha)
+                .then_with(|| a.vendor.cmp(b.vendor))
+                .then_with(|| a.name.cmp(b.name))
+        });
+        let shown = listed.len();
+        let matched = listed
+            .iter()
+            .filter(|r| with_profile.contains(r.id))
+            .count();
+        ui.label(format!(
+            "{shown} resins · {matched} with a published profile on this printer"
+        ));
+        let mut pick_resin: Option<&'static str> = None;
+        egui::ScrollArea::vertical()
+            .id_salt("resins")
+            .max_height(170.0)
+            .show(ui, |ui| {
+                for resin in listed {
+                    let mark = if with_profile.contains(resin.id) {
+                        "● "
+                    } else {
+                        ""
+                    };
+                    let label = format!("{mark}{} · {}", resin.vendor, resin.name);
+                    if ui
+                        .selectable_label(resin.name == current_resin, label)
+                        .clicked()
+                    {
+                        pick_resin = Some(resin.name);
+                    }
+                }
+            });
+        if !self.profile_note.is_empty() {
+            ui.label(self.profile_note.as_str());
+        }
+        if let Some(id) = pick_printer {
+            self.select_printer(id);
+        }
+        if let Some(name) = pick_resin {
+            self.apply_resin(name);
         }
         let s = &mut self.settings;
         let mut changed = false;
@@ -1232,6 +1453,22 @@ impl AmberApp {
             }
             changed = true;
         }
+        ui.collapsing("Compensation and cost", |ui| {
+            changed |= drag_f32(ui, "XY offset", &mut s.xy_offset_mm, 0.01, -0.5, 0.5, "mm");
+            changed |= drag_f32(
+                ui,
+                "Elephant foot",
+                &mut s.elephant_foot_mm,
+                0.01,
+                0.0,
+                0.5,
+                "mm",
+            );
+            changed |= drag_f32(ui, "Shrink XY", &mut s.shrink_xy_pct, 0.01, 0.0, 5.0, "%");
+            changed |= drag_f32(ui, "Shrink Z", &mut s.shrink_z_pct, 0.01, 0.0, 5.0, "%");
+            changed |= drag_f32(ui, "Price", &mut s.price_per_liter, 1.0, 0.0, 200.0, "/L");
+            ui.label("Positive XY offset grows the part. Elephant foot insets the bottom layers. Shrink scales the mesh up so the cured part comes out the drawn size.");
+        });
         ui.collapsing("Bottom lift and image", |ui| {
             changed |= drag_f32(ui, "Bottom lift", &mut s.bottom_lift_mm, 0.1, 2.0, 15.0, "mm");
             changed |= drag_f32(ui, "Bottom lift speed", &mut s.bottom_lift_speed, 0.05, 0.5, 8.0, "mm/s");
@@ -1239,7 +1476,7 @@ impl AmberApp {
             changed |= ui.checkbox(&mut self.machine.rotate_180, "Rotate exposure 180°").changed();
             changed |= ui.checkbox(&mut self.machine.mirror_x, "Mirror X").changed();
             changed |= ui.checkbox(&mut self.machine.mirror_y, "Mirror Y").changed();
-            ui.label("Rotate 180° is the M3 Max default used by Photonic Etcher. Print the 20 mm cube and flip these if the part comes out mirrored.");
+            ui.label("Print a 20 mm cube and flip these if the part comes out mirrored. The Photon M3 Max default is rotate 180°.");
         });
         if changed {
             self.invalidate_slice();
@@ -1256,11 +1493,23 @@ impl AmberApp {
             {
                 self.start_slice(false);
             }
+            let export_label = if self.machine.native_photon {
+                format!("Export .{}", self.machine.extension)
+            } else {
+                "Export .sl1".to_string()
+            };
             if ui
-                .add_enabled(!slicing, egui::Button::new("Export .pm3m"))
+                .add_enabled(!slicing, egui::Button::new(export_label))
                 .clicked()
             {
-                self.export_pm3m();
+                self.export_print(false);
+            }
+            if self.machine.native_photon
+                && ui
+                    .add_enabled(!slicing, egui::Button::new("Export .sl1"))
+                    .clicked()
+            {
+                self.export_print(true);
             }
             if slicing && ui.button("Cancel").clicked() {
                 if let Some(job) = &self.job {
@@ -1663,22 +1912,49 @@ fn nonzero(v: f32) -> f32 {
     }
 }
 
-fn sanitize_filename(name: &str) -> String {
-    let mut stem = name.trim().trim_end_matches(".pm3m").to_string();
+fn sanitize_filename(name: &str, ext: &str) -> String {
+    let mut stem = name.trim().to_string();
+    for suffix in [".pm3m", ".pm3", ".sl1", ".ctb", ".goo", ".stl", ".obj"] {
+        if stem.len() > suffix.len() && stem.to_ascii_lowercase().ends_with(suffix) {
+            stem.truncate(stem.len() - suffix.len());
+        }
+    }
+    if let Some((left, _)) = stem.rsplit_once('.') {
+        if left.len() >= 3 {
+            stem = left.to_string();
+        }
+    }
     stem.retain(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
     if stem.is_empty() {
         stem = "print".into();
     }
-    format!("{stem}.pm3m")
+    format!("{stem}.{ext}")
 }
 
-fn default_export_name(doc: &Document) -> String {
+fn default_export_name(doc: &Document, ext: &str) -> String {
     let stem = doc
         .objects
         .first()
         .map(|o| o.name.as_str())
         .unwrap_or("print");
-    sanitize_filename(stem)
+    sanitize_filename(stem, ext)
+}
+
+fn resin_catalog() -> impl Iterator<Item = &'static Resin> {
+    resins::RESINS.iter().chain(community::EXTRA_RESINS.iter())
+}
+
+fn find_resin(name: &str) -> Option<&'static Resin> {
+    resin_catalog().find(|resin| resin.name == name)
+}
+
+fn lookup_profile(
+    resin_id: &str,
+    machine_id: &str,
+    layer_mm: f32,
+) -> Option<&'static ResinProfile> {
+    resins::profile_for(resin_id, machine_id, layer_mm)
+        .or_else(|| community::profile_for(resin_id, machine_id, layer_mm))
 }
 
 fn slice_bytes(slice: &Slice) -> usize {
@@ -1719,7 +1995,7 @@ pub fn run() -> eframe::Result {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1440.0, 900.0])
             .with_min_inner_size([1100.0, 700.0])
-            .with_title("Amber — Photon M3 Max"),
+            .with_title("Amber"),
         renderer: eframe::Renderer::Glow,
         // 0 keeps the window opening on software GL and on machines without MSAA.
         multisampling: 0,

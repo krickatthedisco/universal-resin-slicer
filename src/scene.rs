@@ -20,6 +20,7 @@ pub struct Object {
     pub bottom_cap_mm: f32,
     pub top_cap_mm: f32,
     pub infill: bool,
+    pub infill_gyroid: bool,
     pub infill_spacing_mm: f32,
     pub infill_thickness_mm: f32,
 }
@@ -123,6 +124,7 @@ impl Document {
             bottom_cap_mm: 1.5,
             top_cap_mm: 1.5,
             infill: false,
+            infill_gyroid: false,
             infill_spacing_mm: 4.0,
             infill_thickness_mm: 0.6,
         });
@@ -646,6 +648,7 @@ impl Document {
                         0.0
                     },
                     infill_thickness_mm: obj.infill_thickness_mm,
+                    gyroid: obj.infill_gyroid,
                     z_min: min[2],
                     z_max: max[2],
                 })

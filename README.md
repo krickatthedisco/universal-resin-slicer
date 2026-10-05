@@ -1,6 +1,6 @@
 # Amber
 
-Amber is a desktop resin slicer for the **Anycubic Photon M3 Max**. It opens STL and OBJ models, lays them out on the 298.08 × 165.6 × 300 mm plate, and writes a Photon Workshop **v516** `.pm3m` file the printer can read from USB.
+Amber is a desktop resin slicer. The machine it was built around is the **Anycubic Photon M3 Max** (298.08 × 165.6 × 300 mm, 6480×3600, 46 µm). It also knows the build volume and pixel grid of the other printers in the UVtools printer list, and it can write a Photon Workshop **v516** file for the machines whose profile is version 516. Every printer can be saved as an open `.sl1` zip. Encrypted CTB, GOO, and similar files are not written.
 
 The window is a native app (Rust, egui, OpenGL). The same program builds on Windows and on Linux. It is not a web app.
 
@@ -11,10 +11,10 @@ The window is a native app (Rust, egui, OpenGL). The same program builds on Wind
 From a terminal in the same folder you can also slice without opening the window:
 
 ```text
-amber.exe slice model.stl -o model.pm3m --layer 0.05 --supports medium
+amber.exe slice model.stl -o model.pm3m --layer 0.05 --supports medium --printer anycubic-photon-m3-max
 ```
 
-Amber is not affiliated with Anycubic. Resin times below are Anycubic's published starting points, not a tuned profile for your bottle, temperature, or screen.
+Amber is not affiliated with Anycubic or Elegoo. A resin row is copied from a manufacturer table, with the source shown in the slice panel. If a printer and resin have no row, the times stay where you left them and the panel says to run a RERF. A range in a table is stored as its middle. The Elegoo sheet does not list a bottom-layer count, so those rows use 5.
 
 ## First print on the M3 Max
 
@@ -37,15 +37,19 @@ Amber is not affiliated with Anycubic. Resin times below are Anycubic's publishe
 
 ## What the window does
 
-- Import STL (binary or ASCII) and OBJ. Drop files on the plate.
+- Import STL (binary or ASCII), OBJ, and 3MF. Drop files on the plate.
+- Printer list with search. Picking a printer sets the plate, the pixel size, and that machine's lift defaults. It does not invent an exposure.
+- Resin list with search. A dot means this printer has a published starting point. Elegoo rows are the 2023-12-11 official sheet (Mars, Saturn, and Jupiter, including color). Anycubic rows are the Photon M3 Max store guide from November 2023. Other bottles are named so you can find them, without a guessed cure time.
 - Several models, with move, rotate, scale, mirror, duplicate, delete, and undo.
 - Drop to the bed, center, put the largest face down, auto-orient one model or all of them, shelf-pack the plate, and fill the bed with copies. Repair flips an inside-out shell and welds duplicate corners. Models that hang off the plate are marked.
-- Hollow at slice time: wall thickness, top and bottom caps, and a lattice. Drain holes are cylinders you click onto the surface.
+- Hollow at slice time: wall thickness, top and bottom caps, and a grid or gyroid lattice. Drain holes are cylinders you click onto the surface.
+- XY offset, an elephant-foot inset on the bottom layers, and XY/Z shrink compensation. A price per litre shows a cost after the slice.
 - The prepare window follows the classic Chitubox layout: a top menu, a left tool rail (Select, Move, Rotate, Scale, Mirror, Hollow, Hole, Support), and a right panel that changes with the tool. Print settings stay in the panel under that name.
 - Automatic tree supports (Light, Medium, Heavy). Nearby tips share a trunk. Each tip has a point or ball contact, contact diameter and depth, upper and lower diameter, connection length, trunk diameter, branch angle, and a foot. Cross-braces and a raft are optional. You can also click an underside, send supports only to the platform, or drop them on islands from the last slice.
 - Layer preview with a vertical bar on the right: step up or down one layer, drag the bar, or type a layer number. A new slice opens on the last layer. Islands are tinted, and a layer that seals a cavity is called out.
 - The plate draws every triangle and grows faces that would be smaller than a pixel, so a dense sculpt stays solid instead of looking full of holes.
-- Volume, weight, and a time estimate. Export `.pm3m` or one layer as PNG.
+- Volume, weight, and a time estimate. Export the native v516 file when the printer has one, or `.sl1` for every machine, or one layer as PNG.
+- Large meshes stay on the CPU path that only clips triangles crossing the current layer, and each scanline only tests the edges that cross it. Layers stay in order because islands and sealed pockets depend on the previous layer.
 - Settings persist between launches.
 
 The slicer keeps empty layers under a floating part. The printer stacks exposures from the bed, so dropping those layers would print the part on the plate.
@@ -53,10 +57,10 @@ The slicer keeps empty layers under a floating part. The printer stacks exposure
 ## Command line
 
 ```text
-amber slice model.stl -o model.pm3m --layer 0.05 --exposure 3 --supports medium --hollow 2.0
+amber slice model.stl -o model.pm3m --printer anycubic-photon-m3-max --layer 0.05 --exposure 3 --supports medium --hollow 2.0
 ```
 
-`--supports` is `none`, `light`, `medium`, or `heavy`. Layer height is clamped to 0.01–0.20 mm. The CLI uses the Colored UV starting point unless you pass `--exposure`.
+`--printer` is a catalog id such as `anycubic-photon-m3-max` or `elegoo-mars-4`. `--supports` is `none`, `light`, `medium`, `heavy`, or `hairpin`. Layer height is clamped to 0.01–0.20 mm. The CLI uses the Colored UV starting point unless you pass `--exposure`. A printer without a v516 profile is written as `.sl1` even if the output name says otherwise. Pass `-o file.sl1` to force that zip on a Photon machine.
 
 ## Build
 
@@ -87,17 +91,18 @@ cargo build --release --target x86_64-pc-windows-gnu
 
 ## File format
 
-Output is Photon Workshop v516 with `pw0Img` run-length layers, 6480 × 3600 pixels at 46 µm, and a 224 × 168 preview. Each layer record stores that layer's thickness, not an absolute Z. Motion in the file is single-stage. Anti-aliasing is 1, 2, 4, or 8 levels.
+Photon Workshop v516 (`.pm3m` and the other v516 suffixes in the catalog) uses `pw0Img` run-length layers and a 224 × 168 preview. The M3 Max file is 6480 × 3600 at 46 µm. Each layer record stores that layer's thickness, not an absolute Z. Motion in the file is single-stage. Anti-aliasing is 1, 2, 4, or 8 levels. `.sl1` is a zip of `config.ini` plus one grayscale PNG per layer.
 
 ## Not in this version
 
-- 3MF, and mesh-boolean union. Overlapping solids are unioned in the raster.
-- Variable layer height, two-stage lift as its own mode, and printers other than the Photon M3 Max.
+- Encrypted or proprietary printer files (CTB, GOO, and the rest). Those machines export `.sl1` for a converter.
+- Mesh-boolean union. Overlapping solids are unioned in the raster.
+- Variable layer height, two-stage lift as its own mode, and a measured exposure for every resin on every printer.
 - Live re-slice while you drag a model.
 
 ## Credits
 
-Machine numbers for the M3 Max match Anycubic's 7K panel and the published SoulCrafted printer profile. The v516 layout follows the Photon Workshop file as documented by UVtools and Photonic Etcher. Amber's slicer, support generator, and file writer are original. SoulCrafted and UVtools source was not copied.
+Printer volumes and pixel grids come from the UVtools printer profiles (manufacturer figures). The M3 Max orientation matches Photonic Etcher: rotate 180°, no mirror. The v516 layout follows the Photon Workshop file as documented by UVtools and Photonic Etcher. Elegoo times are from Elegoo's resin sheet dated 2023-12-11. Anycubic M3 Max times are from the November 2023 store guide. Amber's slicer, support generator, and file writers are original. SoulCrafted and UVtools source was not copied.
 
 ## License
 
