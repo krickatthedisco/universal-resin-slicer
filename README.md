@@ -2,7 +2,7 @@
 
 Amber is a desktop resin slicer. The machine it was built around is the **Anycubic Photon M3 Max** (298.08 × 165.6 × 300 mm, 6480×3600, 46 µm). It also knows the build volume and pixel grid of the other printers in the UVtools printer list. The save dialog defaults to the file that printer reads when Amber can write it: Photon Workshop **v516** (`.pm3m` and the other v516 suffixes), unencrypted Chitubox **`.ctb`**, Prusa **`.sl1`**, or a PNG layer zip (`.cws`, `.zip`, NanoDLP). You can pick any of those four for any printer. Encrypted CTB, GOO, and the other locked containers are not written; those machines default to `.sl1`.
 
-The window is a native app (Rust, egui, OpenGL), version 0.2.3. The same program builds on Windows and on Linux. It is not a web app.
+The window is a native app (Rust, egui, OpenGL), version 0.2.4. The same program builds on Windows and on Linux. It is not a web app.
 
 [![Buy Me a Coffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-krickatthedisco-FFDD00?style=for-the-badge&logo=buy-me-a-coffee&logoColor=black)](https://buymeacoffee.com/krickatthedisco)
 

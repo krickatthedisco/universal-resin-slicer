@@ -582,10 +582,10 @@ impl Sweep {
 fn raster_solid(solid: &Solid, z: f32, machine: Machine, aa: u8, tris: &[u32]) -> Image {
     let mut segs = clip_tris(solid, z, machine, tris);
     stitch_open_ends(&mut segs);
-    // Two supports in one mesh are two closed loops. Even-odd on both at
-    // once paints the overlap as a hole, which shows up as a one-layer
-    // line where a branch, a trunk, or a foot touch. Fill each loop on
-    // its own and keep the darker pixel, the same as a union.
+    // Each closed outline is filled on its own. An outline that sits inside
+    // another is a hole (the infinity mark, a pin hole, a letter counter).
+    // Two supports that merely overlap are not one inside the other, so the
+    // overlap stays solid instead of leaving a one-layer gap.
     fill_components(&segs, machine, aa)
 }
 
@@ -633,11 +633,58 @@ fn fill_components(segs: &[([f32; 2], [f32; 2])], machine: Machine, aa: u8) -> I
         };
         groups[index].push(segs[i]);
     }
+    let parts: Vec<Image> = groups
+        .iter()
+        .map(|group| fill_segments(group, machine, aa))
+        .collect();
+    let mut order: Vec<usize> = (0..parts.len()).collect();
+    let counts: Vec<u32> = parts.iter().map(nonzero_count).collect();
+    order.sort_by(|&a, &b| counts[b].cmp(&counts[a]).then(a.cmp(&b)));
+    let mut placed: Vec<usize> = Vec::new();
     let mut image = Image::empty();
-    for group in &groups {
-        blit_max(&mut image, &fill_segments(group, machine, aa));
+    for index in order {
+        if counts[index] == 0 {
+            continue;
+        }
+        let depth = placed
+            .iter()
+            .filter(|&&other| covered_by(&parts[other], &parts[index]))
+            .count();
+        if depth % 2 == 0 {
+            blit_max(&mut image, &parts[index]);
+        } else {
+            blit_sub(&mut image, &parts[index]);
+        }
+        placed.push(index);
     }
     image
+}
+
+fn nonzero_count(img: &Image) -> u32 {
+    img.pixels.iter().filter(|px| **px > 0).count() as u32
+}
+
+/// True when almost every painted pixel of `inner` is already painted in `outer`.
+/// A hole passes. Two supports that only cross do not.
+fn covered_by(outer: &Image, inner: &Image) -> bool {
+    if outer.width == 0 || inner.width == 0 {
+        return false;
+    }
+    let mut on = 0u32;
+    let mut hit = 0u32;
+    for y in 0..inner.height {
+        let row = (y * inner.width) as usize;
+        for x in 0..inner.width {
+            if inner.pixels[row + x as usize] == 0 {
+                continue;
+            }
+            on += 1;
+            if outer.get(inner.x0 + x, inner.y0 + y) > 0 {
+                hit += 1;
+            }
+        }
+    }
+    on > 0 && hit * 10 >= on * 9
 }
 
 fn find_seg(parent: &mut [usize], mut i: usize) -> usize {
@@ -2463,6 +2510,34 @@ mod tests {
         assert!(
             px(8.5, 5.0) > 0,
             "the overlap was left empty, which is the one-layer line between supports"
+        );
+    }
+
+    #[test]
+    fn a_hole_in_a_plate_stays_open_and_an_island_inside_it_stays() {
+        let machine = machine_no_flip();
+        let mut mesh = box_mesh([0.0, 0.0, 0.0], [30.0, 30.0, 4.0]);
+        mesh.append(&box_mesh([8.0, 8.0, 0.0], [22.0, 22.0, 4.0]));
+        mesh.append(&box_mesh([12.0, 12.0, 0.0], [18.0, 18.0, 4.0]));
+        let solid = Solid {
+            vertices: mesh.vertices,
+            indices: mesh.indices,
+            hollow: None,
+            negative: false,
+        };
+        let sweep = Sweep::build(&solid);
+        let mut sweep = sweep;
+        let active = sweep.activate(2.0).to_vec();
+        let img = raster_solid(&solid, 2.0, machine, 1, &active);
+        let px = |x_mm: f32, y_mm: f32| {
+            let [x, y] = to_px([x_mm, y_mm], machine);
+            img.get(x.round() as i32, y.round() as i32)
+        };
+        assert!(px(4.0, 15.0) > 0, "the plate border is missing");
+        assert_eq!(px(10.0, 15.0), 0, "the hole was filled solid");
+        assert!(
+            px(15.0, 15.0) > 0,
+            "the island inside the hole was cut away"
         );
     }
 

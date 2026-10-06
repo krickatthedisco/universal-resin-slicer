@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.4
+
+- A slice keeps the holes in a part. The Photonsters validation matrix was coming out as solid blocks: the infinity mark, the lettering, the slots, and the pin holes were filled in. Those outlines are cut out again. Overlapping supports still meet as one solid.
+
 ## 0.2.3
 
 - File → Calibration models opens AmeraLabs Town, the Cones of Calibration, and the Photonsters XP2 matrix. Amber's own city, pin, hole, and slope cards are gone.
