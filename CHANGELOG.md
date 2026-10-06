@@ -15,4 +15,4 @@ Amber is a desktop resin slicer. The first printer it was built around is the An
 - Fill enclosed voids heals speckles and accidental pockets, and leaves a model you hollowed empty.
 - Anti-alias, optional image blur, XY offset, elephant foot, and shrink compensation.
 - Measure, overhang colors, overlap warning, layer preview, and a print time split into light and lifting.
-- Layers are sliced across cores.
+- Layers are sliced across cores. Island tracking only clears the pixels a layer actually set, instead of wiping the whole plate each time.

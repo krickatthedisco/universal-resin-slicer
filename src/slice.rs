@@ -123,6 +123,8 @@ struct Bits {
     w: usize,
     h: usize,
     data: Vec<u64>,
+    /// Inclusive pixel bounds of bits that are currently set.
+    dirty: Option<(i32, i32, i32, i32)>,
 }
 
 impl Bits {
@@ -132,11 +134,32 @@ impl Bits {
             w,
             h,
             data: vec![0; words],
+            dirty: None,
         }
     }
 
+    /// Forget the pixels set since the last clear. Only that rectangle is
+    /// written, so a small part does not wipe a full Photon plate every layer.
     fn clear(&mut self) {
-        self.data.fill(0);
+        let Some((x0, y0, x1, y1)) = self.dirty.take() else {
+            return;
+        };
+        if self.w == 0 || self.h == 0 || self.data.is_empty() {
+            return;
+        }
+        let x0 = x0.clamp(0, self.w as i32 - 1) as usize;
+        let x1 = x1.clamp(0, self.w as i32 - 1) as usize;
+        let y0 = y0.clamp(0, self.h as i32 - 1) as usize;
+        let y1 = y1.clamp(0, self.h as i32 - 1) as usize;
+        for y in y0..=y1 {
+            let start = y * self.w + x0;
+            let end = y * self.w + x1;
+            let first = start / 64;
+            let last = (end / 64).min(self.data.len() - 1);
+            for word in &mut self.data[first..=last] {
+                *word = 0;
+            }
+        }
     }
 
     fn set(&mut self, x: i32, y: i32) {
@@ -145,6 +168,10 @@ impl Bits {
         }
         let i = y as usize * self.w + x as usize;
         self.data[i / 64] |= 1u64 << (i % 64);
+        self.dirty = Some(match self.dirty {
+            Some((x0, y0, x1, y1)) => (x0.min(x), y0.min(y), x1.max(x), y1.max(y)),
+            None => (x, y, x, y),
+        });
     }
 
     fn get(&self, x: i32, y: i32) -> bool {
@@ -2681,6 +2708,24 @@ mod tests {
             (got - extra).abs() < 2.0,
             "rest added {got}s, expected about {extra}"
         );
+    }
+
+    #[test]
+    fn bits_clear_forgets_only_the_pixels_that_were_set() {
+        let mut bits = Bits::new(100, 40);
+        bits.set(10, 3);
+        bits.set(90, 20);
+        assert!(bits.get(10, 3));
+        assert!(bits.get(90, 20));
+        bits.clear();
+        assert!(!bits.get(10, 3));
+        assert!(!bits.get(90, 20));
+        bits.set(4, 4);
+        assert!(bits.get(4, 4));
+        assert!(!bits.get(10, 3));
+        assert!(!bits.get(90, 20));
+        bits.clear();
+        assert!(!bits.get(4, 4));
     }
 
     #[test]
