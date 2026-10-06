@@ -833,6 +833,98 @@ fn stitch_open_ends(segs: &mut Vec<([f32; 2], [f32; 2])>) {
     segs.extend(extra);
 }
 
+/// Which axes of the exposure file are opposite the plate.
+///
+/// The preview shows the part the way the top view does: +X to the right,
+/// +Y toward the top of the screen. The file may be rotated or mirrored for
+/// the printer. `flip_x` means file column 0 is the right of the plate.
+/// `flip_y` means file row 0 is the bottom of the plate.
+pub fn plate_axis_flips(machine: Machine) -> (bool, bool) {
+    let [fx, fy] = to_px(
+        [0.5 * machine.pixel_mm(), 0.5 * machine.pixel_mm_y()],
+        machine,
+    );
+    let flip_x = fx > machine.res_x as f32 * 0.5;
+    // Low model Y in the top half of the file means row 0 is the near edge.
+    // The preview puts +Y at the top, so that image is flipped.
+    let flip_y = fy < machine.res_y as f32 * 0.5;
+    (flip_x, flip_y)
+}
+
+/// Turn an exposure bitmap into plate orientation. Pixel `(0, 0)` is the
+/// minimum X at the back of the bed (+Y), matching a top view.
+pub fn orient_gray_to_plate(src: &[u8], width: u32, height: u32, machine: Machine) -> Vec<u8> {
+    let (flip_x, flip_y) = plate_axis_flips(machine);
+    let w = width as usize;
+    let h = height as usize;
+    if src.len() < w.saturating_mul(h) || w == 0 || h == 0 {
+        return Vec::new();
+    }
+    if !flip_x && !flip_y {
+        return src[..w * h].to_vec();
+    }
+    let mut out = vec![0u8; w * h];
+    for sy in 0..h {
+        let fy = if flip_y { h - 1 - sy } else { sy };
+        let src_row = fy * w;
+        let dst_row = sy * w;
+        if flip_x {
+            for sx in 0..w {
+                out[dst_row + sx] = src[src_row + (w - 1 - sx)];
+            }
+        } else {
+            out[dst_row..dst_row + w].copy_from_slice(&src[src_row..src_row + w]);
+        }
+    }
+    out
+}
+
+/// Flip a tightly packed RGBA image the same way as `orient_gray_to_plate`.
+pub fn flip_rgba(rgba: &mut [u8], width: u32, height: u32, flip_x: bool, flip_y: bool) {
+    let w = width as usize;
+    let h = height as usize;
+    if (!flip_x && !flip_y) || rgba.len() < w.saturating_mul(h).saturating_mul(4) {
+        return;
+    }
+    if flip_y {
+        for y in 0..h / 2 {
+            let a = y * w * 4;
+            let b = (h - 1 - y) * w * 4;
+            for i in 0..w * 4 {
+                rgba.swap(a + i, b + i);
+            }
+        }
+    }
+    if flip_x {
+        for y in 0..h {
+            let row = y * w * 4;
+            for x in 0..w / 2 {
+                let a = row + x * 4;
+                let b = row + (w - 1 - x) * 4;
+                for i in 0..4 {
+                    rgba.swap(a + i, b + i);
+                }
+            }
+        }
+    }
+}
+
+/// Move an island box into the same plate pixels as `orient_gray_to_plate`.
+pub fn orient_bbox_to_plate(bbox: [i32; 4], width: i32, height: i32, machine: Machine) -> [i32; 4] {
+    let (flip_x, flip_y) = plate_axis_flips(machine);
+    let (x0, x1) = if flip_x {
+        (width - 1 - bbox[2], width - 1 - bbox[0])
+    } else {
+        (bbox[0], bbox[2])
+    };
+    let (y0, y1) = if flip_y {
+        (height - 1 - bbox[3], height - 1 - bbox[1])
+    } else {
+        (bbox[1], bbox[3])
+    };
+    [x0, y0, x1, y1]
+}
+
 fn to_px(p: [f32; 2], machine: Machine) -> [f32; 2] {
     let w = machine.res_x as f32;
     let h = machine.res_y as f32;
@@ -2662,6 +2754,57 @@ mod tests {
         let mut m = Machine::photon_m3_max();
         m.rotate_180 = false;
         m
+    }
+
+    fn tiny_machine() -> Machine {
+        let mut m = Machine::photon_m3_max();
+        m.res_x = 8;
+        m.res_y = 6;
+        m.rotate_180 = false;
+        m.mirror_x = false;
+        m.mirror_y = false;
+        m
+    }
+
+    #[test]
+    fn plate_preview_keeps_a_corner_put_whether_or_not_the_file_is_spun() {
+        let mut flags = Vec::new();
+        for rotate in [false, true] {
+            for mirror_x in [false, true] {
+                for mirror_y in [false, true] {
+                    flags.push((rotate, mirror_x, mirror_y));
+                }
+            }
+        }
+        for (rotate, mirror_x, mirror_y) in flags {
+            let mut machine = tiny_machine();
+            machine.rotate_180 = rotate;
+            machine.mirror_x = mirror_x;
+            machine.mirror_y = mirror_y;
+            let w = machine.res_x;
+            let h = machine.res_y;
+            let mut src = vec![0u8; (w * h) as usize];
+            // One pixel in from the high-X, high-Y corner of the bed.
+            let mx = (w as f32 - 1.5) * machine.pixel_mm();
+            let my = (h as f32 - 1.5) * machine.pixel_mm_y();
+            let [fx, fy] = to_px([mx, my], machine);
+            let ix = fx.floor() as usize;
+            let iy = fy.floor() as usize;
+            src[iy * w as usize + ix] = 200;
+            let plate = orient_gray_to_plate(&src, w, h, machine);
+            let sx = (w - 2) as usize;
+            let sy = 1usize;
+            assert_eq!(
+                plate[sy * w as usize + sx],
+                200,
+                "rotate {rotate} mirror {mirror_x},{mirror_y} put the corner at file {ix},{iy}"
+            );
+            assert_eq!(
+                plate.iter().filter(|p| **p == 200).count(),
+                1,
+                "the corner was copied more than once"
+            );
+        }
     }
 
     #[test]

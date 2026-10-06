@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.8
+
+- The layer preview matches the plate. +X is to the right and +Y is toward the top, the same as the top view. Rotate 180°, Mirror X, and Mirror Y still change the file the printer reads, and the Photon M3 Max default stays rotate 180°. Turning that off no longer leaves the preview mirrored.
+
 ## 0.2.7
 
 - The layer preview zooms and pans. Scroll zooms toward the pointer, drag moves the plate, and Fit or a double-click shows the whole layer again. 1:1 is one printer pixel per screen pixel, which is the slice itself. Zoomed out, any exposed printer pixel in a texel still shows, so a thin line is not dropped.

@@ -708,12 +708,14 @@ impl AmberApp {
             return;
         };
         let layer = &slice.layers[self.preview_index.min(slice.layers.len().saturating_sub(1))];
-        let Ok((w, h, rgba)) =
+        let Ok((w, h, mut rgba)) =
             slice::preview_rgba(&layer.rle, slice.width, slice.height, 1600, &layer.islands)
         else {
             self.status = "Could not decode that layer.".into();
             return;
         };
+        let (flip_x, flip_y) = slice::plate_axis_flips(self.machine);
+        slice::flip_rgba(&mut rgba, w, h, flip_x, flip_y);
         let Some(path) = rfd::FileDialog::new()
             .set_file_name(format!("layer_{:04}.png", layer.index))
             .add_filter("PNG", &["png"])
@@ -3450,7 +3452,7 @@ impl AmberApp {
             changed |= ui.checkbox(&mut self.machine.rotate_180, "Rotate exposure 180°").changed();
             changed |= ui.checkbox(&mut self.machine.mirror_x, "Mirror X").changed();
             changed |= ui.checkbox(&mut self.machine.mirror_y, "Mirror Y").changed();
-            ui.label("Print a 20 mm cube and flip these if the part comes out mirrored. The Photon M3 Max default is rotate 180°.");
+            ui.label("These change the file the printer reads. The layer preview stays matched to the plate. The Photon M3 Max file is rotated 180°.");
         });
         if changed {
             self.invalidate_slice();
@@ -4720,7 +4722,7 @@ impl AmberApp {
             ui.label(format!("{:.0}%", zoom * 100.0))
                 .on_hover_text("100% is one printer pixel per screen pixel");
             ui.label(
-                egui::RichText::new("Scroll zooms at the pointer. Drag pans.")
+                egui::RichText::new("Same way up as the top view. Scroll zooms, drag pans.")
                     .weak()
                     .small(),
             );
@@ -4846,13 +4848,31 @@ impl AmberApp {
         let Ok(gray) = slice::decode_rle(&layer.rle, slice.width, slice.height) else {
             return false;
         };
+        // The file may be rotated or mirrored for the printer. Show the
+        // layer the way the part sits on the bed, so the preview matches
+        // the top view instead of the raw exposure.
+        let gray = slice::orient_gray_to_plate(&gray, slice.width, slice.height, self.machine);
+        let islands = layer
+            .islands
+            .iter()
+            .map(|island| {
+                let mut island = island.clone();
+                island.bbox = slice::orient_bbox_to_plate(
+                    island.bbox,
+                    slice.width as i32,
+                    slice.height as i32,
+                    self.machine,
+                );
+                island
+            })
+            .collect();
         let plate = PreviewPlate {
             gen,
             layer: index,
             width: slice.width,
             height: slice.height,
             gray,
-            islands: layer.islands.clone(),
+            islands,
         };
         self.preview_plate = Some(plate);
         self.preview_stamp = None;
