@@ -1,7 +1,7 @@
 //! Amber is a desktop resin slicer. The first machine it knows how to drive
 //! is the Anycubic Photon M3 Max.
 
-pub const VERSION: &str = "0.2.0";
+pub const VERSION: &str = "0.2.1";
 
 pub mod app;
 pub mod catalog;

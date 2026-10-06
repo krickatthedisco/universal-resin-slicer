@@ -803,6 +803,76 @@ pub fn smooth_normals(mesh: &Mesh) -> Vec<[f32; 3]> {
     acc
 }
 
+/// The empty inside of a hollow model: the surface moved in by `inset`,
+/// closed flat at `z_lo` and `z_hi`, and wound so it subtracts from the shell.
+///
+/// The cut view draws this with the outside. The stencil cap then fills only
+/// the wall, and the opening shows the cavity. Top and bottom caps stay solid
+/// because the void stops at those planes.
+pub fn cavity_shell(mesh: &Mesh, inset: f32, z_lo: f32, z_hi: f32) -> Option<Mesh> {
+    if inset < 0.05 || z_hi < z_lo + 0.05 || mesh.indices.len() < 3 {
+        return None;
+    }
+    let inner = inset_along_normals(mesh, inset)?;
+    if inner.signed_volume_mm3() < 1.0 {
+        return None;
+    }
+    let (below, _) = inner.split_at_z(z_hi);
+    if below.triangle_count() == 0 {
+        return None;
+    }
+    let (_, mut cavity) = below.split_at_z(z_lo);
+    if cavity.signed_volume_mm3() < 1.0 {
+        return None;
+    }
+    cavity.flip_winding();
+    Some(cavity)
+}
+
+fn inset_along_normals(mesh: &Mesh, distance: f32) -> Option<Mesh> {
+    let count = mesh.vertices.len();
+    if count == 0 {
+        return None;
+    }
+    let mut acc = vec![[0.0f32; 3]; count];
+    for tri in mesh.indices.chunks_exact(3) {
+        let a = mesh.vertices[tri[0] as usize];
+        let b = mesh.vertices[tri[1] as usize];
+        let c = mesh.vertices[tri[2] as usize];
+        let ux = b[0] - a[0];
+        let uy = b[1] - a[1];
+        let uz = b[2] - a[2];
+        let vx = c[0] - a[0];
+        let vy = c[1] - a[1];
+        let vz = c[2] - a[2];
+        let cross = [uy * vz - uz * vy, uz * vx - ux * vz, ux * vy - uy * vx];
+        for &index in tri {
+            let slot = &mut acc[index as usize];
+            slot[0] += cross[0];
+            slot[1] += cross[1];
+            slot[2] += cross[2];
+        }
+    }
+    let mut vertices = Vec::with_capacity(count);
+    for (point, normal) in mesh.vertices.iter().zip(acc.iter()) {
+        let len = (normal[0] * normal[0] + normal[1] * normal[1] + normal[2] * normal[2]).sqrt();
+        if len < 1e-8 {
+            vertices.push(*point);
+            continue;
+        }
+        let scale = distance / len;
+        vertices.push([
+            point[0] - normal[0] * scale,
+            point[1] - normal[1] * scale,
+            point[2] - normal[2] * scale,
+        ]);
+    }
+    Some(Mesh {
+        vertices,
+        indices: mesh.indices.clone(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -830,5 +900,82 @@ mod tests {
             (low + high - whole).abs() < 2.0,
             "sum {low}+{high} vs {whole}"
         );
+    }
+
+    #[test]
+    fn a_hollow_box_cavity_sits_inside_and_stops_at_the_caps() {
+        let mesh = box_mesh([0.0, 0.0, 0.0], [10.0, 10.0, 10.0]);
+        let cavity = cavity_shell(&mesh, 2.0, 1.5, 8.5).expect("cavity");
+        assert!(
+            cavity.signed_volume_mm3() < 0.0,
+            "the cavity should subtract, volume {}",
+            cavity.signed_volume_mm3()
+        );
+        let (min, max) = cavity.bounds().unwrap();
+        assert!(min[2] >= 1.4 && max[2] <= 8.6, "z bounds {min:?} {max:?}");
+        assert!(min[0] > 0.3 && max[0] < 9.7, "the void should sit inside x");
+        assert!(
+            mesh_contains(&cavity, [5.0, 5.0, 5.0]),
+            "the middle of the hollow is not empty"
+        );
+        assert!(
+            !mesh_contains(&cavity, [0.4, 5.0, 5.0]),
+            "the wall was carved out"
+        );
+        assert!(
+            !mesh_contains(&cavity, [5.0, 5.0, 9.2]),
+            "the top cap was hollowed"
+        );
+    }
+
+    fn mesh_contains(mesh: &Mesh, origin: [f32; 3]) -> bool {
+        let dir = [1.0, 0.017, 0.011];
+        let mut hits = 0i32;
+        for tri in mesh.indices.chunks_exact(3) {
+            let a = mesh.vertices[tri[0] as usize];
+            let b = mesh.vertices[tri[1] as usize];
+            let c = mesh.vertices[tri[2] as usize];
+            if ray_hits_triangle(origin, dir, a, b, c) {
+                hits += 1;
+            }
+        }
+        hits % 2 == 1
+    }
+
+    fn ray_hits_triangle(
+        origin: [f32; 3],
+        dir: [f32; 3],
+        a: [f32; 3],
+        b: [f32; 3],
+        c: [f32; 3],
+    ) -> bool {
+        let e1 = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+        let e2 = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
+        let p = [
+            dir[1] * e2[2] - dir[2] * e2[1],
+            dir[2] * e2[0] - dir[0] * e2[2],
+            dir[0] * e2[1] - dir[1] * e2[0],
+        ];
+        let det = e1[0] * p[0] + e1[1] * p[1] + e1[2] * p[2];
+        if det.abs() < 1e-8 {
+            return false;
+        }
+        let inv = 1.0 / det;
+        let tvec = [origin[0] - a[0], origin[1] - a[1], origin[2] - a[2]];
+        let u = (tvec[0] * p[0] + tvec[1] * p[1] + tvec[2] * p[2]) * inv;
+        if !(0.0..=1.0).contains(&u) {
+            return false;
+        }
+        let q = [
+            tvec[1] * e1[2] - tvec[2] * e1[1],
+            tvec[2] * e1[0] - tvec[0] * e1[2],
+            tvec[0] * e1[1] - tvec[1] * e1[0],
+        ];
+        let v = (dir[0] * q[0] + dir[1] * q[1] + dir[2] * q[2]) * inv;
+        if v < 0.0 || u + v > 1.0 {
+            return false;
+        }
+        let t = (e2[0] * q[0] + e2[1] * q[1] + e2[2] * q[2]) * inv;
+        t > 1e-4
     }
 }

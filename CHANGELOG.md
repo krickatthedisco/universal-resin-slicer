@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.1
+
+- A hollow model shows its wall and the empty inside in the cut view. The top and bottom caps stay solid, the same as the slice.
+- The GitHub page has a Sponsor this project link to https://buymeacoffee.com/krickatthedisco.
+
 ## 0.2.0
 
 - Prepare cuts the model with two handles: one at the top of the part, and one that comes up from the bottom. Each cut is capped the way a model viewer caps a clip plane, one solid face with the holes left open. The stack of thin strips that drew dark bands across the cut is gone.

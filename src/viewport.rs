@@ -302,12 +302,13 @@ impl ViewCache {
             } else {
                 [0.76, 0.64, 0.46]
             };
-            let local_key = (obj.id, obj.mesh_rev);
+            let shell = shell_stamp(obj);
+            let local_key = (obj.id, shell);
             live_locals.insert(local_key);
             let local = if let Some(buf) = self.locals.get(&local_key) {
                 buf.clone()
             } else {
-                let buf = Arc::new(local_tris(&obj.mesh));
+                let buf = Arc::new(local_tris(&view_mesh(obj)));
                 self.locals.insert(local_key, buf.clone());
                 buf
             };
@@ -316,7 +317,7 @@ impl ViewCache {
                 .unwrap_or((1.0, 0.0));
             objects.push(ObjectFrame {
                 id: obj.id,
-                mesh_rev: obj.mesh_rev,
+                mesh_rev: shell,
                 model: Document::matrix(obj),
                 color,
                 local,
@@ -414,6 +415,52 @@ fn world_stamp(structure: u64, plate: Vec3, selection: Selection, view: &PlateVi
         h = h.wrapping_mul(0x9E3779B1).wrapping_add(n);
     }
     h
+}
+
+/// Outside shell, plus the empty inside when the model is hollow.
+fn view_mesh(obj: &crate::scene::Object) -> Mesh {
+    if !obj.hollow || obj.wall_mm < 0.05 {
+        return obj.mesh.clone();
+    }
+    let mat = Document::matrix(obj);
+    if mat.determinant().abs() < 1e-8 {
+        return obj.mesh.clone();
+    }
+    let world = Document::world_mesh(obj);
+    let Some((min, max)) = world.bounds() else {
+        return obj.mesh.clone();
+    };
+    let z_lo = min[2] + obj.bottom_cap_mm;
+    let z_hi = max[2] - obj.top_cap_mm;
+    let Some(cavity) = crate::mesh::cavity_shell(&world, obj.wall_mm, z_lo, z_hi) else {
+        return obj.mesh.clone();
+    };
+    let inv = mat.inverse();
+    let local = cavity.transformed(|p| inv.transform_point3(Vec3::from_array(p)).to_array());
+    let mut mesh = obj.mesh.clone();
+    mesh.append(&local);
+    mesh
+}
+
+fn shell_stamp(obj: &crate::scene::Object) -> u64 {
+    if !obj.hollow {
+        return obj.mesh_rev;
+    }
+    let mut stamp = obj.mesh_rev.wrapping_add(0xA11);
+    for n in [
+        quant(obj.wall_mm) as u64,
+        quant(obj.bottom_cap_mm) as u64,
+        quant(obj.top_cap_mm) as u64,
+        quant(obj.rotation_deg.x) as u64,
+        quant(obj.rotation_deg.y) as u64,
+        quant(obj.rotation_deg.z) as u64,
+        (obj.scale.x * 1000.0).round() as u64,
+        (obj.scale.y * 1000.0).round() as u64,
+        (obj.scale.z * 1000.0).round() as u64,
+    ] {
+        stamp = stamp.wrapping_mul(131).wrapping_add(n);
+    }
+    stamp
 }
 
 fn local_tris(mesh: &Mesh) -> Vec<f32> {

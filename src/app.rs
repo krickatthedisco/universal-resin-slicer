@@ -1896,7 +1896,7 @@ impl AmberApp {
         self.doc.touch_xform();
         self.invalidate_slice();
         self.status = if on {
-            "This model will be hollowed when you slice. Punch a hole so resin can drain.".into()
+            "The cut shows the wall and the empty inside. Punch a hole so resin can drain.".into()
         } else {
             "This model will print solid.".into()
         };
@@ -2473,7 +2473,7 @@ impl AmberApp {
 
     fn hollow_ui(&mut self, ui: &mut egui::Ui) {
         ui.heading("Hollow");
-        ui.label("The inside stays empty. Resin infill is not offered: it traps resin and blows out the print.");
+        ui.label("The inside stays empty. The cut on the right shows the wall and that cavity. Resin infill is not offered: it traps resin and blows out the print.");
         let Some(id) = self.doc.edit_target() else {
             ui.label("Select a model. Hollowing applies only to it.");
             return;
