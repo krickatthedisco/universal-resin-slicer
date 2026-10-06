@@ -620,7 +620,9 @@ impl AmberApp {
             };
             with_amber_extension(path)
         } else {
-            self.plate_path.clone().unwrap_or_else(|| PathBuf::from("plate.amber"))
+            self.plate_path
+                .clone()
+                .unwrap_or_else(|| PathBuf::from("plate.amber"))
         };
         match plate::write_plate(&path, &self.plate_data()) {
             Ok(()) => {
@@ -727,12 +729,10 @@ impl AmberApp {
         let duplicate = ctx.input(|i| i.key_pressed(egui::Key::D) && i.modifiers.command);
         let open = ctx.input(|i| i.key_pressed(egui::Key::O) && i.modifiers.command);
         let slice_now = ctx.input(|i| i.key_pressed(egui::Key::Enter) && i.modifiers.command);
-        let save_plate = ctx.input(|i| {
-            i.key_pressed(egui::Key::S) && i.modifiers.command && i.modifiers.shift
-        });
-        let save = ctx.input(|i| {
-            i.key_pressed(egui::Key::S) && i.modifiers.command && !i.modifiers.shift
-        });
+        let save_plate =
+            ctx.input(|i| i.key_pressed(egui::Key::S) && i.modifiers.command && i.modifiers.shift);
+        let save =
+            ctx.input(|i| i.key_pressed(egui::Key::S) && i.modifiers.command && !i.modifiers.shift);
         let help = ctx.input(|i| i.key_pressed(egui::Key::F1));
         let fit = ctx.input(|i| i.key_pressed(egui::Key::F));
         if help {
@@ -2064,7 +2064,7 @@ impl AmberApp {
 
     fn apply_mirror(&mut self, id: u64, axis: usize) {
         if self.keep_original {
-            if let Some(copy) = self.doc.duplicate(id) {
+            if let Some(copy) = self.doc.duplicate_mesh_only(id) {
                 self.doc.mirror(copy, axis);
             }
         } else {

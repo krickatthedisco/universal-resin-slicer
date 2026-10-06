@@ -80,8 +80,12 @@ enum Undo {
     Deleted {
         object: Object,
         supports: Vec<Support>,
+        drains: Vec<DrainHole>,
     },
-    Added(u64),
+    Added {
+        id: u64,
+        drains: Vec<u64>,
+    },
     Cut {
         original: Object,
         added: u64,
@@ -252,7 +256,10 @@ impl Document {
         if let Some(obj) = self.objects.last_mut() {
             cache_bounds(obj);
         }
-        self.push_undo(Undo::Added(id));
+        self.push_undo(Undo::Added {
+            id,
+            drains: Vec::new(),
+        });
         self.selection = Selection::Object(id);
         self.touch();
         id
@@ -455,7 +462,7 @@ impl Document {
                 })
             }
             Undo::Drains(_) => Some(Undo::Drains(self.drains.clone())),
-            Undo::Added(id) => {
+            Undo::Added { id, drains } => {
                 let object = self.object(*id)?.clone();
                 let supports = self
                     .supports
@@ -463,9 +470,22 @@ impl Document {
                     .copied()
                     .filter(|support| support.object_id == *id)
                     .collect();
-                Some(Undo::Deleted { object, supports })
+                let holes = self
+                    .drains
+                    .iter()
+                    .copied()
+                    .filter(|drain| drains.contains(&drain.id))
+                    .collect();
+                Some(Undo::Deleted {
+                    object,
+                    supports,
+                    drains: holes,
+                })
             }
-            Undo::Deleted { object, .. } => Some(Undo::Added(object.id)),
+            Undo::Deleted { object, drains, .. } => Some(Undo::Added {
+                id: object.id,
+                drains: drains.iter().map(|drain| drain.id).collect(),
+            }),
             Undo::Cut { original, added } => {
                 let lower = self.object(original.id)?.clone();
                 let upper = self.object(*added)?.clone();
@@ -504,14 +524,20 @@ impl Document {
                 }
             }
             Undo::Drains(list) => self.drains = list,
-            Undo::Deleted { object, supports } => {
+            Undo::Deleted {
+                object,
+                supports,
+                drains,
+            } => {
                 self.selection = Selection::Object(object.id);
                 self.supports.extend(supports);
+                self.drains.extend(drains);
                 self.objects.push(object);
             }
-            Undo::Added(id) => {
+            Undo::Added { id, drains } => {
                 self.objects.retain(|o| o.id != id);
                 self.supports.retain(|support| support.object_id != id);
+                self.drains.retain(|drain| !drains.contains(&drain.id));
                 if self.selection == Selection::Object(id) {
                     self.selection = Selection::None;
                 }
@@ -576,15 +602,101 @@ impl Document {
         self.touch_xform();
     }
 
+    fn drain_ids_touching(&self, id: u64) -> Vec<u64> {
+        let Some((min, max)) = self.object(id).and_then(Self::display_bounds) else {
+            return Vec::new();
+        };
+        self.drains
+            .iter()
+            .filter(|drain| {
+                drain.origin.x >= min.x - 2.0
+                    && drain.origin.x <= max.x + 2.0
+                    && drain.origin.y >= min.y - 2.0
+                    && drain.origin.y <= max.y + 2.0
+                    && drain.origin.z >= min.z - 4.0
+                    && drain.origin.z <= max.z + 2.0
+            })
+            .map(|drain| drain.id)
+            .collect()
+    }
+
+    /// Copy this model's tips and nearby holes onto another model, shifted by `delta`.
+    /// Returns the new hole ids so one undo can remove them with the copy.
+    fn copy_attachments(&mut self, from: u64, to: u64, delta: Vec3) -> Vec<u64> {
+        let tips: Vec<Support> = self
+            .supports
+            .iter()
+            .copied()
+            .filter(|support| support.object_id == from)
+            .collect();
+        for mut tip in tips {
+            tip.id = self.alloc();
+            tip.object_id = to;
+            tip.x += delta.x;
+            tip.y += delta.y;
+            tip.z_top += delta.z;
+            tip.z_base = (tip.z_base + delta.z).max(0.0);
+            self.supports.push(tip);
+        }
+        let holes: Vec<DrainHole> = {
+            let ids = self.drain_ids_touching(from);
+            self.drains
+                .iter()
+                .copied()
+                .filter(|drain| ids.contains(&drain.id))
+                .collect()
+        };
+        let mut new_ids = Vec::new();
+        for mut hole in holes {
+            hole.id = self.alloc();
+            hole.origin += delta;
+            new_ids.push(hole.id);
+            self.drains.push(hole);
+        }
+        new_ids
+    }
+
+    fn shift_attachments(&mut self, id: u64, delta: Vec3, holes: &[u64]) {
+        for support in &mut self.supports {
+            if support.object_id == id {
+                support.x += delta.x;
+                support.y += delta.y;
+                support.z_top += delta.z;
+                support.z_base = (support.z_base + delta.z).max(0.0);
+            }
+        }
+        for drain in &mut self.drains {
+            if holes.contains(&drain.id) {
+                drain.origin += delta;
+            }
+        }
+    }
+
     pub fn duplicate(&mut self, id: u64) -> Option<u64> {
+        self.duplicate_from(id, true)
+    }
+
+    /// A copy of the mesh only. Used when the next step mirrors it, so the
+    /// tips are not left on the unmirrored side.
+    pub fn duplicate_mesh_only(&mut self, id: u64) -> Option<u64> {
+        self.duplicate_from(id, false)
+    }
+
+    fn duplicate_from(&mut self, id: u64, attachments: bool) -> Option<u64> {
         let obj = self.object(id)?.clone();
         let new_id = self.alloc();
         let mut copy = obj;
         copy.id = new_id;
         copy.name = format!("{} copy", copy.name);
-        copy.position.x += 12.0;
+        let delta = Vec3::new(12.0, 0.0, 0.0);
+        copy.position += delta;
         self.objects.push(copy);
-        self.push_undo(Undo::Added(new_id));
+        let drains = if attachments {
+            self.copy_attachments(id, new_id, delta)
+        } else {
+            Vec::new()
+        };
+        self.push_undo(Undo::Added { id: new_id, drains });
         self.selection = Selection::Object(new_id);
         self.touch();
         Some(new_id)
@@ -634,10 +746,11 @@ impl Document {
             let mut copy = origin.clone();
             copy.id = new_id;
             copy.name = format!("{} {}", origin.name, n + 2);
-            copy.position.x += x - min.x;
-            copy.position.y += y - min.y;
+            let delta = Vec3::new(x - min.x, y - min.y, 0.0);
+            copy.position += delta;
             self.objects.push(copy);
-            self.push_undo(Undo::Added(new_id));
+            let drains = self.copy_attachments(id, new_id, delta);
+            self.push_undo(Undo::Added { id: new_id, drains });
             added += 1;
             col += 1;
         }
@@ -757,7 +870,11 @@ impl Document {
                         .filter(|s| s.object_id == id)
                         .collect();
                     self.supports.retain(|s| s.object_id != id);
-                    self.push_undo(Undo::Deleted { object, supports });
+                    self.push_undo(Undo::Deleted {
+                        object,
+                        supports,
+                        drains: Vec::new(),
+                    });
                     self.selection = Selection::None;
                     self.touch();
                 }
@@ -858,12 +975,20 @@ impl Document {
             return Err("That model is gone.");
         };
         self.push_xform_undo(id);
+        let hole_ids = self.drain_ids_touching(id);
+        if self.supports.iter().any(|support| support.object_id == id) {
+            self.remember_supports();
+        }
+        if !hole_ids.is_empty() {
+            self.push_undo(Undo::Drains(self.drains.clone()));
+        }
         let dx0 = gap - min.x;
         let dy0 = gap - min.y;
         if let Some(obj) = self.object_mut(id) {
             obj.position.x += dx0;
             obj.position.y += dy0;
         }
+        self.shift_attachments(id, Vec3::new(dx0, dy0, 0.0), &hole_ids);
         let mut added = 0usize;
         for row in 0..rows {
             for col in 0..cols {
@@ -877,7 +1002,9 @@ impl Document {
                 copy.position.x += dx0 + col as f32 * (w + gap);
                 copy.position.y += dy0 + row as f32 * (d + gap);
                 self.objects.push(copy);
-                self.push_undo(Undo::Added(new_id));
+                let delta = Vec3::new(col as f32 * (w + gap), row as f32 * (d + gap), 0.0);
+                let drains = self.copy_attachments(id, new_id, delta);
+                self.push_undo(Undo::Added { id: new_id, drains });
                 added += 1;
             }
         }
@@ -1678,6 +1805,36 @@ mod tests {
         hidden.insert(id);
         assert!(doc.raycast_visible(origin, dir, &hidden, None).is_none());
         assert!(doc.raycast(origin, dir).is_some());
+    }
+
+    #[test]
+    fn a_copy_keeps_the_supports_and_the_hole() {
+        let mut doc = Document::new();
+        let id = doc.add_mesh("box".into(), box_mesh([0.0, 0.0, 0.0], [10.0, 10.0, 10.0]));
+        doc.add_support_at(Vec3::new(4.0, 4.0, 10.0), id);
+        doc.punch_bottom_drain(id);
+        let tip_x = doc.supports[0].x;
+        let copy = doc.duplicate(id).unwrap();
+        let copied: Vec<_> = doc
+            .supports
+            .iter()
+            .filter(|support| support.object_id == copy)
+            .collect();
+        assert_eq!(copied.len(), 1);
+        assert!(
+            (copied[0].x - (tip_x + 12.0)).abs() < 0.05,
+            "x {}",
+            copied[0].x
+        );
+        assert_eq!(doc.supports.iter().filter(|s| s.object_id == id).count(), 1);
+        assert_eq!(doc.drains.len(), 2);
+        assert!(doc.undo());
+        assert_eq!(doc.objects.len(), 1);
+        assert_eq!(doc.supports.len(), 1);
+        assert_eq!(doc.drains.len(), 1);
+        assert!(doc.redo());
+        assert_eq!(doc.supports.len(), 2);
+        assert_eq!(doc.drains.len(), 2);
     }
 
     #[test]

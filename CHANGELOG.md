@@ -18,3 +18,4 @@ Amber is a desktop resin slicer. The first printer it was built around is the An
 - Layers are sliced across cores. Island tracking only clears the pixels a layer actually set, instead of wiping the whole plate each time.
 - Redo (Ctrl+Y) puts an undone edit back, including a move, a delete, and a cut. A new edit clears that. The status line says the next step: open a model, punch a hole, add supports, slice, or save.
 - Save plate writes an `.amber` file: the models, where they sit, their supports and holes, and the printer and resin settings. Open plate puts that job back. Ctrl+Shift+S saves it again.
+- Duplicate, copy across the bed, and fill the bed take the supports and the drain holes with each copy. Undo removes that copy's tips and holes.
