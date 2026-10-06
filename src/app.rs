@@ -608,7 +608,13 @@ impl AmberApp {
         }
         let delete =
             ctx.input(|i| i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace));
-        let undo = ctx.input(|i| i.key_pressed(egui::Key::Z) && i.modifiers.command);
+        let undo =
+            ctx.input(|i| i.key_pressed(egui::Key::Z) && i.modifiers.command && !i.modifiers.shift);
+        let redo = ctx.input(|i| {
+            i.modifiers.command
+                && (i.key_pressed(egui::Key::Y)
+                    || (i.key_pressed(egui::Key::Z) && i.modifiers.shift))
+        });
         let duplicate = ctx.input(|i| i.key_pressed(egui::Key::D) && i.modifiers.command);
         let open = ctx.input(|i| i.key_pressed(egui::Key::O) && i.modifiers.command);
         let slice_now = ctx.input(|i| i.key_pressed(egui::Key::Enter) && i.modifiers.command);
@@ -631,8 +637,10 @@ impl AmberApp {
             self.export_print(false);
         }
         if undo {
-            self.doc.undo();
-            self.invalidate_slice();
+            self.undo_edit();
+        }
+        if redo {
+            self.redo_edit();
         }
         if delete {
             self.doc.delete_selection();
@@ -839,8 +847,11 @@ impl AmberApp {
             });
             ui.menu_button("Edit", |ui| {
                 if ui.button("Undo").clicked() {
-                    self.doc.undo();
-                    self.invalidate_slice();
+                    self.undo_edit();
+                    ui.close();
+                }
+                if ui.button("Redo").clicked() {
+                    self.redo_edit();
                     ui.close();
                 }
                 if ui.button("Duplicate").clicked() {
@@ -1028,7 +1039,63 @@ impl AmberApp {
         }
     }
 
+    fn next_step(&self) -> String {
+        if self.job.is_some() {
+            return "Slicing. The bar shows how far along it is.".into();
+        }
+        if self.doc.objects.is_empty() {
+            return "Next: open a model, or drop an STL, OBJ, or 3MF on the plate.".into();
+        }
+        if self.doc.outside_plate(self.plate()) {
+            return "Next: move the model back onto the plate.".into();
+        }
+        if let Some(name) = self.doc.hollow_without_drain() {
+            return format!("Next: punch a hole in {name} so resin can drain.");
+        }
+        let floating = self.doc.objects.iter().any(|obj| {
+            Document::display_bounds(obj).is_some_and(|(min, _)| min.z > 0.4)
+                && !self
+                    .doc
+                    .supports
+                    .iter()
+                    .any(|support| support.object_id == obj.id)
+        });
+        if floating {
+            return "Next: add supports, or put the model on the bed.".into();
+        }
+        if self.slice.is_none() {
+            return "Next: slice, then save the file the printer reads.".into();
+        }
+        if self.slice_gen != self.doc.changed {
+            return "Next: slice again. The plate changed after the last slice.".into();
+        }
+        if !self.island_marks.is_empty() && self.model_stamp() == self.island_stamp {
+            return "Next: the red marks are islands. Click one with Support, then slice again."
+                .into();
+        }
+        "Next: save the file, copy it to a USB stick, and print it from the printer.".into()
+    }
+
+    fn undo_edit(&mut self) {
+        if self.doc.undo() {
+            self.invalidate_slice();
+            self.status = "Undid the last edit.".into();
+        } else {
+            self.status = "Nothing to undo.".into();
+        }
+    }
+
+    fn redo_edit(&mut self) {
+        if self.doc.redo() {
+            self.invalidate_slice();
+            self.status = "Redid that edit.".into();
+        } else {
+            self.status = "Nothing to redo.".into();
+        }
+    }
+
     fn status_bar(&self, ui: &mut egui::Ui) {
+        ui.label(egui::RichText::new(self.next_step()).strong());
         ui.horizontal(|ui| {
             let tris: usize = self
                 .doc
@@ -1058,6 +1125,7 @@ impl AmberApp {
 
     fn simple_panel(&mut self, ui: &mut egui::Ui) {
         ui.heading("Let's print");
+        ui.label(egui::RichText::new(self.next_step()).strong());
         ui.label("Simple keeps the path short. Workshop, in the top bar, has every control.");
         if self.simple_page == 1 {
             if ui.button("Back").clicked() {
@@ -2934,16 +3002,8 @@ impl AmberApp {
         let color = [0.90, 0.22, 0.18];
         for &(x, y, z) in &self.island_marks {
             let arm = 0.7;
-            frame.add_line(
-                Vec3::new(x - arm, y, z),
-                Vec3::new(x + arm, y, z),
-                color,
-            );
-            frame.add_line(
-                Vec3::new(x, y - arm, z),
-                Vec3::new(x, y + arm, z),
-                color,
-            );
+            frame.add_line(Vec3::new(x - arm, y, z), Vec3::new(x + arm, y, z), color);
+            frame.add_line(Vec3::new(x, y - arm, z), Vec3::new(x, y + arm, z), color);
             frame.add_line(Vec3::new(x, y, z), Vec3::new(x, y, z + 1.4), color);
         }
     }
@@ -3129,7 +3189,7 @@ impl AmberApp {
                 ui.label("Right-click a model for the same edits. Right-drag orbits, and you can swing under the bed. The bed turns clear so you can click an underside.");
                 ui.label("View → Cut the view hides the model above a height, so you can click the surface that is left and place a support there. The checkbox beside a model hides it in the view. It still prints. Tips only draws the contact points. After a slice, red marks on the plate are islands. Click one with Support to plant a tip there.");
                 ui.separator();
-                ui.label("Ctrl+O open    Ctrl+Z undo    Ctrl+D duplicate    Delete remove");
+                ui.label("Ctrl+O open    Ctrl+Z undo    Ctrl+Y redo    Ctrl+D duplicate    Delete remove");
                 ui.label("Ctrl+Enter slice    Ctrl+S save    F1 this page");
                 ui.label("On the plate, the arrow keys nudge the model by 1 mm (Shift is 0.1 mm). F fits the camera. In the layer view, the arrows step through layers.");
                 ui.separator();
@@ -3443,7 +3503,9 @@ impl AmberApp {
             }
         });
         if mark_note {
-            ui.label("Red marks on the plate (Prepare) are these islands. Support, then click a mark.");
+            ui.label(
+                "Red marks on the plate (Prepare) are these islands. Support, then click a mark.",
+            );
         }
         let (caption, seals) = {
             let layer = &slice.layers[self.preview_index];

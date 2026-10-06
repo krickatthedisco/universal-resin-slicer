@@ -85,6 +85,11 @@ enum Undo {
         original: Object,
         added: u64,
     },
+    /// Both pieces of a cut, so redo can put them back.
+    RestoreCut {
+        lower: Object,
+        upper: Object,
+    },
 }
 
 pub struct Document {
@@ -111,6 +116,7 @@ pub struct Document {
     pub raft_angle: f32,
     next_id: u64,
     undo: Vec<Undo>,
+    redo: Vec<Undo>,
     pub changed: u64,
     /// Bumped for supports, meshes, and raft settings. A plain move does not.
     pub structure: u64,
@@ -138,6 +144,7 @@ impl Document {
             raft_angle: 30.0,
             next_id: 1,
             undo: Vec::new(),
+            redo: Vec::new(),
             changed: 1,
             structure: 1,
         }
@@ -244,7 +251,7 @@ impl Document {
         if let Some(obj) = self.objects.last_mut() {
             cache_bounds(obj);
         }
-        self.undo.push(Undo::Added(id));
+        self.push_undo(Undo::Added(id));
         self.selection = Selection::Object(id);
         self.touch();
         id
@@ -342,21 +349,105 @@ impl Document {
     }
 
     pub fn remember_xform(&mut self, id: u64, position: Vec3, rotation_deg: Vec3, scale: Vec3) {
-        self.undo.push(Undo::Xform {
+        self.push_undo(Undo::Xform {
             id,
             position,
             rotation_deg,
             scale,
         });
+    }
+
+    fn push_undo(&mut self, edit: Undo) {
+        self.undo.push(edit);
         if self.undo.len() > 40 {
             self.undo.remove(0);
         }
+        self.redo.clear();
     }
 
-    pub fn undo(&mut self) {
+    /// Put the last edit back. Returns false when there is nothing to undo.
+    pub fn undo(&mut self) -> bool {
         let Some(edit) = self.undo.pop() else {
-            return;
+            return false;
         };
+        if let Some(inverse) = self.capture_inverse(&edit) {
+            self.redo.push(inverse);
+            if self.redo.len() > 40 {
+                self.redo.remove(0);
+            }
+        }
+        self.apply_history(edit);
+        self.touch();
+        true
+    }
+
+    /// Reapply the last undone edit. Returns false when there is nothing to redo.
+    pub fn redo(&mut self) -> bool {
+        let Some(edit) = self.redo.pop() else {
+            return false;
+        };
+        if let Some(inverse) = self.capture_inverse(&edit) {
+            self.undo.push(inverse);
+            if self.undo.len() > 40 {
+                self.undo.remove(0);
+            }
+        }
+        self.apply_history(edit);
+        self.touch();
+        true
+    }
+
+    fn capture_inverse(&self, edit: &Undo) -> Option<Undo> {
+        match edit {
+            Undo::Xform { id, .. } => {
+                let obj = self.object(*id)?;
+                Some(Undo::Xform {
+                    id: *id,
+                    position: obj.position,
+                    rotation_deg: obj.rotation_deg,
+                    scale: obj.scale,
+                })
+            }
+            Undo::Supports { lifted, .. } => {
+                let mut now = Vec::new();
+                for (id, _) in lifted {
+                    if let Some(obj) = self.object(*id) {
+                        now.push((*id, obj.position));
+                    }
+                }
+                Some(Undo::Supports {
+                    list: self.supports.clone(),
+                    lifted: now,
+                })
+            }
+            Undo::Drains(_) => Some(Undo::Drains(self.drains.clone())),
+            Undo::Added(id) => {
+                let object = self.object(*id)?.clone();
+                let supports = self
+                    .supports
+                    .iter()
+                    .copied()
+                    .filter(|support| support.object_id == *id)
+                    .collect();
+                Some(Undo::Deleted { object, supports })
+            }
+            Undo::Deleted { object, .. } => Some(Undo::Added(object.id)),
+            Undo::Cut { original, added } => {
+                let lower = self.object(original.id)?.clone();
+                let upper = self.object(*added)?.clone();
+                Some(Undo::RestoreCut { lower, upper })
+            }
+            Undo::RestoreCut { lower, upper } => {
+                let original = self.object(lower.id)?.clone();
+                Some(Undo::Cut {
+                    original,
+                    added: upper.id,
+                })
+            }
+        }
+    }
+
+    fn apply_history(&mut self, edit: Undo) {
         match edit {
             Undo::Xform {
                 id,
@@ -386,6 +477,7 @@ impl Document {
             }
             Undo::Added(id) => {
                 self.objects.retain(|o| o.id != id);
+                self.supports.retain(|support| support.object_id != id);
                 if self.selection == Selection::Object(id) {
                     self.selection = Selection::None;
                 }
@@ -400,8 +492,22 @@ impl Document {
                 }
                 self.selection = Selection::Object(id);
             }
+            Undo::RestoreCut { lower, upper } => {
+                let lower_id = lower.id;
+                let upper_id = upper.id;
+                if let Some(pos) = self.objects.iter().position(|o| o.id == lower_id) {
+                    self.objects[pos] = lower;
+                } else {
+                    self.objects.push(lower);
+                }
+                if let Some(pos) = self.objects.iter().position(|o| o.id == upper_id) {
+                    self.objects[pos] = upper;
+                } else {
+                    self.objects.push(upper);
+                }
+                self.selection = Selection::Object(upper_id);
+            }
         }
-        self.touch();
     }
 
     pub fn drop_object(&mut self, id: u64) {
@@ -444,7 +550,7 @@ impl Document {
         copy.name = format!("{} copy", copy.name);
         copy.position.x += 12.0;
         self.objects.push(copy);
-        self.undo.push(Undo::Added(new_id));
+        self.push_undo(Undo::Added(new_id));
         self.selection = Selection::Object(new_id);
         self.touch();
         Some(new_id)
@@ -497,7 +603,7 @@ impl Document {
             copy.position.x += x - min.x;
             copy.position.y += y - min.y;
             self.objects.push(copy);
-            self.undo.push(Undo::Added(new_id));
+            self.push_undo(Undo::Added(new_id));
             added += 1;
             col += 1;
         }
@@ -546,7 +652,7 @@ impl Document {
         upper.name = format!("{} upper", obj.name);
         cache_bounds(&mut upper);
         self.objects.push(upper);
-        self.undo.push(Undo::Cut {
+        self.push_undo(Undo::Cut {
             original: obj,
             added,
         });
@@ -617,13 +723,13 @@ impl Document {
                         .filter(|s| s.object_id == id)
                         .collect();
                     self.supports.retain(|s| s.object_id != id);
-                    self.undo.push(Undo::Deleted { object, supports });
+                    self.push_undo(Undo::Deleted { object, supports });
                     self.selection = Selection::None;
                     self.touch();
                 }
             }
             Selection::Support(id) => {
-                self.undo.push(Undo::Supports {
+                self.push_undo(Undo::Supports {
                     list: self.supports.clone(),
                     lifted: Vec::new(),
                 });
@@ -632,7 +738,7 @@ impl Document {
                 self.touch();
             }
             Selection::Drain(id) => {
-                self.undo.push(Undo::Drains(self.drains.clone()));
+                self.push_undo(Undo::Drains(self.drains.clone()));
                 self.drains.retain(|d| d.id != id);
                 self.selection = Selection::None;
                 self.touch();
@@ -737,7 +843,7 @@ impl Document {
                 copy.position.x += dx0 + col as f32 * (w + gap);
                 copy.position.y += dy0 + row as f32 * (d + gap);
                 self.objects.push(copy);
-                self.undo.push(Undo::Added(new_id));
+                self.push_undo(Undo::Added(new_id));
                 added += 1;
             }
         }
@@ -791,13 +897,18 @@ impl Document {
     }
 
     pub fn auto_layout(&mut self, plate_x: f32, plate_y: f32) {
-        for obj in &self.objects {
-            self.undo.push(Undo::Xform {
+        let prior: Vec<Undo> = self
+            .objects
+            .iter()
+            .map(|obj| Undo::Xform {
                 id: obj.id,
                 position: obj.position,
                 rotation_deg: obj.rotation_deg,
                 scale: obj.scale,
-            });
+            })
+            .collect();
+        for edit in prior {
+            self.push_undo(edit);
         }
         let mut boxes: Vec<(u64, Vec3, Vec3)> = Vec::new();
         for obj in &self.objects {
@@ -889,20 +1000,17 @@ impl Document {
         }
         self.supports.retain(|s| s.object_id != id);
         self.supports.extend(found);
-        self.undo.push(Undo::Supports { list, lifted });
+        self.push_undo(Undo::Supports { list, lifted });
         self.touch();
         true
     }
 
     /// Remember the support list once, so a drag can move many times and still undo in one step.
     pub fn remember_supports(&mut self) {
-        self.undo.push(Undo::Supports {
+        self.push_undo(Undo::Supports {
             list: self.supports.clone(),
             lifted: Vec::new(),
         });
-        if self.undo.len() > 40 {
-            self.undo.remove(0);
-        }
     }
 
     /// The support tip closest to the ray, when it is within `radius` millimetres.
@@ -983,7 +1091,7 @@ impl Document {
         };
         let platform_only = obj.support.platform_only;
         let world = Self::world_mesh(obj);
-        self.undo.push(Undo::Supports {
+        self.push_undo(Undo::Supports {
             list: self.supports.clone(),
             lifted: Vec::new(),
         });
@@ -1033,7 +1141,7 @@ impl Document {
                 vertices: Vec::new(),
                 indices: Vec::new(),
             });
-        self.undo.push(Undo::Supports {
+        self.push_undo(Undo::Supports {
             list: self.supports.clone(),
             lifted: Vec::new(),
         });
@@ -1063,7 +1171,7 @@ impl Document {
         if !self.supports.iter().any(|s| s.object_id == id) {
             return false;
         }
-        self.undo.push(Undo::Supports {
+        self.push_undo(Undo::Supports {
             list: self.supports.clone(),
             lifted: Vec::new(),
         });
@@ -1089,7 +1197,7 @@ impl Document {
         let depth = self.drain_depth_mm.max(need).clamp(1.0, 40.0);
         let radius = (self.drain_diameter_mm * 0.5).clamp(0.2, 8.0);
         let origin = Vec3::new((min.x + max.x) * 0.5, (min.y + max.y) * 0.5, min.z + 0.3);
-        self.undo.push(Undo::Drains(self.drains.clone()));
+        self.push_undo(Undo::Drains(self.drains.clone()));
         let drain_id = self.alloc();
         self.drains.push(DrainHole {
             id: drain_id,
@@ -1120,7 +1228,7 @@ impl Document {
     }
 
     pub fn add_drain(&mut self, origin: Vec3, into_model: Vec3) {
-        self.undo.push(Undo::Drains(self.drains.clone()));
+        self.push_undo(Undo::Drains(self.drains.clone()));
         let id = self.alloc();
         let axis = if into_model.length() < 1e-4 {
             Vec3::NEG_Z
@@ -1536,5 +1644,54 @@ mod tests {
         hidden.insert(id);
         assert!(doc.raycast_visible(origin, dir, &hidden, None).is_none());
         assert!(doc.raycast(origin, dir).is_some());
+    }
+
+    #[test]
+    fn redo_puts_a_move_and_a_delete_back() {
+        let mut doc = Document::new();
+        let id = doc.add_mesh("box".into(), box_mesh([0.0, 0.0, 0.0], [10.0, 10.0, 10.0]));
+        doc.push_xform_undo(id);
+        doc.object_mut(id).unwrap().position.x = 8.0;
+        assert!(doc.undo());
+        assert!(doc.object(id).unwrap().position.x.abs() < 0.01);
+        assert!(doc.redo());
+        assert!((doc.object(id).unwrap().position.x - 8.0).abs() < 0.01);
+        doc.selection = Selection::Object(id);
+        doc.delete_selection();
+        assert!(doc.objects.is_empty());
+        assert!(doc.undo());
+        assert_eq!(doc.objects.len(), 1);
+        assert!(doc.redo());
+        assert!(doc.objects.is_empty());
+        assert!(doc.undo());
+        let id = doc.objects[0].id;
+        doc.push_xform_undo(id);
+        doc.object_mut(id).unwrap().position.y = 3.0;
+        assert!(!doc.redo());
+    }
+
+    #[test]
+    fn redo_restores_a_cut() {
+        let mut doc = Document::new();
+        let id = doc.add_mesh("box".into(), box_mesh([0.0, 0.0, 0.0], [10.0, 10.0, 20.0]));
+        doc.cut_at_z(id, 8.0).unwrap();
+        assert_eq!(doc.objects.len(), 2);
+        assert!(doc.undo());
+        assert_eq!(doc.objects.len(), 1);
+        assert!(doc.redo());
+        assert_eq!(doc.objects.len(), 2);
+        let heights: Vec<f32> = doc
+            .objects
+            .iter()
+            .filter_map(|obj| Document::world_bounds(obj).map(|(_, max)| max.z))
+            .collect();
+        assert!(
+            heights.iter().any(|z| (*z - 8.0).abs() < 0.2),
+            "{heights:?}"
+        );
+        assert!(
+            heights.iter().any(|z| (*z - 20.0).abs() < 0.2),
+            "{heights:?}"
+        );
     }
 }

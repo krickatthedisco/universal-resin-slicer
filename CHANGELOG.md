@@ -16,3 +16,4 @@ Amber is a desktop resin slicer. The first printer it was built around is the An
 - Anti-alias, optional image blur, XY offset, elephant foot, and shrink compensation.
 - Measure, overhang colors, overlap warning, layer preview, and a print time split into light and lifting.
 - Layers are sliced across cores. Island tracking only clears the pixels a layer actually set, instead of wiping the whole plate each time.
+- Redo (Ctrl+Y) puts an undone edit back, including a move, a delete, and a cut. A new edit clears that. The status line says the next step: open a model, punch a hole, add supports, slice, or save.
