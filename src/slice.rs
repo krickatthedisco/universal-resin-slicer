@@ -34,7 +34,13 @@ pub struct Hollow {
 pub struct Drain {
     pub origin: [f32; 3],
     pub axis: [f32; 3],
+    /// Radius at the mouth, outside the surface.
     pub radius_mm: f32,
+    /// Radius at the inner end. Zero uses `radius_mm`.
+    pub inner_radius_mm: f32,
+    /// How far the mouth stands out past the surface.
+    pub extend_mm: f32,
+    /// How far the hole runs into the model.
     pub depth_mm: f32,
 }
 
@@ -1469,17 +1475,45 @@ fn apply_drains(img: &mut Image, drains: &[Drain], z: f32, machine: Machine) {
 
 fn point_near_drain(point: [f32; 3], drain: &Drain) -> bool {
     let axis = normalize(drain.axis);
+    let extend = drain.extend_mm.max(0.0);
+    let depth = drain.depth_mm.max(0.0);
     let start = [
-        drain.origin[0] - axis[0] * 0.8,
-        drain.origin[1] - axis[1] * 0.8,
-        drain.origin[2] - axis[2] * 0.8,
+        drain.origin[0] - axis[0] * extend,
+        drain.origin[1] - axis[1] * extend,
+        drain.origin[2] - axis[2] * extend,
     ];
     let end = [
-        drain.origin[0] + axis[0] * drain.depth_mm,
-        drain.origin[1] + axis[1] * drain.depth_mm,
-        drain.origin[2] + axis[2] * drain.depth_mm,
+        drain.origin[0] + axis[0] * depth,
+        drain.origin[1] + axis[1] * depth,
+        drain.origin[2] + axis[2] * depth,
     ];
-    dist_point_segment(point, start, end) <= drain.radius_mm
+    let ab = [end[0] - start[0], end[1] - start[1], end[2] - start[2]];
+    let ap = [
+        point[0] - start[0],
+        point[1] - start[1],
+        point[2] - start[2],
+    ];
+    let ab2 = ab[0] * ab[0] + ab[1] * ab[1] + ab[2] * ab[2];
+    let t = if ab2 < 1e-12 {
+        0.0
+    } else {
+        ((ap[0] * ab[0] + ap[1] * ab[1] + ap[2] * ab[2]) / ab2).clamp(0.0, 1.0)
+    };
+    let q = [
+        start[0] + ab[0] * t,
+        start[1] + ab[1] * t,
+        start[2] + ab[2] * t,
+    ];
+    let d = [point[0] - q[0], point[1] - q[1], point[2] - q[2]];
+    let dist = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+    let outer = drain.radius_mm.max(0.05);
+    let inner = if drain.inner_radius_mm > 0.05 {
+        drain.inner_radius_mm
+    } else {
+        outer
+    };
+    let radius = outer + (inner - outer) * t;
+    dist <= radius
 }
 
 fn normalize(v: [f32; 3]) -> [f32; 3] {
@@ -1489,20 +1523,6 @@ fn normalize(v: [f32; 3]) -> [f32; 3] {
     } else {
         [v[0] / len, v[1] / len, v[2] / len]
     }
-}
-
-fn dist_point_segment(p: [f32; 3], a: [f32; 3], b: [f32; 3]) -> f32 {
-    let ab = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
-    let ap = [p[0] - a[0], p[1] - a[1], p[2] - a[2]];
-    let ab2 = ab[0] * ab[0] + ab[1] * ab[1] + ab[2] * ab[2];
-    let t = if ab2 < 1e-12 {
-        0.0
-    } else {
-        ((ap[0] * ab[0] + ap[1] * ab[1] + ap[2] * ab[2]) / ab2).clamp(0.0, 1.0)
-    };
-    let q = [a[0] + ab[0] * t, a[1] + ab[1] * t, a[2] + ab[2] * t];
-    let d = [p[0] - q[0], p[1] - q[1], p[2] - q[2]];
-    (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt()
 }
 
 fn paint_bits(bits: &mut Bits, img: &Image) {
@@ -2366,6 +2386,25 @@ mod tests {
         assert!(img.get(90, 25) > 0, "second shape missing");
         assert_eq!(img.get(42, 25), 0, "filled the gap up to the stray edge");
         assert_eq!(img.get(68, 25), 0, "filled the gap past the stray edge");
+    }
+
+    #[test]
+    fn a_tapered_hole_is_wide_at_the_mouth_and_narrow_inside() {
+        let drain = Drain {
+            origin: [0.0, 0.0, 0.0],
+            axis: [0.0, 0.0, 1.0],
+            radius_mm: 2.0,
+            inner_radius_mm: 0.5,
+            extend_mm: 1.0,
+            depth_mm: 4.0,
+        };
+        assert!(point_near_drain([1.5, 0.0, -1.0], &drain));
+        assert!(!point_near_drain([2.5, 0.0, -1.0], &drain));
+        assert!(point_near_drain([0.3, 0.0, 4.0], &drain));
+        assert!(
+            !point_near_drain([1.5, 0.0, 4.0], &drain),
+            "the inner end is the narrow diameter"
+        );
     }
 
     #[test]

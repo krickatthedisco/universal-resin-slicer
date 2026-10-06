@@ -47,13 +47,35 @@ pub struct Object {
     pub bounds_max: [f32; 3],
 }
 
+fn default_hole_extend() -> f32 {
+    0.8
+}
+
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct DrainHole {
     pub id: u64,
     pub origin: Vec3,
     pub axis: Vec3,
+    /// Radius at the mouth (D1 / 2).
     pub radius_mm: f32,
+    /// How far the hole runs into the model (L2).
     pub depth_mm: f32,
+    /// Radius at the inner end (D2 / 2). Zero matches the mouth.
+    #[serde(default)]
+    pub inner_radius_mm: f32,
+    /// How far the mouth stands out past the surface (L1).
+    #[serde(default = "default_hole_extend")]
+    pub extend_mm: f32,
+}
+
+impl DrainHole {
+    pub fn inner_radius(self) -> f32 {
+        if self.inner_radius_mm > 0.05 {
+            self.inner_radius_mm
+        } else {
+            self.radius_mm
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -114,9 +136,18 @@ pub struct Document {
     pub platform_only: bool,
     /// How far above the bed a part sits after supports are added.
     pub support_lift_mm: f32,
-    /// Diameter and depth used by a new drain hole.
+    /// Outer diameter D1 of a new hole, at the mouth.
     pub drain_diameter_mm: f32,
+    /// Inner diameter D2, at the deep end.
+    pub drain_inner_mm: f32,
+    /// Extended length L1, standing out past the surface.
+    pub drain_extend_mm: f32,
+    /// Groove depth L2, into the model.
     pub drain_depth_mm: f32,
+    /// Aim the hole along the view instead of the surface normal.
+    pub hole_along_view: bool,
+    /// Keep the removed resin as its own model, to print and glue back.
+    pub hole_keep: bool,
     /// Skate-raft wall, measured from vertical. 0 is a straight edge.
     pub raft_angle: f32,
     next_id: u64,
@@ -144,8 +175,12 @@ impl Document {
             style: supports::PRESETS[1].style,
             platform_only: false,
             support_lift_mm: 5.0,
-            drain_diameter_mm: 2.4,
-            drain_depth_mm: 8.0,
+            drain_diameter_mm: 1.5,
+            drain_inner_mm: 1.5,
+            drain_extend_mm: 1.5,
+            drain_depth_mm: 1.5,
+            hole_along_view: false,
+            hole_keep: false,
             raft_angle: 30.0,
             next_id: 1,
             undo: Vec::new(),
@@ -235,6 +270,18 @@ impl Document {
     }
 
     pub fn add_mesh(&mut self, name: String, mesh: Mesh) -> u64 {
+        let id = self.spawn_object(name, mesh);
+        self.push_undo(Undo::Added {
+            id,
+            drains: Vec::new(),
+        });
+        self.selection = Selection::Object(id);
+        self.touch();
+        id
+    }
+
+    /// Place a model without an undo step or a selection change.
+    fn spawn_object(&mut self, name: String, mesh: Mesh) -> u64 {
         let id = self.alloc();
         let support = self.profile();
         self.objects.push(Object {
@@ -256,13 +303,32 @@ impl Document {
         if let Some(obj) = self.objects.last_mut() {
             cache_bounds(obj);
         }
-        self.push_undo(Undo::Added {
-            id,
-            drains: Vec::new(),
-        });
-        self.selection = Selection::Object(id);
-        self.touch();
         id
+    }
+
+    /// Outer radius, inner radius, extended length, and groove depth.
+    pub fn hole_dims(&self) -> (f32, f32, f32, f32) {
+        let outer = (self.drain_diameter_mm * 0.5).clamp(0.2, 8.0);
+        let inner = (self.drain_inner_mm * 0.5).clamp(0.2, 8.0);
+        let extend = self.drain_extend_mm.clamp(0.0, 40.0);
+        let depth = self.drain_depth_mm.clamp(0.2, 80.0);
+        (outer, inner, extend, depth)
+    }
+
+    /// `outward` faces the camera. The axis points into the model.
+    pub fn hole_axis(&self, outward: Vec3, view_dir: Vec3) -> Vec3 {
+        if self.hole_along_view {
+            let dir = view_dir.normalize_or_zero();
+            if dir.length_squared() < 0.25 {
+                Vec3::NEG_Z
+            } else {
+                dir
+            }
+        } else if outward.length_squared() < 1e-8 {
+            Vec3::NEG_Z
+        } else {
+            -outward.normalize()
+        }
     }
 
     pub fn import(&mut self, path: &Path) -> Result<u64> {
@@ -1384,28 +1450,16 @@ impl Document {
     }
 
     /// A drain through the bottom center, aimed up into the part.
-    pub fn punch_bottom_drain(&mut self, id: u64) {
+    /// Returns true when the removed resin was kept as its own model.
+    pub fn punch_bottom_drain(&mut self, id: u64) -> bool {
         let Some(obj) = self.object(id) else {
-            return;
+            return false;
         };
         let Some((min, max)) = Self::world_bounds(obj) else {
-            return;
+            return false;
         };
-        let need = obj.bottom_cap_mm + obj.wall_mm + 1.0;
-        let depth = self.drain_depth_mm.max(need).clamp(1.0, 40.0);
-        let radius = (self.drain_diameter_mm * 0.5).clamp(0.2, 8.0);
-        let origin = Vec3::new((min.x + max.x) * 0.5, (min.y + max.y) * 0.5, min.z + 0.3);
-        self.push_undo(Undo::Drains(self.drains.clone()));
-        let drain_id = self.alloc();
-        self.drains.push(DrainHole {
-            id: drain_id,
-            origin,
-            axis: Vec3::Z,
-            radius_mm: radius,
-            depth_mm: depth,
-        });
-        self.selection = Selection::Drain(drain_id);
-        self.touch();
+        let origin = Vec3::new((min.x + max.x) * 0.5, (min.y + max.y) * 0.5, min.z);
+        self.commit_hole(origin, Vec3::Z, id)
     }
 
     /// Raise the part until its lowest point is `lift` above the bed.
@@ -1425,25 +1479,76 @@ impl Document {
         Some(previous)
     }
 
-    pub fn add_drain(&mut self, origin: Vec3, into_model: Vec3) {
-        self.push_undo(Undo::Drains(self.drains.clone()));
-        let id = self.alloc();
-        let axis = if into_model.length() < 1e-4 {
+    /// Punch at a clicked point. `outward` is the surface normal facing the camera.
+    /// Returns true when the removed resin was kept as its own model.
+    pub fn add_hole(&mut self, origin: Vec3, outward: Vec3, view_dir: Vec3, source: u64) -> bool {
+        let axis = self.hole_axis(outward, view_dir);
+        self.commit_hole(origin, axis, source)
+    }
+
+    fn commit_hole(&mut self, origin: Vec3, axis: Vec3, source: u64) -> bool {
+        let (outer, inner, extend, depth) = self.hole_dims();
+        let axis = if axis.length_squared() < 0.25 {
             Vec3::NEG_Z
         } else {
-            -into_model.normalize()
+            axis.normalize()
         };
-        let radius = (self.drain_diameter_mm * 0.5).clamp(0.2, 8.0);
-        let depth = self.drain_depth_mm.clamp(1.0, 40.0);
+        if !self.hole_keep {
+            self.push_undo(Undo::Drains(self.drains.clone()));
+        }
+        let drain_id = self.alloc();
         self.drains.push(DrainHole {
-            id,
+            id: drain_id,
             origin,
             axis,
-            radius_mm: radius,
+            radius_mm: outer,
             depth_mm: depth,
+            inner_radius_mm: inner,
+            extend_mm: extend,
         });
-        self.selection = Selection::Drain(id);
-        self.touch();
+        if self.hole_keep {
+            let mesh = supports::hole_mesh(origin, axis, outer, inner, extend, depth);
+            let plug_id = self.spawn_object("Hole plug".into(), mesh);
+            self.park_plug(plug_id, source, axis);
+            self.push_undo(Undo::Added {
+                id: plug_id,
+                drains: vec![drain_id],
+            });
+            self.selection = Selection::Object(plug_id);
+            self.touch();
+            true
+        } else {
+            self.selection = Selection::Drain(drain_id);
+            self.touch();
+            false
+        }
+    }
+
+    /// Set the plug on the bed, clear of the part it was cut from.
+    fn park_plug(&mut self, plug_id: u64, source: u64, axis: Vec3) {
+        let mut side = axis.cross(Vec3::Z);
+        if side.length_squared() < 1e-4 {
+            side = axis.cross(Vec3::X);
+        }
+        side = side.normalize_or_zero();
+        if side.length_squared() < 0.25 {
+            side = Vec3::Y;
+        }
+        let source_bounds = self.object(source).and_then(Self::world_bounds);
+        let plug_bounds = self.object(plug_id).and_then(Self::world_bounds);
+        if let (Some((smin, smax)), Some((pmin, pmax))) = (source_bounds, plug_bounds) {
+            let source_center = (smin + smax) * 0.5;
+            let plug_center = (pmin + pmax) * 0.5;
+            let half_src = (smax - smin).dot(side).abs() * 0.5;
+            let half_plug = (pmax - pmin).dot(side).abs() * 0.5;
+            let target = source_center + side * (half_src + half_plug + 4.0);
+            let delta = target - plug_center;
+            if let Some(obj) = self.object_mut(plug_id) {
+                obj.position.x += delta.x;
+                obj.position.y += delta.y;
+            }
+        }
+        self.drop_object(plug_id);
     }
 
     pub fn solids(&self) -> Vec<Solid> {
@@ -1557,6 +1662,8 @@ impl Document {
                 origin: d.origin.to_array(),
                 axis: d.axis.to_array(),
                 radius_mm: d.radius_mm,
+                inner_radius_mm: d.inner_radius(),
+                extend_mm: d.extend_mm,
                 depth_mm: d.depth_mm,
             })
             .collect()
@@ -1959,5 +2066,39 @@ mod tests {
             heights.iter().any(|z| (*z - 20.0).abs() < 0.2),
             "{heights:?}"
         );
+    }
+
+    #[test]
+    fn keep_hole_makes_a_plug_and_undo_removes_both() {
+        let mut doc = Document::new();
+        let id = doc.add_mesh("box".into(), box_mesh([0.0, 0.0, 0.0], [20.0, 20.0, 20.0]));
+        doc.hole_keep = true;
+        assert!(doc.punch_bottom_drain(id));
+        assert_eq!(doc.objects.len(), 2);
+        assert_eq!(doc.drains.len(), 1);
+        let plug = doc
+            .objects
+            .iter()
+            .find(|obj| obj.name == "Hole plug")
+            .unwrap();
+        let (pmin, pmax) = Document::world_bounds(plug).unwrap();
+        let (smin, smax) = Document::world_bounds(doc.object(id).unwrap()).unwrap();
+        let overlaps = pmin.x < smax.x
+            && pmax.x > smin.x
+            && pmin.y < smax.y
+            && pmax.y > smin.y
+            && pmin.z < smax.z
+            && pmax.z > smin.z;
+        assert!(
+            !overlaps,
+            "the plug has to sit beside the part so it can be printed"
+        );
+        assert!(doc.undo());
+        assert_eq!(doc.objects.len(), 1);
+        assert_eq!(doc.drains.len(), 0);
+        assert!(doc.object(id).is_some());
+        assert!(doc.redo());
+        assert_eq!(doc.objects.len(), 2);
+        assert_eq!(doc.drains.len(), 1);
     }
 }

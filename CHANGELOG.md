@@ -20,7 +20,8 @@ Amber is a desktop resin slicer. The first printer it was built around is the An
 - Redo (Ctrl+Y) puts an undone edit back, including a move, a delete, and a cut. A new edit clears that. The status line says the next step: open a model, punch a hole, add supports, slice, or save.
 - Save plate writes an `.amber` file: the models, where they sit, their supports and holes, and the printer and resin settings. Open plate puts that job back. Ctrl+Shift+S saves it again.
 - Duplicate, copy across the bed, and fill the bed take the supports and the drain holes with each copy. Undo removes that copy's tips and holes.
-- Prepare has the same layer slider as Preview. The current layer is drawn on the plate, and the model above it can be cut away.
+- Prepare has the same layer slider as Preview. The current layer is drawn on the plate, and the model above it can be cut away. Before a slice, that bar is a height cut, so a hole can be placed on the surface that is left.
+- The Hole tool previews the punch under the pointer. The hole can follow the surface or the screen. Outer and inner diameters, the stub outside the surface, and the depth into the model are set in the Punch panel. Keep Hole saves the removed resin as its own model, set beside the part, so it can be printed and glued back in.
 - Support pillars default to a hexagon. Round and square are in the same menu. The diameter is flat to flat.
 - Simple view can show every support piece again after showing only the contact points.
 - A layer where two supports overlap stays solid instead of leaving a one-layer line between them.

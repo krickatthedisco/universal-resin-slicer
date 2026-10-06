@@ -252,7 +252,14 @@ impl ViewCache {
                 }
             }
             for drain in &doc.drains {
-                let mesh = drain_mesh(drain.origin, drain.axis, drain.radius_mm, drain.depth_mm);
+                let mesh = supports::hole_mesh(
+                    drain.origin,
+                    drain.axis,
+                    drain.radius_mm,
+                    drain.inner_radius(),
+                    drain.extend_mm,
+                    drain.depth_mm,
+                );
                 let color = if selection == Selection::Drain(drain.id) {
                     [0.95, 0.45, 0.30]
                 } else {
@@ -507,16 +514,10 @@ fn push_line(lines: &mut Vec<f32>, a: [f32; 3], b: [f32; 3], color: [f32; 3]) {
     lines.extend_from_slice(&[b[0], b[1], b[2], color[0], color[1], color[2]]);
 }
 
-fn drain_mesh(origin: Vec3, axis: Vec3, radius: f32, depth: f32) -> Mesh {
-    let axis = axis.normalize_or_zero();
-    let start = origin - axis * 0.6;
-    let end = origin + axis * depth;
-    // Reuse the support taper by going through supports::brace_mesh shape.
-    supports::brace_mesh(&supports::Brace {
-        a: start,
-        b: end,
-        radius,
-    })
+pub fn colored_tris(mesh: &Mesh, color: [f32; 3]) -> Vec<f32> {
+    let mut tris = Vec::new();
+    push_mesh_flat(&mut tris, mesh, color);
+    tris
 }
 
 // Solid shading follows the usual slicer path (PrusaSlicer / OrcaSlicer
@@ -697,6 +698,7 @@ pub struct Renderer {
     sheet_vbo: glow::Buffer,
     sheet_tex: glow::Texture,
     sheet_key: u64,
+    ghost: MeshGpu,
 }
 
 impl Renderer {
@@ -751,6 +753,9 @@ impl Renderer {
                 sheet_vbo,
                 sheet_tex,
                 sheet_key: u64::MAX,
+                ghost: MeshGpu {
+                    batches: Vec::new(),
+                },
             })
         }
     }
@@ -851,6 +856,7 @@ impl Renderer {
         overhang_deg: Option<f32>,
         clip_z: Option<f32>,
         sheet: Option<&LayerSheet>,
+        ghost: &[f32],
     ) {
         unsafe {
             let vp = camera.view_proj(aspect);
@@ -911,6 +917,35 @@ impl Renderer {
             }
             gl.uniform_1_f32(self.locs.show_overhang.as_ref(), 0.0);
             gl.uniform_1_f32(self.locs.clip_on.as_ref(), 0.0);
+            if !ghost.is_empty() {
+                upload_mesh(gl, &mut self.ghost.batches, ghost);
+                gl.enable(glow::BLEND);
+                gl.blend_func(glow::SRC_ALPHA, glow::ONE_MINUS_SRC_ALPHA);
+                gl.depth_mask(false);
+                gl.depth_func(glow::LEQUAL);
+                self.draw_solid(
+                    gl,
+                    &self.ghost.batches,
+                    Mat4::IDENTITY,
+                    [1.0, 1.0, 1.0],
+                    0.0,
+                    0.55,
+                    vp,
+                );
+                gl.depth_func(glow::GREATER);
+                self.draw_solid(
+                    gl,
+                    &self.ghost.batches,
+                    Mat4::IDENTITY,
+                    [1.0, 1.0, 1.0],
+                    0.0,
+                    0.28,
+                    vp,
+                );
+                gl.depth_func(glow::LEQUAL);
+                gl.depth_mask(true);
+                gl.disable(glow::BLEND);
+            }
             if under {
                 gl.enable(glow::BLEND);
                 gl.blend_func(glow::SRC_ALPHA, glow::ONE_MINUS_SRC_ALPHA);
@@ -1054,6 +1089,7 @@ impl Renderer {
             for raft in &self.rafts {
                 drop_batches(gl, &raft.batches);
             }
+            drop_batches(gl, &self.ghost.batches);
             gl.delete_vertex_array(self.line_vao);
             gl.delete_buffer(self.line_vbo);
         }

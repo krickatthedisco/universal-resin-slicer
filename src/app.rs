@@ -214,6 +214,8 @@ pub struct AmberApp {
     hidden_models: HashSet<u64>,
     view_rev: u64,
     view_drawn: u64,
+    /// The drain whose sizes are currently shown in the hole panel.
+    hole_panel_for: Option<u64>,
 }
 
 impl AmberApp {
@@ -361,6 +363,7 @@ impl AmberApp {
             hidden_models: HashSet::new(),
             view_rev: 0,
             view_drawn: 0,
+            hole_panel_for: None,
         }
     }
 
@@ -1813,11 +1816,14 @@ impl AmberApp {
     }
 
     fn punch_hole(&mut self, id: u64) {
-        self.doc.punch_bottom_drain(id);
+        let kept = self.doc.punch_bottom_drain(id);
         self.tool = Tool::Drain;
         self.invalidate_slice();
-        self.status =
-            "Punched a drain at the bottom of this model. Click the shell to place another.".into();
+        self.status = if kept {
+            "Punched a hole and set the plug beside the model. Print that piece and glue it back in.".into()
+        } else {
+            "Punched a hole at the bottom of this model. Click the shell to place another.".into()
+        };
     }
 
     fn grow_supports(&mut self, platform_only: bool) {
@@ -2207,55 +2213,107 @@ impl AmberApp {
     }
 
     fn drain_ui(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Hole");
-        ui.label("Click the outside of a hollow. The hole points inward so resin can drain and air can enter.");
+        self.sync_hole_panel();
+        ui.heading("Punch");
+        ui.label("Move over the model to see the hole, then click to punch it. It points into the part so resin can drain and air can enter.");
         ui.label("Put at least one hole near the lowest point of a cup, or the layer that seals it will suction onto the film.");
-        let mut hole = false;
-        hole |= drag_f32(
+        ui.add_space(4.0);
+        let along = self.doc.hole_along_view;
+        ui.radio_value(
+            &mut self.doc.hole_along_view,
+            false,
+            "Perpendicular to the model",
+        );
+        ui.radio_value(
+            &mut self.doc.hole_along_view,
+            true,
+            "Perpendicular to the screen",
+        );
+        if self.doc.hole_along_view != along {
+            self.doc.touch_xform();
+        }
+        ui.add_space(6.0);
+        let mut edited = false;
+        edited |= hole_field(
             ui,
-            "Diameter",
+            "Outer Circle Diameter D1(mm)",
             &mut self.doc.drain_diameter_mm,
-            0.05,
             0.4,
-            12.0,
-            "mm",
+            16.0,
         );
-        hole |= drag_f32(
+        edited |= hole_field(
             ui,
-            "Depth",
-            &mut self.doc.drain_depth_mm,
-            0.1,
-            1.0,
-            40.0,
-            "mm",
+            "Inside Circle Diameter D2(mm)",
+            &mut self.doc.drain_inner_mm,
+            0.4,
+            16.0,
         );
-        if hole {
-            self.doc.touch();
+        edited |= hole_field(
+            ui,
+            "Extended Length L1(mm)",
+            &mut self.doc.drain_extend_mm,
+            0.0,
+            40.0,
+        );
+        edited |= hole_field(
+            ui,
+            "Groove Depth L2(mm)",
+            &mut self.doc.drain_depth_mm,
+            0.2,
+            80.0,
+        );
+        ui.add_space(4.0);
+        ui.checkbox(&mut self.doc.hole_keep, "Keep Hole")
+            .on_hover_text(
+                "Save the resin this hole removes as its own model, set beside the part. Print it and glue it back in.",
+            );
+        if edited {
+            self.write_selected_hole();
         }
-        if let Selection::Drain(id) = self.doc.selection {
-            let current = self.doc.drains.iter().find(|d| d.id == id).copied();
-            if let Some(mut drain) = current {
-                let mut diameter = drain.radius_mm * 2.0;
-                let mut edited = false;
-                edited |= drag_f32(ui, "This hole", &mut diameter, 0.05, 0.4, 12.0, "mm");
-                edited |= drag_f32(ui, "This depth", &mut drain.depth_mm, 0.1, 1.0, 40.0, "mm");
-                if edited {
-                    drain.radius_mm = diameter * 0.5;
-                    if let Some(slot) = self.doc.drains.iter_mut().find(|d| d.id == id) {
-                        *slot = drain;
-                    }
-                    self.doc.touch();
-                    self.invalidate_slice();
-                }
-            }
-        }
+        ui.add_space(6.0);
         if ui.button("Punch hole at the bottom").clicked() {
             if let Some(id) = self.doc.edit_target() {
                 self.punch_hole(id);
             } else {
-                self.status = "Select the model you want a drain in.".into();
+                self.status = "Select the model you want a hole in.".into();
             }
         }
+    }
+
+    fn sync_hole_panel(&mut self) {
+        let Selection::Drain(id) = self.doc.selection else {
+            self.hole_panel_for = None;
+            return;
+        };
+        if self.hole_panel_for == Some(id) {
+            return;
+        }
+        let Some(drain) = self.doc.drains.iter().find(|d| d.id == id).copied() else {
+            self.hole_panel_for = None;
+            return;
+        };
+        self.doc.drain_diameter_mm = drain.radius_mm * 2.0;
+        self.doc.drain_inner_mm = drain.inner_radius() * 2.0;
+        self.doc.drain_extend_mm = drain.extend_mm;
+        self.doc.drain_depth_mm = drain.depth_mm;
+        self.hole_panel_for = Some(id);
+    }
+
+    fn write_selected_hole(&mut self) {
+        let Selection::Drain(id) = self.doc.selection else {
+            return;
+        };
+        let (outer, inner, extend, depth) = self.doc.hole_dims();
+        if let Some(slot) = self.doc.drains.iter_mut().find(|d| d.id == id) {
+            slot.radius_mm = outer;
+            slot.inner_radius_mm = inner;
+            slot.extend_mm = extend;
+            slot.depth_mm = depth;
+        } else {
+            return;
+        }
+        self.doc.touch();
+        self.invalidate_slice();
     }
 
     fn size_label(&self, ui: &mut egui::Ui, id: u64) {
@@ -3017,10 +3075,6 @@ impl AmberApp {
 
     fn viewport(&mut self, ui: &mut egui::Ui) {
         let count = self.slice.as_ref().map(|s| s.layers.len()).unwrap_or(0);
-        if count == 0 {
-            self.viewport_scene(ui);
-            return;
-        }
         let avail = ui.available_size();
         let bar = 96.0;
         ui.horizontal(|ui| {
@@ -3033,18 +3087,74 @@ impl AmberApp {
                 egui::vec2(bar, avail.y),
                 egui::Layout::top_down(egui::Align::Center),
                 |ui| {
-                    ui.checkbox(&mut self.show_plate_layer, "On plate")
-                        .on_hover_text(
-                            "Draw this sliced layer on the bed, in the same pixels the file will cure.",
-                        );
-                    ui.checkbox(&mut self.cut_at_layer, "Cut model")
-                        .on_hover_text(
-                            "Hide the model above this layer so you can see the pixels on the cut.",
-                        );
-                    self.layer_bar(ui, count);
+                    if count == 0 {
+                        self.height_bar(ui);
+                    } else {
+                        ui.checkbox(&mut self.show_plate_layer, "On plate")
+                            .on_hover_text(
+                                "Draw this sliced layer on the bed, in the same pixels the file will cure.",
+                            );
+                        ui.checkbox(&mut self.cut_at_layer, "Cut model")
+                            .on_hover_text(
+                                "Hide the model above this layer so you can see the pixels on the cut.",
+                            );
+                        self.layer_bar(ui, count);
+                    }
                 },
             );
         });
+    }
+
+    /// Height cut before a slice exists. The same bar shows layers afterwards.
+    fn height_bar(&mut self, ui: &mut egui::Ui) {
+        ui.label("Height");
+        let step = self.settings.layer_mm.max(0.01);
+        let max_z = self.machine.size_z.max(step);
+        if ui
+            .add(egui::Button::new("▲").min_size(egui::vec2(64.0, 28.0)))
+            .on_hover_text("Up one layer height")
+            .clicked()
+        {
+            self.plate_view.section_z = (self.plate_view.section_z + step).min(max_z);
+            self.plate_view.section = true;
+            self.touch_view();
+        }
+        let footer = 110.0;
+        let slider_h = (ui.available_height() - footer).max(64.0);
+        ui.spacing_mut().slider_width = slider_h;
+        let mut z = self.plate_view.section_z.clamp(0.0, max_z);
+        if ui
+            .add(
+                egui::Slider::new(&mut z, 0.0..=max_z)
+                    .vertical()
+                    .show_value(false),
+            )
+            .changed()
+        {
+            self.plate_view.section_z = z;
+            self.plate_view.section = true;
+            self.touch_view();
+        }
+        if ui
+            .add(egui::Button::new("▼").min_size(egui::vec2(64.0, 28.0)))
+            .on_hover_text("Down one layer height")
+            .clicked()
+        {
+            self.plate_view.section_z = (self.plate_view.section_z - step).max(0.0);
+            self.plate_view.section = true;
+            self.touch_view();
+        }
+        ui.add_space(4.0);
+        let mut cut = self.plate_view.section;
+        if ui
+            .checkbox(&mut cut, "Cut")
+            .on_hover_text("Hide the model above this height so a hole can be placed on the cut.")
+            .changed()
+        {
+            self.plate_view.section = cut;
+            self.touch_view();
+        }
+        ui.label(format!("{:.2} mm", self.plate_view.section_z));
     }
 
     fn prepare_sheet(&mut self) -> Option<LayerSheet> {
@@ -3172,14 +3282,8 @@ impl AmberApp {
         } else {
             None
         };
-        let clip = if count > 0 && self.show_plate_layer && self.cut_at_layer {
-            self.slice.as_ref().and_then(|slice| {
-                let index = self.preview_index.min(slice.layers.len().saturating_sub(1));
-                slice.layers.get(index).map(|layer| layer.z_top_mm)
-            })
-        } else {
-            self.plate_view.section.then_some(self.plate_view.section_z)
-        };
+        let clip = self.view_clip();
+        let ghost = self.hole_ghost(&response);
         let callback = egui::PaintCallback {
             rect,
             callback: Arc::new(egui_glow::CallbackFn::new(move |info, painter| {
@@ -3199,7 +3303,15 @@ impl AmberApp {
                 if let Some(frame) = &frame {
                     gpu.sync(gl, frame);
                 }
-                gpu.paint(gl, &camera, aspect, overhang, clip, sheet.as_ref());
+                gpu.paint(
+                    gl,
+                    &camera,
+                    aspect,
+                    overhang,
+                    clip,
+                    sheet.as_ref(),
+                    ghost.as_slice(),
+                );
             })),
         };
         ui.painter().add(callback);
@@ -3521,10 +3633,44 @@ impl AmberApp {
         }
     }
 
+    fn view_clip(&self) -> Option<f32> {
+        let count = self.slice.as_ref().map(|s| s.layers.len()).unwrap_or(0);
+        if count > 0 && self.show_plate_layer && self.cut_at_layer {
+            self.slice.as_ref().and_then(|slice| {
+                let index = self.preview_index.min(slice.layers.len().saturating_sub(1));
+                slice.layers.get(index).map(|layer| layer.z_top_mm)
+            })
+        } else if self.plate_view.section {
+            Some(self.plate_view.section_z)
+        } else {
+            None
+        }
+    }
+
+    fn hole_ghost(&self, response: &egui::Response) -> Vec<f32> {
+        if self.tool != Tool::Drain {
+            return Vec::new();
+        }
+        let Some(pos) = response.hover_pos() else {
+            return Vec::new();
+        };
+        let rect = response.rect;
+        let rel_x = (pos.x - rect.left()) / rect.width().max(1.0);
+        let rel_y = (pos.y - rect.top()) / rect.height().max(1.0);
+        let aspect = (rect.width() / rect.height().max(1.0)).clamp(0.2, 5.0);
+        let (origin, dir) = self.camera.ray(rel_x, rel_y, aspect);
+        let Some((_, point, normal)) = self.visible_hit(origin, dir) else {
+            return Vec::new();
+        };
+        let axis = self.doc.hole_axis(normal, dir);
+        let (outer, inner, extend, depth) = self.doc.hole_dims();
+        let mesh = crate::supports::hole_mesh(point, axis, outer, inner, extend, depth);
+        viewport::colored_tris(&mesh, [0.95, 0.72, 0.20])
+    }
+
     fn visible_hit(&self, origin: Vec3, dir: Vec3) -> Option<(u64, Vec3, Vec3)> {
-        let clip = self.plate_view.section.then_some(self.plate_view.section_z);
         self.doc
-            .raycast_visible(origin, dir, &self.hidden_models, clip)
+            .raycast_visible(origin, dir, &self.hidden_models, self.view_clip())
     }
 
     fn show_help(&mut self, ctx: &egui::Context) {
@@ -3547,7 +3693,8 @@ impl AmberApp {
                 ui.separator();
                 ui.label("Simple is the short path. Workshop is every control: rafts, rest times, compensation, and the rest.");
                 ui.label("Right-click a model for the same edits. Right-drag orbits, and you can swing under the bed. The bed turns clear so you can click an underside.");
-                ui.label("View → Cut the view hides the model above a height, so you can click the surface that is left and place a support there. The checkbox beside a model hides it in the view. It still prints. Tips only draws the contact points. After a slice, red marks on the plate are islands. Click one with Support to plant a tip there.");
+                ui.label("The bar on the right of Prepare is a height cut before you slice, and the sliced layers after. Cut hides the model above that height so a hole or a support can land on the surface that is left. View → Cut the view is the same height. The checkbox beside a model hides it in the view. It still prints. Tips only draws the contact points. After a slice, red marks on the plate are islands. Click one with Support to plant a tip there.");
+                ui.label("The Hole tool draws the punch under the pointer. Perpendicular to the model follows the surface. Perpendicular to the screen follows the camera. Keep Hole saves the removed resin as its own model, set beside the part, so you can print it and glue it back.");
                 ui.separator();
                 ui.label("Ctrl+O open    Ctrl+Shift+S save the plate    Ctrl+S save the sliced file");
                 ui.label("Ctrl+Z undo    Ctrl+Y redo    Ctrl+D duplicate    Delete remove");
@@ -3811,9 +3958,14 @@ impl AmberApp {
                 }
             }
             Tool::Drain => {
-                if let Some((_, point, normal)) = self.visible_hit(origin, dir) {
-                    self.doc.add_drain(point, normal);
+                if let Some((id, point, normal)) = self.visible_hit(origin, dir) {
+                    let kept = self.doc.add_hole(point, normal, dir, id);
                     self.invalidate_slice();
+                    self.status = if kept {
+                        "Punched a hole and set the plug beside the model. Print that piece and glue it back in.".into()
+                    } else {
+                        "Punched a hole. Undo removes it.".into()
+                    };
                 }
             }
             Tool::Measure => {
@@ -4008,6 +4160,18 @@ fn grid_drag(
             *changed |= response.changed();
         }
     });
+}
+
+fn hole_field(ui: &mut egui::Ui, label: &str, value: &mut f32, min: f32, max: f32) -> bool {
+    ui.label(label);
+    ui.add(
+        egui::DragValue::new(value)
+            .speed(0.01)
+            .range(min..=max)
+            .fixed_decimals(3)
+            .min_decimals(3),
+    )
+    .changed()
 }
 
 fn drag_f32(

@@ -957,6 +957,29 @@ pub fn brace_mesh(brace: &Brace) -> Mesh {
     tapered(brace.a, brace.radius, brace.b, brace.radius, 8, true)
 }
 
+/// A drain or plug. `into` points from the surface into the model.
+/// The outer radius is at the mouth, `extend` mm outside the surface.
+/// The inner radius is `depth` mm inside the model.
+pub fn hole_mesh(
+    origin: Vec3,
+    into: Vec3,
+    outer_r: f32,
+    inner_r: f32,
+    extend: f32,
+    depth: f32,
+) -> Mesh {
+    let axis = into.normalize_or_zero();
+    if axis.length_squared() < 0.5 {
+        return Mesh {
+            vertices: Vec::new(),
+            indices: Vec::new(),
+        };
+    }
+    let mouth = origin - axis * extend.max(0.0);
+    let tip = origin + axis * depth.max(0.05);
+    tapered(mouth, outer_r.max(0.05), tip, inner_r.max(0.05), 16, true)
+}
+
 /// A pillar whose flat-to-flat width is the given radius times two.
 fn shaft(a: Vec3, ra: f32, b: Vec3, rb: f32, style: &SupportStyle, round_seg: usize) -> Mesh {
     let (seg, scale) = match style.section {
