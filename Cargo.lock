@@ -34,7 +34,7 @@ dependencies = [
 
 [[package]]
 name = "amber"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "anyhow",
  "eframe",

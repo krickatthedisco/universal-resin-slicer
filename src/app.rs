@@ -3395,9 +3395,9 @@ impl AmberApp {
         }
         ui.label("Blur stays off unless you set it. It softens the anti-aliased edge and adds time to the slice.");
         changed |= ui
-            .checkbox(&mut s.fill_voids, "Fill enclosed voids")
+            .checkbox(&mut s.fill_voids, "Heal hairline gaps")
             .changed();
-        ui.label("Heals speckled gaps and cures closed pockets in each layer. A model you hollowed stays empty. Drain holes are cut after, so a drain still opens.");
+        ui.label("Closes a one-pixel crack and a speckle. A hole in the model stays open, including the infinity mark, lettering, and pin holes. A model you hollowed stays empty. Drain holes are cut after this.");
         ui.collapsing("Compensation and cost", |ui| {
             changed |= drag_f32(ui, "XY offset", &mut s.xy_offset_mm, 0.01, -0.5, 0.5, "mm");
             changed |= drag_f32(

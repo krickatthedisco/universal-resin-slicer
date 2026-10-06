@@ -351,7 +351,7 @@ pub fn slice(req: Request<'_>) -> Result<Slice, String> {
     let cavity_ml = (cavity_px_layers * pixel_area * h as f64 / 1000.0) as f32;
     if sealed_layers > 0 {
         warnings.push(format!(
-            "{sealed_layers} layers seal an interior pocket ({cavity_ml:.2} ml of air in the slice). Add a drain at the bottom of a hollow, or it can suction onto the film. Fill enclosed voids closes accidental pockets and leaves a model you hollowed empty."
+            "{sealed_layers} layers seal an interior pocket ({cavity_ml:.2} ml of air in the slice). Add a drain at the bottom of a hollow, or it can suction onto the film."
         ));
     }
     Ok(Slice {
@@ -426,13 +426,13 @@ fn raster_range(
             let hollow = solids[cursor].hollow;
             let active = sweeps[cursor].activate(z).to_vec();
             let mut part = raster_solid(&solids[cursor], z, machine, settings.anti_alias, &active);
-            // Heal and fill before hollowing. The hollow is cut from the
-            // repaired solid, so a model you hollowed stays empty while
-            // speckled mesh gaps and accidental pockets become solid resin.
+            // Close a one-pixel crack in a noisy mesh. A wider close, or
+            // filling every enclosed loop, packs the validation matrix: the
+            // line fan becomes a bar and the infinity mark becomes a square.
+            // A hollow is cut after this, so that cavity stays empty too.
             if settings.fill_voids {
-                let radius = (0.75 / machine.pixel_mm()).round().clamp(2.0, 24.0) as i32;
-                heal_speckles(&mut part, radius);
-                fill_enclosed(&mut part);
+                heal_speckles(&mut part, 2);
+                fill_pinholes(&mut part, 4);
             }
             cursor += 1;
             while cursor < solids.len() && solids[cursor].negative {
@@ -1815,11 +1815,10 @@ fn window_any(solid: &[bool], w: usize, h: usize, radius: i32, any: bool) -> Vec
     out
 }
 
-/// Paint empty pixels that cannot reach the border of this layer. Those are
-/// the same closed holes the suction check reports. Call this before
-/// hollowing so the carved cavity is not painted back in.
-fn fill_enclosed(img: &mut Image) {
-    if img.width <= 0 || img.height <= 0 {
+/// Fill an enclosed empty spot no bigger than `max_area` pixels.
+/// A hole in the mesh is larger than that and stays open.
+fn fill_pinholes(img: &mut Image, max_area: u32) {
+    if img.width <= 2 || img.height <= 2 || max_area == 0 {
         return;
     }
     let w = img.width;
@@ -1828,37 +1827,72 @@ fn fill_enclosed(img: &mut Image) {
     if img.pixels.len() < n {
         return;
     }
-    let mut reach = vec![false; n];
+    let pixels = &img.pixels;
+    let mut seen = vec![false; n];
     let mut q = VecDeque::new();
-    let push_empty =
-        |x: i32, y: i32, reach: &mut [bool], q: &mut VecDeque<(i32, i32)>, pixels: &[u8]| {
-            if x < 0 || y < 0 || x >= w || y >= h {
-                return;
-            }
-            let i = (y * w + x) as usize;
-            if reach[i] || pixels[i] > 0 {
-                return;
-            }
-            reach[i] = true;
-            q.push_back((x, y));
-        };
+    let consider = |x: i32, y: i32, seen: &[bool]| -> Option<usize> {
+        if x < 0 || y < 0 || x >= w || y >= h {
+            return None;
+        }
+        let i = (y * w + x) as usize;
+        if seen[i] || pixels[i] > 0 {
+            None
+        } else {
+            Some(i)
+        }
+    };
     for x in 0..w {
-        push_empty(x, 0, &mut reach, &mut q, &img.pixels);
-        push_empty(x, h - 1, &mut reach, &mut q, &img.pixels);
+        for y in [0, h - 1] {
+            if let Some(i) = consider(x, y, &seen) {
+                seen[i] = true;
+                q.push_back((x, y));
+            }
+        }
     }
     for y in 0..h {
-        push_empty(0, y, &mut reach, &mut q, &img.pixels);
-        push_empty(w - 1, y, &mut reach, &mut q, &img.pixels);
+        for x in [0, w - 1] {
+            if let Some(i) = consider(x, y, &seen) {
+                seen[i] = true;
+                q.push_back((x, y));
+            }
+        }
     }
     let dirs = [(1i32, 0i32), (-1, 0), (0, 1), (0, -1)];
     while let Some((x, y)) = q.pop_front() {
         for (dx, dy) in dirs {
-            push_empty(x + dx, y + dy, &mut reach, &mut q, &img.pixels);
+            if let Some(i) = consider(x + dx, y + dy, &seen) {
+                seen[i] = true;
+                q.push_back((x + dx, y + dy));
+            }
         }
     }
-    for (pixel, reached) in img.pixels.iter_mut().zip(reach.iter()) {
-        if *pixel == 0 && !reached {
-            *pixel = 255;
+    for start in 0..n {
+        if seen[start] || img.pixels[start] > 0 {
+            continue;
+        }
+        let mut stack = Vec::new();
+        seen[start] = true;
+        q.push_back(((start % w as usize) as i32, (start / w as usize) as i32));
+        while let Some((x, y)) = q.pop_front() {
+            stack.push((y as usize) * (w as usize) + (x as usize));
+            for (dx, dy) in dirs {
+                let nx = x + dx;
+                let ny = y + dy;
+                if nx < 0 || ny < 0 || nx >= w || ny >= h {
+                    continue;
+                }
+                let i = (ny * w + nx) as usize;
+                if seen[i] || img.pixels[i] > 0 {
+                    continue;
+                }
+                seen[i] = true;
+                q.push_back((nx, ny));
+            }
+        }
+        if stack.len() as u32 <= max_area {
+            for i in stack {
+                img.pixels[i] = 255;
+            }
         }
     }
 }
@@ -3135,5 +3169,43 @@ mod tests {
         assert_eq!(again_b.len(), b.len());
         assert_eq!(again_b[0].area_px, b[0].area_px);
         assert!((again_b[0].z_mm - 4.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn fill_voids_keeps_a_modeled_hole_and_clears_a_speckle() {
+        let mut pixels = vec![255u8; 48 * 48];
+        for y in 14..34 {
+            for x in 14..34 {
+                pixels[(y * 48 + x) as usize] = 0;
+            }
+        }
+        for y in 4..6 {
+            for x in 4..6 {
+                pixels[(y * 48 + x) as usize] = 0;
+            }
+        }
+        // A slot wider than the two-pixel heal, like one gap in the line fan.
+        for y in 36..44 {
+            for x in 8..20 {
+                pixels[(y * 48 + x) as usize] = 0;
+            }
+        }
+        let mut img = Image {
+            x0: 0,
+            y0: 0,
+            width: 48,
+            height: 48,
+            pixels,
+        };
+        heal_speckles(&mut img, 2);
+        fill_pinholes(&mut img, 4);
+        assert_eq!(img.get(24, 24), 0, "a modeled hole was packed solid");
+        assert_eq!(img.get(13, 39), 0, "a line-fan gap was packed solid");
+        assert_eq!(img.get(4, 4), 255, "a two-pixel speckle stayed open");
+        assert_eq!(
+            img.get(2, 2),
+            255,
+            "the solid around the speckle was erased"
+        );
     }
 }

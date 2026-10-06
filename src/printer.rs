@@ -186,7 +186,7 @@ pub struct PrintSettings {
     /// Currency per litre. Zero hides the cost.
     #[serde(default)]
     pub price_per_liter: f32,
-    /// Cure closed holes in each layer so a detected pocket does not stay empty.
+    /// Close a one-pixel crack. Modeled holes stay open.
     #[serde(default)]
     pub fill_voids: bool,
 }

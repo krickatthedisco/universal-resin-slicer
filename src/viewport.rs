@@ -474,44 +474,62 @@ fn shell_stamp(obj: &crate::scene::Object) -> u64 {
     stamp
 }
 
+/// Faces steeper than this stay sharp. A calibration plate's walls, lettering,
+/// and infinity mark are right angles; a curve on Benchy is shallower and
+/// still shades smooth. One normal per welded vertex was blending the top
+/// face into the walls, so those features drew as soft blobs.
+const CREASE_COS: f32 = 0.8192; // 35 degrees
+
 fn local_tris(mesh: &Mesh) -> Vec<f32> {
-    let normals = smooth_world_normals(mesh, Mat4::IDENTITY);
-    let mut tris = Vec::with_capacity(mesh.indices.len() * 9);
+    let faces = mesh.indices.len() / 3;
+    let mut face_n = Vec::with_capacity(faces);
+    let mut face_w = Vec::with_capacity(faces);
     for tri in mesh.indices.chunks_exact(3) {
+        let a = Vec3::from_array(mesh.vertices[tri[0] as usize]);
+        let b = Vec3::from_array(mesh.vertices[tri[1] as usize]);
+        let c = Vec3::from_array(mesh.vertices[tri[2] as usize]);
+        let cross = (b - a).cross(c - a);
+        let len = cross.length();
+        if len < 1e-8 {
+            face_n.push(Vec3::Z);
+            face_w.push(0.0);
+        } else {
+            face_n.push(cross / len);
+            face_w.push(len);
+        }
+    }
+    let mut fans: Vec<Vec<u32>> = vec![Vec::new(); mesh.vertices.len()];
+    for (face, tri) in mesh.indices.chunks_exact(3).enumerate() {
         for &index in tri {
-            let i = index as usize;
-            if i >= mesh.vertices.len() || i >= normals.len() {
-                continue;
+            let fan = &mut fans[index as usize];
+            let id = face as u32;
+            if fan.last().copied() != Some(id) {
+                fan.push(id);
             }
-            push_vert(&mut tris, mesh.vertices[i], normals[i], [1.0, 1.0, 1.0]);
+        }
+    }
+    let mut tris = Vec::with_capacity(mesh.indices.len() * 9);
+    for (face, tri) in mesh.indices.chunks_exact(3).enumerate() {
+        let mine = face_n[face];
+        for &index in tri {
+            let mut acc = Vec3::ZERO;
+            for &other in &fans[index as usize] {
+                let n = face_n[other as usize];
+                if mine.dot(n) >= CREASE_COS {
+                    acc += n * face_w[other as usize];
+                }
+            }
+            let len = acc.length();
+            let normal = if len < 1e-8 { mine } else { acc / len };
+            push_vert(
+                &mut tris,
+                mesh.vertices[index as usize],
+                normal.to_array(),
+                [1.0, 1.0, 1.0],
+            );
         }
     }
     tris
-}
-
-fn smooth_world_normals(mesh: &Mesh, mat: Mat4) -> Vec<[f32; 3]> {
-    let mut acc = vec![Vec3::ZERO; mesh.vertices.len()];
-    for tri in mesh.indices.chunks_exact(3) {
-        let p = [
-            mat.transform_point3(Vec3::from_array(mesh.vertices[tri[0] as usize])),
-            mat.transform_point3(Vec3::from_array(mesh.vertices[tri[1] as usize])),
-            mat.transform_point3(Vec3::from_array(mesh.vertices[tri[2] as usize])),
-        ];
-        let cross = (p[1] - p[0]).cross(p[2] - p[0]);
-        for &index in tri {
-            acc[index as usize] += cross;
-        }
-    }
-    acc.into_iter()
-        .map(|n| {
-            let len = n.length();
-            if len < 1e-8 {
-                [0.0, 0.0, 1.0]
-            } else {
-                (n / len).to_array()
-            }
-        })
-        .collect()
 }
 
 fn push_mesh_flat(tris: &mut Vec<f32>, mesh: &Mesh, color: [f32; 3]) {
@@ -634,10 +652,10 @@ pub fn colored_tris(mesh: &Mesh, color: [f32; 3]) -> Vec<f32> {
     tris
 }
 
-// Solid shading follows the usual slicer path (PrusaSlicer / OrcaSlicer
-// gouraud): transform the real triangle, interpolate a smooth normal, and
-// let the depth buffer hide whatever is behind the shell. Two-sided so a
-// hollow still reads when you look into it.
+// Solid shading follows the usual slicer path (PrusaSlicer / OrcaSlicer):
+// transform the real triangle and interpolate the corner normal. A hard edge
+// keeps a face normal, so a flat top does not blend into the wall under it.
+// Two-sided so a hollow still reads when you look into it.
 const VERT: &str = r#"
 layout(location = 0) in vec3 a_pos;
 layout(location = 1) in vec3 a_nrm;
@@ -1493,8 +1511,8 @@ pub type SharedRenderer = Arc<std::sync::Mutex<Renderer>>;
 
 #[cfg(test)]
 mod tests {
-    use super::{smooth_world_normals, Camera};
-    use glam::{Mat4, Vec3};
+    use super::{local_tris, Camera};
+    use glam::Vec3;
 
     #[test]
     fn orbit_can_drop_below_the_bed() {
@@ -1505,15 +1523,39 @@ mod tests {
     }
 
     #[test]
-    fn a_cube_corner_normal_points_out_of_the_box() {
+    fn a_cube_edge_stays_sharp_and_a_shallow_bend_stays_smooth() {
         let mesh = crate::mesh::box_mesh([0.0, 0.0, 0.0], [10.0, 10.0, 10.0]);
-        let normals = smooth_world_normals(&mesh, Mat4::IDENTITY);
-        let corner = normals
-            .iter()
-            .zip(mesh.vertices.iter())
-            .find(|(_, v)| v[0] > 9.0 && v[1] > 9.0 && v[2] > 9.0)
-            .map(|(n, _)| *n)
-            .expect("top corner");
-        assert!(corner[0] > 0.4 && corner[1] > 0.4 && corner[2] > 0.4);
+        let tris = local_tris(&mesh);
+        let mut sharp = 0;
+        for vert in tris.chunks_exact(9) {
+            if vert[0] > 9.0 && vert[1] > 9.0 && vert[2] > 9.0 {
+                let n = [vert[3], vert[4], vert[5]];
+                let dominant = n[0].abs().max(n[1].abs()).max(n[2].abs());
+                assert!(dominant > 0.9, "cube corner was averaged into {n:?}");
+                sharp += 1;
+            }
+        }
+        assert!(sharp >= 3, "the top corner was missing, got {sharp}");
+
+        let bend = crate::mesh::Mesh {
+            vertices: vec![
+                [0.0, 0.0, 0.0],
+                [2.0, 0.0, 0.0],
+                [1.0, 1.0, 0.0],
+                [1.0, 1.0, 0.15],
+            ],
+            indices: vec![0, 1, 2, 0, 1, 3],
+        };
+        let tris = local_tris(&bend);
+        let mut blended = false;
+        for vert in tris.chunks_exact(9) {
+            if vert[0].abs() < 0.01 && vert[1].abs() < 0.01 {
+                assert!(vert[5] > 0.9, "shallow face fell over {:?}", &vert[3..6]);
+                if vert[4].abs() > 0.02 {
+                    blended = true;
+                }
+            }
+        }
+        assert!(blended, "a shallow bend was left faceted");
     }
 }

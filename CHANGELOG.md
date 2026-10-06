@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.6
+
+- The plate view keeps a hard edge. A flat top no longer blends into the wall under it, so the validation matrix, lettering, and other sharp detail read as the mesh instead of a soft blob.
+- Heal hairline gaps only closes a crack a pixel or two wide. It no longer packs the infinity mark, the line fan, or the pin holes into solid resin. That option used to be "Fill enclosed voids". Leave it on; modeled holes stay open.
+
 ## 0.2.5
 
 - The Windows build carries a version resource and an application manifest, and it declares a current Windows subsystem. Defender's Trojan:Win32/Wacatac.B!ml result on the previous exe is a false positive on the unsigned MinGW build.
