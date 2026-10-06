@@ -264,6 +264,7 @@ pub fn slice(req: Request<'_>) -> Result<Slice, String> {
     // did that for its own layers; only the first layer of a later range is
     // still open, and it is one decode per core.
     let mut carry_bits = Bits::new(machine.res_x as usize, machine.res_y as usize);
+    let mut carry_seen = SeenMask::new();
     let mut carry_enclosed: Vec<(i32, i32, u32)> = Vec::new();
     let mut thumb = vec![0u8; 224 * 168];
     let mut cavity_px_layers = 0.0f64;
@@ -274,7 +275,7 @@ pub fn slice(req: Request<'_>) -> Result<Slice, String> {
                 let img = image_from_rle(&layer.rle, machine.res_x as i32, machine.res_y as i32)?;
                 let z = (layer.index as f32 + 0.5) * h;
                 if img.width > 0 {
-                    layer.islands = find_islands(&img, &carry_bits, machine, z);
+                    layer.islands = find_islands(&img, &carry_bits, machine, z, &mut carry_seen);
                     let mut seals = 0u32;
                     for (x, y, area) in &carry_enclosed {
                         if img.get(*x, *y) > 0 {
@@ -396,6 +397,7 @@ fn raster_range(
 ) -> Result<RangeProduct, String> {
     let mut layers = Vec::with_capacity((end - start) as usize);
     let mut prev_solid = Bits::new(machine.res_x as usize, machine.res_y as usize);
+    let mut seen = SeenMask::new();
     let mut prev_enclosed: Vec<(i32, i32, u32)> = Vec::new();
     let mut thumb = vec![0u8; 224 * 168];
     let mut cavity_px = 0.0f64;
@@ -440,7 +442,7 @@ fn raster_range(
         let mut seals = 0u32;
         if image.width > 0 {
             if !boundary && index > 0 {
-                islands = find_islands(&image, &prev_solid, machine, z);
+                islands = find_islands(&image, &prev_solid, machine, z, &mut seen);
                 for (x, y, area) in &prev_enclosed {
                     if image.get(*x, *y) > 0 {
                         seals += *area;
@@ -1436,21 +1438,65 @@ fn paint_bits(bits: &mut Bits, img: &Image) {
     }
 }
 
-fn find_islands(img: &Image, prev: &Bits, machine: Machine, z: f32) -> Vec<Island> {
-    let w = img.width as usize;
-    let h = img.height as usize;
-    let mut seen = vec![false; w * h];
+/// Visited pixels for one island scan. The same buffer is restamped each
+/// layer, so a tall part does not allocate and wipe a fresh mask every time.
+struct SeenMask {
+    data: Vec<u8>,
+    gen: u8,
+}
+
+impl SeenMask {
+    fn new() -> Self {
+        Self {
+            data: Vec::new(),
+            gen: 0,
+        }
+    }
+
+    fn begin(&mut self, n: usize) {
+        if self.data.len() < n {
+            self.data.resize(n, 0);
+        }
+        if self.gen == u8::MAX {
+            self.data[..n].fill(0);
+            self.gen = 1;
+        } else {
+            self.gen += 1;
+        }
+    }
+
+    fn seen(&self, i: usize) -> bool {
+        self.data[i] == self.gen
+    }
+
+    fn mark(&mut self, i: usize) {
+        self.data[i] = self.gen;
+    }
+}
+
+fn find_islands(
+    img: &Image,
+    prev: &Bits,
+    machine: Machine,
+    z: f32,
+    seen: &mut SeenMask,
+) -> Vec<Island> {
+    let n = (img.width as usize).saturating_mul(img.height as usize);
+    if n == 0 {
+        return Vec::new();
+    }
+    seen.begin(n);
     let mut islands = Vec::new();
     let dirs = [(1, 0), (-1, 0), (0, 1), (0, -1)];
     for sy in 0..img.height {
         for sx in 0..img.width {
             let start = (sy * img.width + sx) as usize;
-            if seen[start] || img.pixels[start] == 0 {
+            if img.pixels[start] == 0 || seen.seen(start) {
                 continue;
             }
             let mut stack = VecDeque::new();
             stack.push_back((sx, sy));
-            seen[start] = true;
+            seen.mark(start);
             let mut area = 0u32;
             let mut touches = false;
             let mut sx_sum = 0i64;
@@ -1479,10 +1525,10 @@ fn find_islands(img: &Image, prev: &Bits, machine: Machine, z: f32) -> Vec<Islan
                         continue;
                     }
                     let ni = (ny * img.width + nx) as usize;
-                    if seen[ni] || img.pixels[ni] == 0 {
+                    if img.pixels[ni] == 0 || seen.seen(ni) {
                         continue;
                     }
-                    seen[ni] = true;
+                    seen.mark(ni);
                     stack.push_back((nx, ny));
                 }
             }
@@ -2735,5 +2781,52 @@ mod tests {
         let low = marks.iter().find(|point| point.0 < 3.0).unwrap();
         assert!((low.2 - 2.0).abs() < 0.01, "lowest z {}", low.2);
         assert!(marks.windows(2).all(|pair| pair[0].2 <= pair[1].2));
+    }
+
+    #[test]
+    fn a_reused_island_mask_does_not_hide_the_next_layer() {
+        let machine = machine_no_flip();
+        let prev = Bits::new(machine.res_x as usize, machine.res_y as usize);
+        let mut block = vec![0u8; 16 * 16];
+        for y in 1..5 {
+            for x in 1..5 {
+                block[y * 16 + x] = 255;
+            }
+        }
+        let first = Image {
+            x0: 0,
+            y0: 0,
+            width: 16,
+            height: 16,
+            pixels: block,
+        };
+        let mut later = vec![0u8; 10 * 10];
+        for y in 2..6 {
+            for x in 4..8 {
+                later[y * 10 + x] = 255;
+            }
+        }
+        let second = Image {
+            x0: 40,
+            y0: 40,
+            width: 10,
+            height: 10,
+            pixels: later,
+        };
+        let mut fresh_a = SeenMask::new();
+        let mut fresh_b = SeenMask::new();
+        let mut reused = SeenMask::new();
+        let a = find_islands(&first, &prev, machine, 3.0, &mut fresh_a);
+        let b = find_islands(&second, &prev, machine, 4.0, &mut fresh_b);
+        let again_a = find_islands(&first, &prev, machine, 3.0, &mut reused);
+        reused.gen = u8::MAX;
+        let again_b = find_islands(&second, &prev, machine, 4.0, &mut reused);
+        assert_eq!(a.len(), 1, "first island count {}", a.len());
+        assert_eq!(b.len(), 1, "second island count {}", b.len());
+        assert_eq!(again_a.len(), a.len());
+        assert_eq!(again_a[0].area_px, a[0].area_px);
+        assert_eq!(again_b.len(), b.len());
+        assert_eq!(again_b[0].area_px, b[0].area_px);
+        assert!((again_b[0].z_mm - 4.0).abs() < 0.01);
     }
 }

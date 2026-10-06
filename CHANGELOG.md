@@ -16,7 +16,7 @@ Amber is a desktop resin slicer. The first printer it was built around is the An
 - Fill enclosed voids heals speckles and accidental pockets, and leaves a model you hollowed empty.
 - Anti-alias, optional image blur, XY offset, elephant foot, and shrink compensation.
 - Measure, overhang colors, overlap warning, layer preview, and a print time split into light and lifting.
-- Layers are sliced across cores. Island tracking only clears the pixels a layer actually set, instead of wiping the whole plate each time.
+- Layers are sliced across cores. Island tracking only clears the pixels a layer actually set, instead of wiping the whole plate each time. The island scan reuses one visited mask up the part, and only wipes it every 255 layers.
 - Redo (Ctrl+Y) puts an undone edit back, including a move, a delete, and a cut. A new edit clears that. The status line says the next step: open a model, punch a hole, add supports, slice, or save.
 - Save plate writes an `.amber` file: the models, where they sit, their supports and holes, and the printer and resin settings. Open plate puts that job back. Ctrl+Shift+S saves it again.
 - Duplicate, copy across the bed, and fill the bed take the supports and the drain holes with each copy. Undo removes that copy's tips and holes.
