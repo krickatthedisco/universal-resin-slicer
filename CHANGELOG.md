@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.5
+
+- The Windows build carries a version resource and an application manifest, and it declares a current Windows subsystem. Defender's Trojan:Win32/Wacatac.B!ml result on the previous exe is a false positive on the unsigned MinGW build.
+
 ## 0.2.4
 
 - A slice keeps the holes in a part. The Photonsters validation matrix was coming out as solid blocks: the infinity mark, the lettering, the slots, and the pin holes were filled in. Those outlines are cut out again. Overlapping supports still meet as one solid.

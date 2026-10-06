@@ -2,7 +2,7 @@
 
 Amber is a desktop resin slicer. The machine it was built around is the **Anycubic Photon M3 Max** (298.08 × 165.6 × 300 mm, 6480×3600, 46 µm). It also knows the build volume and pixel grid of the other printers in the UVtools printer list. The save dialog defaults to the file that printer reads when Amber can write it: Photon Workshop **v516** (`.pm3m` and the other v516 suffixes), unencrypted Chitubox **`.ctb`**, Prusa **`.sl1`**, or a PNG layer zip (`.cws`, `.zip`, NanoDLP). You can pick any of those four for any printer. Encrypted CTB, GOO, and the other locked containers are not written; those machines default to `.sl1`.
 
-The window is a native app (Rust, egui, OpenGL), version 0.2.4. The same program builds on Windows and on Linux. It is not a web app.
+The window is a native app (Rust, egui, OpenGL), version 0.2.5. The same program builds on Windows and on Linux. It is not a web app.
 
 [![Buy Me a Coffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-krickatthedisco-FFDD00?style=for-the-badge&logo=buy-me-a-coffee&logoColor=black)](https://buymeacoffee.com/krickatthedisco)
 
@@ -10,7 +10,11 @@ The window opens in **Simple**. That path is: open a model, pick the printer and
 
 ## Run the Windows app
 
-`amber.exe` in this folder is a 64-bit Windows program. Copy it to your PC and double-click it. It does not need Rust or an installer. Windows may warn that the file is unrecognized; that is the usual prompt for an app that is not signed.
+`amber.exe` in this folder is a 64-bit Windows program. Copy it to your PC and double-click it. It does not need Rust or an installer.
+
+Windows Defender sometimes calls this file `Trojan:Win32/Wacatac.B!ml`. That name is a machine-learning guess, and it hits unsigned Rust programs, including a hello-world compiled with MinGW. Amber is this slicer and nothing else. The file is not packed. File Properties should show Amber, version 0.2.5, and Tyler Krick.
+
+If the download is blocked, open Properties on `amber.exe` and check Unblock, then move it out of Downloads. If Defender already quarantined it, open Windows Security, Protection history, and choose Restore. To get the detection removed for everyone, submit the exe at <https://www.microsoft.com/en-us/wdsi/filesubmission> as a software developer, and mark it as incorrectly detected. A signature from Microsoft is what clears that name. The file is not code-signed, so SmartScreen can still say the publisher is unrecognized: More info, then Run anyway.
 
 From a terminal in the same folder you can also slice without opening the window:
 

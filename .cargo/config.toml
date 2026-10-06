@@ -1,0 +1,7 @@
+# The release exe is a GUI program. Declare Windows Vista or newer so the
+# header is not the MinGW default, which is the Windows XP subsystem.
+[target.x86_64-pc-windows-gnu]
+rustflags = [
+  "-C", "link-arg=-Wl,--major-subsystem-version,6",
+  "-C", "link-arg=-Wl,--minor-subsystem-version,0",
+]
