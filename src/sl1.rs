@@ -105,6 +105,7 @@ mod tests {
             vertices: mesh.vertices,
             indices: mesh.indices,
             hollow: None,
+            negative: false,
         };
         let mut settings = crate::printer::PrintSettings::default();
         settings.layer_mm = 0.5;

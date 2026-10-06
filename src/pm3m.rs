@@ -295,6 +295,7 @@ mod tests {
             vertices: mesh.vertices,
             indices: mesh.indices,
             hollow: None,
+            negative: false,
         };
         let settings = PrintSettings::default();
         let mut machine = Machine::photon_m3_max();

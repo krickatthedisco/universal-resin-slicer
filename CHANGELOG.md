@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.2
+
+- Split a model into objects or into parts, assemble several models into one object, and mark a volume as negative so it cuts only its siblings. Union, subtract, and intersect bake two meshes into one. Shift-click picks the second model. Undo puts the plate back.
+- A negative volume is drawn in red, and a cut through it leaves the hole open.
+- View → Theme switches light and dark, and each mode keeps its own scheme: Amber, Slate, Pine, or Plum.
+- File can add #3DBenchy, a drain cup, the basic primitives, and Amber's own exposure tests (a city, pins, holes, and slopes). AmeraLabs Town and the Cones of Calibration open their own download pages.
+- Right-click → Arrange on the RERF grid lays the selected model across the plate, one copy per zone, with a digit on each. On an Anycubic printer the save name becomes R_E_R_F.
+
 ## 0.2.1
 
 - A hollow model shows its wall and the empty inside in the cut view. The top and bottom caps stay solid, the same as the slice.

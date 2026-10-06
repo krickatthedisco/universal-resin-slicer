@@ -95,6 +95,8 @@ pub struct ObjectFrame {
     /// World Z of the mesh bounds. A cut outside this range draws no cap.
     pub z_min: f32,
     pub z_max: f32,
+    pub negative: bool,
+    pub assembly: u64,
 }
 
 #[derive(Clone)]
@@ -295,7 +297,14 @@ impl ViewCache {
                     || max.y > plate.y + 0.2
                     || max.z > plate.z + 0.2
             });
-            let color = if outside {
+            let negative = obj.kind == crate::scene::VolumeKind::Negative;
+            let color = if negative {
+                if selected {
+                    [0.95, 0.42, 0.36]
+                } else {
+                    [0.82, 0.24, 0.22]
+                }
+            } else if outside {
                 [0.72, 0.32, 0.28]
             } else if selected {
                 [0.93, 0.78, 0.52]
@@ -323,6 +332,8 @@ impl ViewCache {
                 local,
                 z_min,
                 z_max,
+                negative,
+                assembly: obj.assembly_id(),
             });
             if selected {
                 if let Some((min, max)) = Document::display_bounds(obj) {
@@ -759,6 +770,8 @@ struct ObjectGpu {
     color: [f32; 3],
     z_min: f32,
     z_max: f32,
+    negative: bool,
+    assembly: u64,
 }
 
 struct RaftGpu {
@@ -916,6 +929,8 @@ impl Renderer {
                 gpu.color = obj.color;
                 gpu.z_min = obj.z_min;
                 gpu.z_max = obj.z_max;
+                gpu.negative = obj.negative;
+                gpu.assembly = obj.assembly;
                 next.push(gpu);
             } else {
                 let mut batches = Vec::new();
@@ -928,6 +943,8 @@ impl Renderer {
                     color: obj.color,
                     z_min: obj.z_min,
                     z_max: obj.z_max,
+                    negative: obj.negative,
+                    assembly: obj.assembly,
                 });
             }
         }
@@ -1037,9 +1054,38 @@ impl Renderer {
                 gl.uniform_1_f32(self.locs.clip_on.as_ref(), 1.0);
             }
             for obj in &self.objects {
+                if obj.negative {
+                    continue;
+                }
                 self.draw_solid(gl, &obj.batches, obj.model, obj.color, 1.0, 1.0, vp);
             }
             gl.uniform_1_f32(self.locs.show_overhang.as_ref(), 0.0);
+            let mut any_negative = false;
+            for obj in &self.objects {
+                if obj.negative {
+                    any_negative = true;
+                    break;
+                }
+            }
+            if any_negative {
+                gl.enable(glow::BLEND);
+                gl.blend_func(glow::SRC_ALPHA, glow::ONE_MINUS_SRC_ALPHA);
+                gl.depth_mask(false);
+                for obj in &self.objects {
+                    if obj.negative {
+                        self.draw_solid(gl, &obj.batches, obj.model, obj.color, 1.0, 0.42, vp);
+                    }
+                }
+                gl.depth_func(glow::GREATER);
+                for obj in &self.objects {
+                    if obj.negative {
+                        self.draw_solid(gl, &obj.batches, obj.model, obj.color, 1.0, 0.18, vp);
+                    }
+                }
+                gl.depth_func(glow::LEQUAL);
+                gl.depth_mask(true);
+                gl.disable(glow::BLEND);
+            }
             gl.uniform_1_f32(self.locs.clip_on.as_ref(), 0.0);
             if let Some((lo, hi)) = clip {
                 self.draw_section_caps(gl, lo, hi, vp);
@@ -1117,9 +1163,36 @@ impl Renderer {
             let planes = [(-1.0e6, clip_hi, clip_hi), (clip_lo, 1.0e6, clip_lo)];
             gl.enable(glow::STENCIL_TEST);
             gl.stencil_mask(0xff);
-            for obj in &self.objects {
+            let mut groups: Vec<(u64, Vec<usize>)> = Vec::new();
+            for (i, obj) in self.objects.iter().enumerate() {
+                if let Some(group) = groups.iter_mut().find(|group| group.0 == obj.assembly) {
+                    group.1.push(i);
+                } else {
+                    groups.push((obj.assembly, vec![i]));
+                }
+            }
+            for (_, members) in groups {
+                let mut positives = Vec::new();
+                let mut negatives = Vec::new();
+                for index in members {
+                    if self.objects[index].negative {
+                        negatives.push(index);
+                    } else {
+                        positives.push(index);
+                    }
+                }
+                if positives.is_empty() {
+                    continue;
+                }
+                let mut z_min = f32::MAX;
+                let mut z_max = f32::MIN;
+                for index in &positives {
+                    z_min = z_min.min(self.objects[*index].z_min);
+                    z_max = z_max.max(self.objects[*index].z_max);
+                }
+                let color = self.objects[positives[0]].color;
                 for (lo, hi, z) in planes {
-                    if z <= obj.z_min + 0.03 || z >= obj.z_max - 0.03 {
+                    if z <= z_min + 0.03 || z >= z_max - 0.03 {
                         continue;
                     }
                     gl.clear_stencil(0);
@@ -1136,11 +1209,31 @@ impl Renderer {
 
                     gl.cull_face(glow::FRONT);
                     gl.stencil_op(glow::INCR_WRAP, glow::INCR_WRAP, glow::INCR_WRAP);
-                    self.draw_solid(gl, &obj.batches, obj.model, obj.color, 1.0, 1.0, vp);
-
+                    for index in &positives {
+                        let obj = &self.objects[*index];
+                        self.draw_solid(gl, &obj.batches, obj.model, obj.color, 1.0, 1.0, vp);
+                    }
                     gl.cull_face(glow::BACK);
                     gl.stencil_op(glow::DECR_WRAP, glow::DECR_WRAP, glow::DECR_WRAP);
-                    self.draw_solid(gl, &obj.batches, obj.model, obj.color, 1.0, 1.0, vp);
+                    for index in &positives {
+                        let obj = &self.objects[*index];
+                        self.draw_solid(gl, &obj.batches, obj.model, obj.color, 1.0, 1.0, vp);
+                    }
+
+                    // A negative uses the swapped wrap so its cross-section
+                    // cancels the parent. The cap is not drawn on the cutter.
+                    gl.cull_face(glow::FRONT);
+                    gl.stencil_op(glow::DECR_WRAP, glow::DECR_WRAP, glow::DECR_WRAP);
+                    for index in &negatives {
+                        let obj = &self.objects[*index];
+                        self.draw_solid(gl, &obj.batches, obj.model, obj.color, 1.0, 1.0, vp);
+                    }
+                    gl.cull_face(glow::BACK);
+                    gl.stencil_op(glow::INCR_WRAP, glow::INCR_WRAP, glow::INCR_WRAP);
+                    for index in &negatives {
+                        let obj = &self.objects[*index];
+                        self.draw_solid(gl, &obj.batches, obj.model, obj.color, 1.0, 1.0, vp);
+                    }
 
                     gl.color_mask(true, true, true, true);
                     gl.depth_mask(true);
@@ -1151,7 +1244,7 @@ impl Renderer {
                     gl.stencil_func(glow::NOTEQUAL, 0, 0xff);
                     gl.stencil_op(glow::KEEP, glow::KEEP, glow::KEEP);
                     let model = Mat4::from_translation(Vec3::new(0.0, 0.0, z));
-                    self.draw_solid(gl, &self.cap_quad.batches, model, obj.color, 1.0, 1.0, vp);
+                    self.draw_solid(gl, &self.cap_quad.batches, model, color, 1.0, 1.0, vp);
                 }
             }
             gl.disable(glow::STENCIL_TEST);

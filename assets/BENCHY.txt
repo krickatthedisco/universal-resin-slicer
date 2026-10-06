@@ -1,0 +1,8 @@
+#3DBenchy is included as the original STL from Creative Tools.
+
+It is dedicated to the public domain under the Creative Commons CC0 1.0
+Universal license. Attribution is not required. The makers ask that
+publications mention #3DBenchy and https://www.3dbenchy.com
+
+Source: https://github.com/CreativeTools/3DBenchy
+License: https://www.3dbenchy.com/license/

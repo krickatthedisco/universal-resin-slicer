@@ -3,11 +3,12 @@
 use crate::catalog;
 use crate::community;
 use crate::formats::{self, format_from_extension};
-use crate::mesh::{calibration_cube, overhang_bridge};
+use crate::mesh::{calibration_cube, overhang_bridge, BooleanOp};
 use crate::plate::{self, PlateData};
 use crate::printer::{Machine, PrintFormat, PrintSettings};
 use crate::resins::{self, Resin, ResinProfile};
-use crate::scene::{Document, Selection};
+use crate::scene::{Document, Selection, VolumeKind};
+use crate::shapes;
 use crate::slice::{self, Slice};
 use crate::supports::{SectionShape, PRESETS};
 use crate::viewport::{self, Camera, PlateFrame, PlateView, Renderer, ViewCache};
@@ -85,6 +86,47 @@ fn default_section_z() -> f32 {
     10.0
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+enum ThemeMode {
+    Dark,
+    Light,
+}
+
+impl Default for ThemeMode {
+    fn default() -> Self {
+        Self::Dark
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+enum Scheme {
+    Amber,
+    Slate,
+    Pine,
+    Plum,
+}
+
+impl Default for Scheme {
+    fn default() -> Self {
+        Self::Amber
+    }
+}
+
+impl Scheme {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Amber => "Amber",
+            Self::Slate => "Slate",
+            Self::Pine => "Pine",
+            Self::Plum => "Plum",
+        }
+    }
+
+    fn all() -> [Scheme; 4] {
+        [Self::Amber, Self::Slate, Self::Pine, Self::Plum]
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 struct Persist {
     settings: PrintSettings,
@@ -145,6 +187,12 @@ struct Persist {
     section_z: f32,
     #[serde(default)]
     section_lo: f32,
+    #[serde(default)]
+    theme_mode: ThemeMode,
+    #[serde(default)]
+    dark_scheme: Scheme,
+    #[serde(default)]
+    light_scheme: Scheme,
 }
 
 pub struct AmberApp {
@@ -218,11 +266,15 @@ pub struct AmberApp {
     view_drawn: u64,
     /// The drain whose sizes are currently shown in the hole panel.
     hole_panel_for: Option<u64>,
+    theme_mode: ThemeMode,
+    dark_scheme: Scheme,
+    light_scheme: Scheme,
+    /// Shift-clicked models. Assemble and the booleans use this set.
+    picked: HashSet<u64>,
 }
 
 impl AmberApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        apply_theme(&cc.egui_ctx);
         let mut machine = Machine::photon_m3_max();
         let mut settings = PrintSettings::default();
         let mut preset = 1usize;
@@ -240,6 +292,9 @@ impl AmberApp {
         let mut workshop = false;
         let mut recent = Vec::new();
         let mut plate_view = PlateView::default();
+        let mut theme_mode = ThemeMode::Dark;
+        let mut dark_scheme = Scheme::Amber;
+        let mut light_scheme = Scheme::Amber;
         if let Some(storage) = cc.storage {
             if let Some(raw) = storage.get_string("amber.print") {
                 if let Ok(saved) = serde_json::from_str::<Persist>(&raw) {
@@ -274,9 +329,18 @@ impl AmberApp {
                     plate_view.section = saved.section;
                     plate_view.section_z = saved.section_z;
                     plate_view.section_lo = saved.section_lo;
+                    theme_mode = saved.theme_mode;
+                    dark_scheme = saved.dark_scheme;
+                    light_scheme = saved.light_scheme;
                 }
             }
         }
+        let shown = if theme_mode == ThemeMode::Light {
+            light_scheme
+        } else {
+            dark_scheme
+        };
+        apply_theme(&cc.egui_ctx, theme_mode, shown);
         let mut doc = Document::new();
         doc.set_preset(preset);
         if let Some(style) = saved_style {
@@ -366,6 +430,10 @@ impl AmberApp {
             view_rev: 0,
             view_drawn: 0,
             hole_panel_for: None,
+            theme_mode,
+            dark_scheme,
+            light_scheme,
+            picked: HashSet::new(),
         }
     }
 
@@ -772,10 +840,147 @@ impl AmberApp {
                 overhang_bridge(plate.x, plate.y),
             )
         };
-        self.doc.add_mesh(name, mesh);
+        let id = self.doc.add_mesh(name, mesh);
+        self.picked.clear();
+        self.picked.insert(id);
+        self.note_added();
+    }
+
+    fn add_shape(&mut self, name: &str, mesh: crate::mesh::Mesh) {
+        let mut mesh = mesh;
+        let plate = self.plate();
+        fit_on_plate(&mut mesh, plate);
+        for v in &mut mesh.vertices {
+            v[0] += plate.x * 0.5;
+            v[1] += plate.y * 0.5;
+        }
+        let id = self.doc.add_mesh(name.to_string(), mesh);
+        self.picked.clear();
+        self.picked.insert(id);
+        self.note_added();
+    }
+
+    fn note_added(&mut self) {
         self.export_name = default_export_name(&self.doc, self.machine.extension);
         self.invalidate_slice();
         self.view = View::Prepare;
+    }
+
+    fn shown_scheme(&self) -> Scheme {
+        if self.theme_mode == ThemeMode::Light {
+            self.light_scheme
+        } else {
+            self.dark_scheme
+        }
+    }
+
+    fn theme_menu(&mut self, ui: &mut egui::Ui) {
+        ui.label("Theme");
+        ui.horizontal(|ui| {
+            if ui
+                .selectable_label(self.theme_mode == ThemeMode::Dark, "Dark")
+                .clicked()
+            {
+                self.theme_mode = ThemeMode::Dark;
+            }
+            if ui
+                .selectable_label(self.theme_mode == ThemeMode::Light, "Light")
+                .clicked()
+            {
+                self.theme_mode = ThemeMode::Light;
+            }
+        });
+        ui.label("Dark scheme");
+        self.scheme_row(ui, true);
+        ui.label("Light scheme");
+        self.scheme_row(ui, false);
+        ui.label("Each mode keeps the scheme you pick for it.");
+    }
+
+    fn scheme_row(&mut self, ui: &mut egui::Ui, dark: bool) {
+        ui.horizontal_wrapped(|ui| {
+            for scheme in Scheme::all() {
+                let on = if dark {
+                    self.dark_scheme == scheme
+                } else {
+                    self.light_scheme == scheme
+                };
+                if ui.selectable_label(on, scheme.label()).clicked() {
+                    if dark {
+                        self.dark_scheme = scheme;
+                    } else {
+                        self.light_scheme = scheme;
+                    }
+                }
+            }
+        });
+    }
+
+    fn pick_model(&mut self, id: u64, shift: bool) {
+        if shift {
+            if self.picked.contains(&id) && self.picked.len() > 1 {
+                self.picked.remove(&id);
+            } else {
+                self.picked.insert(id);
+            }
+        } else {
+            self.picked.clear();
+            self.picked.insert(id);
+        }
+        self.doc.selection = Selection::Object(id);
+        self.doc.touch_xform();
+    }
+
+    fn picked_ids(&self) -> Vec<u64> {
+        let mut ids: Vec<u64> = self
+            .picked
+            .iter()
+            .copied()
+            .filter(|id| self.doc.object(*id).is_some())
+            .collect();
+        if let Selection::Object(id) = self.doc.selection {
+            if self.doc.object(id).is_some() && !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+        ids.sort_unstable();
+        ids
+    }
+
+    fn arrange_rerf(&mut self, id: u64) {
+        let plate = self.plate();
+        match self.doc.spread_on_rerf(id, plate.x, plate.y, plate.z) {
+            Ok(spread) => {
+                self.picked.clear();
+                self.picked.insert(id);
+                self.invalidate_slice();
+                let anycubic = self.machine.vendor.eq_ignore_ascii_case("Anycubic");
+                if anycubic {
+                    self.export_name = format!("R_E_R_F.{}", self.machine.extension);
+                }
+                let scale = if spread.scale < 0.99 {
+                    format!(
+                        " Each copy was scaled to {:.0}% so it fits a zone.",
+                        spread.scale * 100.0
+                    )
+                } else {
+                    String::new()
+                };
+                let exposure = self.settings.exposure_s;
+                self.status = if anycubic {
+                    format!(
+                        "Placed {} copies. Zone 1 is the left column and uses the normal exposure ({exposure:.2} s). Save as R_E_R_F so the printer steps the time, often by 0.25 s. Check this machine's manual.{scale}",
+                        spread.count
+                    )
+                } else {
+                    format!(
+                        "Placed {} copies across the plate, one per zone. {} exposes every zone the same ({exposure:.2} s). The grid is the usual 8-column test.{scale}",
+                        spread.count, self.machine.name
+                    )
+                };
+            }
+            Err(err) => self.status = err.into(),
+        }
     }
 
     fn handle_keys(&mut self, ctx: &egui::Context) {
@@ -942,6 +1147,9 @@ impl eframe::App for AmberApp {
             section: self.plate_view.section,
             section_z: self.plate_view.section_z,
             section_lo: self.plate_view.section_lo,
+            theme_mode: self.theme_mode,
+            dark_scheme: self.dark_scheme,
+            light_scheme: self.light_scheme,
         };
         if let Ok(raw) = serde_json::to_string(&saved) {
             storage.set_string("amber.print", raw);
@@ -958,6 +1166,7 @@ impl eframe::App for AmberApp {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        apply_theme(&ctx, self.theme_mode, self.shown_scheme());
         self.poll_job(&ctx);
         self.handle_keys(&ctx);
         if !ctx.input(|i| i.pointer.primary_down() || i.pointer.secondary_down()) {
@@ -1052,14 +1261,91 @@ impl AmberApp {
                         }
                     }
                 }
-                if ui.button("Add 20 mm cube").clicked() {
-                    self.add_builtin("cube");
-                    ui.close();
-                }
-                if ui.button("Add overhang bridge").clicked() {
-                    self.add_builtin("bridge");
-                    ui.close();
-                }
+                ui.menu_button("Add a useful object", |ui| {
+                    if ui
+                        .button("#3DBenchy")
+                        .on_hover_text("The public-domain boat from 3dbenchy.com. CC0.")
+                        .clicked()
+                    {
+                        self.add_shape("3DBenchy", shapes::benchy());
+                        ui.close();
+                    }
+                    if ui.button("20 mm cube").clicked() {
+                        self.add_builtin("cube");
+                        ui.close();
+                    }
+                    if ui.button("Overhang bridge").clicked() {
+                        self.add_builtin("bridge");
+                        ui.close();
+                    }
+                    if ui
+                        .button("Drain cup")
+                        .on_hover_text("A cup with a floor, for a hollow and a drain hole.")
+                        .clicked()
+                    {
+                        self.add_shape("Drain cup", shapes::drain_cup());
+                        ui.close();
+                    }
+                });
+                ui.menu_button("Add a primitive", |ui| {
+                    let shapes: [(&str, fn() -> crate::mesh::Mesh); 12] = [
+                        ("Cube", || shapes::cube(20.0)),
+                        ("Sphere", || shapes::sphere(10.0)),
+                        ("Hemisphere", || shapes::hemisphere(10.0)),
+                        ("Cylinder", || shapes::cylinder(8.0, 20.0)),
+                        ("Cone", || shapes::cone(10.0, 20.0)),
+                        ("Pyramid", || shapes::pyramid(16.0, 16.0)),
+                        ("Torus", || shapes::torus(10.0, 3.0)),
+                        ("Tube", || shapes::tube(10.0, 7.0, 20.0, 32)),
+                        ("Capsule", || shapes::capsule(6.0, 16.0)),
+                        ("Wedge", || shapes::wedge(16.0, 12.0, 10.0)),
+                        ("Hex prism", || shapes::hex_prism(12.0, 16.0)),
+                        ("Slab", || shapes::slab(30.0, 20.0, 2.0)),
+                    ];
+                    for (name, make) in shapes {
+                        if ui.button(name).clicked() {
+                            self.add_shape(name, make());
+                            ui.close();
+                        }
+                    }
+                });
+                ui.menu_button("Add a RERF model", |ui| {
+                    ui.label("Amber's own exposure tests. Right-click a model to lay out the printer's RERF grid.");
+                    if ui
+                        .button("Exposure city")
+                        .on_hover_text("Towers, an arch, and a thin fin. Not the AmeraLabs town.")
+                        .clicked()
+                    {
+                        self.add_shape("Exposure city", shapes::exposure_city());
+                        ui.close();
+                    }
+                    if ui.button("Pin card").clicked() {
+                        self.add_shape("Pin card", shapes::pin_card());
+                        ui.close();
+                    }
+                    if ui.button("Hole card").clicked() {
+                        self.add_shape("Hole card", shapes::hole_card());
+                        ui.close();
+                    }
+                    if ui.button("Slope card").clicked() {
+                        self.add_shape("Slope card", shapes::slope_card());
+                        ui.close();
+                    }
+                    ui.separator();
+                    ui.label("Not bundled. Their licenses do not allow shipping the file.");
+                    if ui.button("AmeraLabs Town…").clicked() {
+                        ui.ctx().open_url(egui::OpenUrl::new_tab(
+                            "https://ameralabs.com/blog/town-calibration-part/",
+                        ));
+                        ui.close();
+                    }
+                    if ui.button("Cones of Calibration…").clicked() {
+                        ui.ctx().open_url(egui::OpenUrl::new_tab(
+                            "https://www.tableflipfoundry.com/3d-printing/the-cones-of-calibration-v3/",
+                        ));
+                        ui.close();
+                    }
+                });
                 if ui.button("Quit").clicked() {
                     ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
                 }
@@ -1119,6 +1405,8 @@ impl AmberApp {
                 self.section_controls(ui);
                 ui.separator();
                 self.support_visibility(ui);
+                ui.separator();
+                self.theme_menu(ui);
             });
             ui.menu_button("Setting", |ui| {
                 let mut changed = false;
@@ -1800,7 +2088,7 @@ impl AmberApp {
         if self.doc.objects.is_empty() {
             ui.label("Open an STL, OBJ, or 3MF, or drop it on the plate.");
         }
-        let rows: Vec<(u64, String, usize)> = self
+        let rows: Vec<(u64, String, usize, bool)> = self
             .doc
             .objects
             .iter()
@@ -1811,13 +2099,29 @@ impl AmberApp {
                     .iter()
                     .filter(|s| s.object_id == obj.id)
                     .count();
-                (obj.id, obj.name.clone(), n)
+                let asm = obj.assembly_id();
+                let grouped = self
+                    .doc
+                    .objects
+                    .iter()
+                    .filter(|other| other.assembly_id() == asm)
+                    .count()
+                    > 1;
+                let negative = obj.kind == VolumeKind::Negative;
+                let mut name = obj.name.clone();
+                if negative {
+                    name = format!("{name}  ·  negative");
+                } else if grouped {
+                    name = format!("{name}  ·  part");
+                }
+                (obj.id, name, n, negative)
             })
             .collect();
         let mut select = None;
         let mut toggle = None;
-        for (id, name, n) in rows {
-            let selected = self.doc.selection == Selection::Object(id);
+        let shift = ui.input(|i| i.modifiers.shift);
+        for (id, name, n, _) in rows {
+            let selected = self.doc.selection == Selection::Object(id) || self.picked.contains(&id);
             let label = if n > 0 {
                 format!("{name}  ·  {n}")
             } else {
@@ -1832,8 +2136,12 @@ impl AmberApp {
                 {
                     toggle = Some((id, shown));
                 }
-                if ui.selectable_label(selected, label).clicked() {
-                    select = Some(Selection::Object(id));
+                if ui
+                    .selectable_label(selected, label)
+                    .on_hover_text("Shift-click to add it to the assemble and boolean set.")
+                    .clicked()
+                {
+                    select = Some((id, shift));
                 }
             });
         }
@@ -1849,9 +2157,14 @@ impl AmberApp {
             }
             self.touch_view();
         }
-        if let Some(sel) = select {
-            self.doc.selection = sel;
-            self.doc.touch_xform();
+        if let Some((id, shift)) = select {
+            self.pick_model(id, shift);
+        }
+        let picked_n = self.picked_ids().len();
+        if picked_n > 1 {
+            ui.label(format!(
+                "{picked_n} models selected. Right-click one for assemble, boolean, or the RERF grid."
+            ));
         }
         if let Selection::Object(id) = self.doc.selection {
             if let Some(obj) = self.doc.object_mut(id) {
@@ -3506,6 +3819,10 @@ impl AmberApp {
         let aspect = (response.rect.width() / response.rect.height().max(1.0)).clamp(0.2, 5.0);
         let (origin, dir) = self.camera.ray(rel_x, rel_y, aspect);
         if let Some((id, _, _)) = self.visible_hit(origin, dir) {
+            if !self.picked.contains(&id) {
+                self.picked.clear();
+                self.picked.insert(id);
+            }
             self.doc.selection = Selection::Object(id);
             self.doc.touch_xform();
             self.part_menu = Some(pointer);
@@ -4000,6 +4317,123 @@ impl AmberApp {
             close = true;
         }
         ui.separator();
+        ui.separator();
+        if click(ui, "Split into objects") {
+            match self.doc.split_shells(id, false) {
+                Ok(n) => {
+                    self.picked.clear();
+                    self.picked.insert(id);
+                    self.invalidate_slice();
+                    self.status = format!("Split into {n} objects.");
+                }
+                Err(err) => self.status = err.into(),
+            }
+            close = true;
+        }
+        if click(ui, "Split into parts") {
+            match self.doc.split_shells(id, true) {
+                Ok(n) => {
+                    self.picked.clear();
+                    self.picked.insert(id);
+                    self.invalidate_slice();
+                    self.status = format!("Split into {n} parts of one object.");
+                }
+                Err(err) => self.status = err.into(),
+            }
+            close = true;
+        }
+        if click(ui, "Assemble selected") {
+            let ids = self.picked_ids();
+            match self.doc.assemble(&ids) {
+                Ok(()) => {
+                    self.invalidate_slice();
+                    self.status =
+                        "Those models are parts of one object. A negative cuts only its siblings."
+                            .into();
+                }
+                Err(err) => self.status = err.into(),
+            }
+            close = true;
+        }
+        let negative = self
+            .doc
+            .object(id)
+            .is_some_and(|obj| obj.kind == VolumeKind::Negative);
+        if click(
+            ui,
+            if negative {
+                "Use as a part"
+            } else {
+                "Use as a negative volume"
+            },
+        ) {
+            let kind = if negative {
+                VolumeKind::Part
+            } else {
+                VolumeKind::Negative
+            };
+            self.doc.set_volume_kind(id, kind);
+            self.invalidate_slice();
+            self.status = if kind == VolumeKind::Negative {
+                "This volume cuts the other parts of its object. Assemble it onto a model if it is on its own.".into()
+            } else {
+                "This volume adds resin again.".into()
+            };
+            close = true;
+        }
+        let others: Vec<u64> = self
+            .picked_ids()
+            .into_iter()
+            .filter(|other| *other != id)
+            .collect();
+        let tool = if others.len() == 1 {
+            Some(others[0])
+        } else {
+            None
+        };
+        let boolean = |app: &mut Self, ui: &mut egui::Ui, label: &str, op: BooleanOp| -> bool {
+            if !ui.button(label).clicked() {
+                return false;
+            }
+            let Some(tool_id) = tool else {
+                app.status = "Shift-click the model to union, subtract, or intersect, then run it from this menu.".into();
+                return true;
+            };
+            match app.doc.boolean_objects(id, tool_id, op) {
+                Ok(()) => {
+                    app.picked.clear();
+                    app.picked.insert(id);
+                    app.invalidate_slice();
+                    app.status = "Baked the boolean into one mesh and removed the other model. Undo puts both back.".into();
+                }
+                Err(err) => app.status = err.into(),
+            }
+            true
+        };
+        if boolean(self, ui, "Union with the other selection", BooleanOp::Union) {
+            close = true;
+        }
+        if boolean(
+            self,
+            ui,
+            "Subtract the other selection",
+            BooleanOp::Difference,
+        ) {
+            close = true;
+        }
+        if boolean(
+            self,
+            ui,
+            "Intersect with the other selection",
+            BooleanOp::Intersection,
+        ) {
+            close = true;
+        }
+        ui.separator();
+        if click(ui, "Arrange on the RERF grid") {
+            self.arrange_rerf(id);
+            close = true;
+        }
         if click(ui, "Duplicate") {
             self.doc.duplicate(id);
             self.invalidate_slice();
@@ -4084,12 +4518,14 @@ impl AmberApp {
                 }
             }
             _ => {
+                let shift = response.ctx.input(|i| i.modifiers.shift);
                 if let Some((id, _, _)) = self.visible_hit(origin, dir) {
-                    self.doc.selection = Selection::Object(id);
-                } else {
+                    self.pick_model(id, shift);
+                } else if !shift {
+                    self.picked.clear();
                     self.doc.selection = Selection::None;
+                    self.doc.touch_xform();
                 }
-                self.doc.touch_xform();
             }
         }
     }
@@ -4410,23 +4846,173 @@ fn write_png(path: &std::path::Path, w: u32, h: u32, rgba: &[u8]) -> Result<(), 
     writer.write_image_data(rgba).map_err(|e| e.to_string())
 }
 
-fn apply_theme(ctx: &egui::Context) {
-    let mut visuals = egui::Visuals::dark();
-    let bg = egui::Color32::from_rgb(22, 24, 27);
-    let panel = egui::Color32::from_rgb(30, 33, 37);
-    let amber = egui::Color32::from_rgb(214, 154, 62);
-    visuals.panel_fill = panel;
-    visuals.window_fill = bg;
-    visuals.extreme_bg_color = egui::Color32::from_rgb(16, 17, 19);
-    visuals.faint_bg_color = egui::Color32::from_rgb(38, 41, 46);
-    visuals.selection.bg_fill = egui::Color32::from_rgb(176, 92, 32);
-    visuals.selection.stroke.color = amber;
-    visuals.hyperlink_color = amber;
-    visuals.widgets.inactive.bg_fill = egui::Color32::from_rgb(42, 46, 51);
-    visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(58, 52, 40);
-    visuals.widgets.active.bg_fill = egui::Color32::from_rgb(176, 92, 32);
-    visuals.widgets.inactive.fg_stroke.color = egui::Color32::from_rgb(228, 220, 206);
-    visuals.override_text_color = Some(egui::Color32::from_rgb(232, 224, 210));
+fn fit_on_plate(mesh: &mut crate::mesh::Mesh, plate: Vec3) {
+    let Some((min, max)) = mesh.bounds() else {
+        return;
+    };
+    let w = (max[0] - min[0]).max(0.2);
+    let d = (max[1] - min[1]).max(0.2);
+    let h = (max[2] - min[2]).max(0.2);
+    let margin = 8.0_f32;
+    let fit = ((plate.x - margin) / w)
+        .min((plate.y - margin) / d)
+        .min((plate.z - margin) / h)
+        .min(1.0);
+    if fit >= 0.999 {
+        return;
+    }
+    let cx = (min[0] + max[0]) * 0.5;
+    let cy = (min[1] + max[1]) * 0.5;
+    for v in &mut mesh.vertices {
+        v[0] = cx + (v[0] - cx) * fit;
+        v[1] = cy + (v[1] - cy) * fit;
+        v[2] = min[2] + (v[2] - min[2]) * fit;
+    }
+}
+
+struct Palette {
+    bg: [u8; 3],
+    panel: [u8; 3],
+    extreme: [u8; 3],
+    faint: [u8; 3],
+    select: [u8; 3],
+    accent: [u8; 3],
+    widget: [u8; 3],
+    hover: [u8; 3],
+    text: [u8; 3],
+    muted: [u8; 3],
+}
+
+fn palette(mode: ThemeMode, scheme: Scheme) -> Palette {
+    let dark = mode == ThemeMode::Dark;
+    match (dark, scheme) {
+        (true, Scheme::Amber) => Palette {
+            bg: [22, 24, 27],
+            panel: [30, 33, 37],
+            extreme: [16, 17, 19],
+            faint: [38, 41, 46],
+            select: [176, 92, 32],
+            accent: [214, 154, 62],
+            widget: [42, 46, 51],
+            hover: [58, 52, 40],
+            text: [232, 224, 210],
+            muted: [228, 220, 206],
+        },
+        (false, Scheme::Amber) => Palette {
+            bg: [244, 236, 224],
+            panel: [252, 247, 238],
+            extreme: [230, 218, 200],
+            faint: [236, 226, 210],
+            select: [214, 148, 52],
+            accent: [140, 78, 16],
+            widget: [236, 226, 208],
+            hover: [248, 214, 168],
+            text: [42, 32, 22],
+            muted: [72, 56, 40],
+        },
+        (true, Scheme::Slate) => Palette {
+            bg: [18, 22, 28],
+            panel: [26, 32, 40],
+            extreme: [12, 16, 20],
+            faint: [36, 44, 54],
+            select: [46, 110, 168],
+            accent: [126, 178, 220],
+            widget: [36, 44, 54],
+            hover: [40, 58, 76],
+            text: [220, 228, 236],
+            muted: [196, 208, 220],
+        },
+        (false, Scheme::Slate) => Palette {
+            bg: [236, 240, 244],
+            panel: [248, 250, 252],
+            extreme: [218, 224, 230],
+            faint: [226, 232, 238],
+            select: [46, 110, 168],
+            accent: [18, 70, 118],
+            widget: [226, 232, 238],
+            hover: [196, 216, 232],
+            text: [22, 28, 36],
+            muted: [52, 64, 78],
+        },
+        (true, Scheme::Pine) => Palette {
+            bg: [18, 26, 22],
+            panel: [26, 36, 31],
+            extreme: [12, 18, 16],
+            faint: [34, 46, 40],
+            select: [36, 120, 78],
+            accent: [122, 196, 150],
+            widget: [34, 46, 40],
+            hover: [40, 62, 50],
+            text: [220, 232, 224],
+            muted: [190, 210, 198],
+        },
+        (false, Scheme::Pine) => Palette {
+            bg: [236, 244, 238],
+            panel: [246, 252, 248],
+            extreme: [214, 228, 220],
+            faint: [224, 236, 228],
+            select: [36, 120, 78],
+            accent: [16, 84, 48],
+            widget: [224, 236, 228],
+            hover: [190, 224, 200],
+            text: [22, 36, 28],
+            muted: [48, 70, 56],
+        },
+        (true, Scheme::Plum) => Palette {
+            bg: [26, 20, 28],
+            panel: [36, 28, 38],
+            extreme: [18, 14, 20],
+            faint: [46, 36, 50],
+            select: [140, 64, 120],
+            accent: [214, 150, 196],
+            widget: [46, 36, 50],
+            hover: [64, 44, 68],
+            text: [236, 224, 232],
+            muted: [214, 196, 210],
+        },
+        (false, Scheme::Plum) => Palette {
+            bg: [246, 238, 244],
+            panel: [252, 246, 250],
+            extreme: [230, 216, 226],
+            faint: [240, 226, 234],
+            select: [150, 64, 122],
+            accent: [102, 28, 82],
+            widget: [240, 226, 234],
+            hover: [236, 200, 220],
+            text: [42, 24, 36],
+            muted: [78, 52, 68],
+        },
+    }
+}
+
+fn rgb(c: [u8; 3]) -> egui::Color32 {
+    egui::Color32::from_rgb(c[0], c[1], c[2])
+}
+
+fn apply_theme(ctx: &egui::Context, mode: ThemeMode, scheme: Scheme) {
+    let mut visuals = if mode == ThemeMode::Light {
+        egui::Visuals::light()
+    } else {
+        egui::Visuals::dark()
+    };
+    let p = palette(mode, scheme);
+    let accent = rgb(p.accent);
+    visuals.panel_fill = rgb(p.panel);
+    visuals.window_fill = rgb(p.bg);
+    visuals.extreme_bg_color = rgb(p.extreme);
+    visuals.faint_bg_color = rgb(p.faint);
+    visuals.selection.bg_fill = rgb(p.select);
+    visuals.selection.stroke.color = accent;
+    visuals.hyperlink_color = accent;
+    visuals.window_stroke.color = rgb(p.faint);
+    visuals.widgets.inactive.bg_fill = rgb(p.widget);
+    visuals.widgets.hovered.bg_fill = rgb(p.hover);
+    visuals.widgets.active.bg_fill = rgb(p.select);
+    visuals.widgets.inactive.fg_stroke.color = rgb(p.muted);
+    visuals.widgets.hovered.fg_stroke.color = rgb(p.text);
+    visuals.widgets.active.fg_stroke.color = rgb(p.text);
+    visuals.widgets.noninteractive.fg_stroke.color = rgb(p.text);
+    visuals.override_text_color = Some(rgb(p.text));
     ctx.set_visuals(visuals);
 }
 

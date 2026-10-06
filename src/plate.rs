@@ -6,7 +6,7 @@
 
 use crate::mesh::Mesh;
 use crate::printer::PrintSettings;
-use crate::scene::{DrainHole, ModelSupport, Object};
+use crate::scene::{DrainHole, ModelSupport, Object, VolumeKind};
 use crate::supports::Support;
 use anyhow::{anyhow, Context, Result};
 use glam::Vec3;
@@ -41,6 +41,10 @@ struct ObjectJson {
     rotation_deg: Vec3,
     scale: Vec3,
     hollow: bool,
+    #[serde(default)]
+    assembly: u64,
+    #[serde(default)]
+    kind: VolumeKind,
     wall_mm: f32,
     bottom_cap_mm: f32,
     top_cap_mm: f32,
@@ -76,6 +80,8 @@ pub fn write_plate(path: &Path, plate: &PlateData) -> Result<()> {
             rotation_deg: obj.rotation_deg,
             scale: obj.scale,
             hollow: obj.hollow,
+            assembly: obj.assembly,
+            kind: obj.kind,
             wall_mm: obj.wall_mm,
             bottom_cap_mm: obj.bottom_cap_mm,
             top_cap_mm: obj.top_cap_mm,
@@ -136,6 +142,8 @@ pub fn read_plate(path: &Path) -> Result<PlateData> {
             rotation_deg: saved.rotation_deg,
             scale: saved.scale,
             hollow: saved.hollow,
+            assembly: saved.assembly,
+            kind: saved.kind,
             wall_mm: saved.wall_mm,
             bottom_cap_mm: saved.bottom_cap_mm,
             top_cap_mm: saved.top_cap_mm,

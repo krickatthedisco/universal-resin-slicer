@@ -16,6 +16,9 @@ pub struct Solid {
     pub vertices: Vec<[f32; 3]>,
     pub indices: Vec<u32>,
     pub hollow: Option<Hollow>,
+    /// Cuts pixels out of the positive solid that was just rasterized.
+    /// Negatives are stored immediately after that solid.
+    pub negative: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -414,9 +417,15 @@ fn raster_range(
         }
         let z = (index as f32 + 0.5) * h;
         let mut image = Image::empty();
-        for (solid, sweep) in solids.iter().zip(sweeps.iter_mut()) {
-            let active = sweep.activate(z);
-            let mut part = raster_solid(solid, z, machine, settings.anti_alias, active);
+        let mut cursor = 0;
+        while cursor < solids.len() {
+            if solids[cursor].negative {
+                cursor += 1;
+                continue;
+            }
+            let hollow = solids[cursor].hollow;
+            let active = sweeps[cursor].activate(z).to_vec();
+            let mut part = raster_solid(&solids[cursor], z, machine, settings.anti_alias, &active);
             // Heal and fill before hollowing. The hollow is cut from the
             // repaired solid, so a model you hollowed stays empty while
             // speckled mesh gaps and accidental pockets become solid resin.
@@ -425,7 +434,14 @@ fn raster_range(
                 heal_speckles(&mut part, radius);
                 fill_enclosed(&mut part);
             }
-            if let Some(hollow) = solid.hollow {
+            cursor += 1;
+            while cursor < solids.len() && solids[cursor].negative {
+                let active = sweeps[cursor].activate(z).to_vec();
+                let cut = raster_solid(&solids[cursor], z, machine, settings.anti_alias, &active);
+                blit_sub(&mut part, &cut);
+                cursor += 1;
+            }
+            if let Some(hollow) = hollow {
                 let cap = z <= hollow.z_min + hollow.bottom_cap_mm
                     || z >= hollow.z_max - hollow.top_cap_mm;
                 apply_shell(&mut part, hollow, machine, cap, z);
@@ -1114,6 +1130,21 @@ fn paint_span(pixels: &mut [u8], width: i32, x0: i32, row: i32, s: f32, e: f32, 
     }
 }
 
+fn blit_sub(dst: &mut Image, src: &Image) {
+    if dst.width == 0 || src.width == 0 {
+        return;
+    }
+    for y in 0..dst.height {
+        for x in 0..dst.width {
+            let px = dst.x0 + x;
+            let py = dst.y0 + y;
+            if src.get(px, py) > 0 {
+                dst.pixels[(y * dst.width + x) as usize] = 0;
+            }
+        }
+    }
+}
+
 fn blit_max(dst: &mut Image, src: &Image) {
     if src.width == 0 {
         return;
@@ -1187,6 +1218,7 @@ fn shrink_solids(solids: &[Solid], settings: &PrintSettings) -> Option<Vec<Solid
                     vertices,
                     indices: solid.indices.clone(),
                     hollow,
+                    negative: solid.negative,
                 }
             })
             .collect(),
@@ -2416,6 +2448,7 @@ mod tests {
             vertices: mesh.vertices,
             indices: mesh.indices,
             hollow: None,
+            negative: false,
         };
         let sweep = Sweep::build(&solid);
         let mut sweep = sweep;
@@ -2440,6 +2473,7 @@ mod tests {
             vertices: mesh.vertices,
             indices: mesh.indices,
             hollow: None,
+            negative: false,
         };
         let mut settings = PrintSettings::default();
         settings.layer_mm = 0.5;
@@ -2477,6 +2511,7 @@ mod tests {
             vertices: mesh.vertices,
             indices: mesh.indices,
             hollow: None,
+            negative: false,
         };
         let mut settings = PrintSettings::default();
         settings.layer_mm = 0.5;
@@ -2532,6 +2567,7 @@ mod tests {
             vertices: mesh.vertices,
             indices: mesh.indices,
             hollow: None,
+            negative: false,
         };
         let mut settings = PrintSettings::default();
         settings.layer_mm = h;
@@ -2594,6 +2630,7 @@ mod tests {
             vertices,
             indices,
             hollow: None,
+            negative: false,
         };
         let mut settings = PrintSettings::default();
         settings.layer_mm = 0.05;
@@ -2624,6 +2661,7 @@ mod tests {
             vertices: mesh.vertices.clone(),
             indices: mesh.indices.clone(),
             hollow: None,
+            negative: false,
         };
         let hollowed = Solid {
             vertices: mesh.vertices,
@@ -2638,6 +2676,7 @@ mod tests {
                 z_min: 0.0,
                 z_max: 10.0,
             }),
+            negative: false,
         };
         let mut settings = PrintSettings::default();
         settings.layer_mm = 1.0;
@@ -2719,6 +2758,7 @@ mod tests {
                 z_min: 0.0,
                 z_max: 10.0,
             }),
+            negative: false,
         };
         let mut open = PrintSettings::default();
         open.layer_mm = 0.2;
@@ -2781,6 +2821,7 @@ mod tests {
             vertices: mesh.vertices,
             indices: mesh.indices,
             hollow: None,
+            negative: false,
         };
         let mut settings = PrintSettings::default();
         settings.layer_mm = 1.0;
@@ -2823,6 +2864,7 @@ mod tests {
             vertices,
             indices,
             hollow: None,
+            negative: false,
         };
         let mut settings = PrintSettings::default();
         settings.layer_mm = 0.2;
@@ -2915,6 +2957,7 @@ mod tests {
             vertices: mesh.vertices,
             indices: mesh.indices,
             hollow: None,
+            negative: false,
         };
         let mut plain = PrintSettings::default();
         plain.layer_mm = 0.5;

@@ -101,10 +101,25 @@ impl Mesh {
         }
     }
 
+    pub fn empty() -> Self {
+        Self {
+            vertices: Vec::new(),
+            indices: Vec::new(),
+        }
+    }
+
     pub fn append(&mut self, other: &Mesh) {
         let base = self.vertices.len() as u32;
         self.vertices.extend_from_slice(&other.vertices);
         self.indices.extend(other.indices.iter().map(|i| i + base));
+    }
+
+    pub fn translate(&mut self, delta: [f32; 3]) {
+        for v in &mut self.vertices {
+            v[0] += delta[0];
+            v[1] += delta[1];
+            v[2] += delta[2];
+        }
     }
 
     /// Cut on the horizontal plane `z` and close both pieces across the cut.
@@ -515,6 +530,20 @@ fn parse_stl_binary(bytes: &[u8], count: u32) -> Result<Mesh> {
     Ok(Mesh { vertices, indices })
 }
 
+/// Read a binary STL that is already in memory. Used for the bundled Benchy.
+pub fn mesh_from_stl_bytes(bytes: &[u8]) -> Result<Mesh> {
+    if bytes.len() >= 84 {
+        let count = u32::from_le_bytes(bytes[80..84].try_into().unwrap());
+        let expected = 84usize.saturating_add(count as usize * 50);
+        if count > 0 && expected == bytes.len() {
+            let mut mesh = parse_stl_binary(bytes, count)?;
+            mesh.weld(1e-4);
+            return Ok(mesh);
+        }
+    }
+    Err(anyhow!("that buffer is not a binary STL"))
+}
+
 fn load_stl_ascii(path: &Path) -> Result<Mesh> {
     let file = File::open(path)?;
     let reader = BufReader::new(file);
@@ -873,6 +902,336 @@ fn inset_along_normals(mesh: &Mesh, distance: f32) -> Option<Mesh> {
     })
 }
 
+/// Shells that do not share an edge. Touching at a single corner stays split.
+pub fn connected_shells(mesh: &Mesh) -> Vec<Mesh> {
+    let mut welded = mesh.clone();
+    welded.weld(1e-4);
+    let faces = welded.indices.len() / 3;
+    if faces == 0 {
+        return Vec::new();
+    }
+    let mut edges: HashMap<(u32, u32), Vec<usize>> = HashMap::new();
+    for (face, tri) in welded.indices.chunks_exact(3).enumerate() {
+        for k in 0..3 {
+            let a = tri[k];
+            let b = tri[(k + 1) % 3];
+            let key = if a < b { (a, b) } else { (b, a) };
+            edges.entry(key).or_default().push(face);
+        }
+    }
+    let mut next: Vec<Vec<usize>> = vec![Vec::new(); faces];
+    for group in edges.values() {
+        if group.len() < 2 {
+            continue;
+        }
+        let first = group[0];
+        for &other in group.iter().skip(1) {
+            next[first].push(other);
+            next[other].push(first);
+        }
+    }
+    let mut seen = vec![false; faces];
+    let mut shells = Vec::new();
+    for start in 0..faces {
+        if seen[start] {
+            continue;
+        }
+        let mut stack = vec![start];
+        seen[start] = true;
+        let mut member = Vec::new();
+        while let Some(face) = stack.pop() {
+            member.push(face);
+            for &other in &next[face] {
+                if !seen[other] {
+                    seen[other] = true;
+                    stack.push(other);
+                }
+            }
+        }
+        let mut indices = Vec::with_capacity(member.len() * 3);
+        for face in member {
+            let i = face * 3;
+            indices.extend_from_slice(&welded.indices[i..i + 3]);
+        }
+        let mut shell = Mesh {
+            vertices: welded.vertices.clone(),
+            indices,
+        };
+        compact_vertices(&mut shell);
+        shells.push(shell);
+    }
+    shells
+}
+
+fn compact_vertices(mesh: &mut Mesh) {
+    let mut used = vec![u32::MAX; mesh.vertices.len()];
+    let mut vertices = Vec::new();
+    for index in &mut mesh.indices {
+        let slot = *index as usize;
+        if slot >= used.len() {
+            continue;
+        }
+        if used[slot] == u32::MAX {
+            used[slot] = vertices.len() as u32;
+            vertices.push(mesh.vertices[slot]);
+        }
+        *index = used[slot];
+    }
+    mesh.vertices = vertices;
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BooleanOp {
+    Union,
+    Difference,
+    Intersection,
+}
+
+/// Bake two closed meshes into one. The pitch stays near a quarter of a
+/// millimetre and grows only when the pair would exceed the cell cap.
+pub fn mesh_boolean(a: &Mesh, b: &Mesh, op: BooleanOp) -> Option<Mesh> {
+    let (amin, amax) = a.bounds()?;
+    let (bmin, bmax) = b.bounds()?;
+    let min = [
+        amin[0].min(bmin[0]),
+        amin[1].min(bmin[1]),
+        amin[2].min(bmin[2]),
+    ];
+    let max = [
+        amax[0].max(bmax[0]),
+        amax[1].max(bmax[1]),
+        amax[2].max(bmax[2]),
+    ];
+    let span = [
+        (max[0] - min[0]).max(0.2),
+        (max[1] - min[1]).max(0.2),
+        (max[2] - min[2]).max(0.2),
+    ];
+    let longest = span[0].max(span[1]).max(span[2]);
+    let pitch = (longest / 128.0).max(0.25);
+    let cells = |axis: usize| ((span[axis] / pitch).ceil() as usize).clamp(1, 160);
+    let n = [cells(0), cells(1), cells(2)];
+    let inside_a = occupancy(a, min, pitch, n);
+    let inside_b = occupancy(b, min, pitch, n);
+    let mut keep = vec![false; inside_a.len()];
+    for i in 0..keep.len() {
+        keep[i] = match op {
+            BooleanOp::Union => inside_a[i] || inside_b[i],
+            BooleanOp::Difference => inside_a[i] && !inside_b[i],
+            BooleanOp::Intersection => inside_a[i] && inside_b[i],
+        };
+    }
+    if !keep.iter().any(|cell| *cell) {
+        return None;
+    }
+    let mut mesh = cells_to_mesh(&keep, min, pitch, n);
+    mesh.weld(pitch * 0.2);
+    if mesh.triangle_count() == 0 {
+        return None;
+    }
+    if mesh.signed_volume_mm3() < 0.0 {
+        mesh.flip_winding();
+    }
+    Some(mesh)
+}
+
+fn occupancy(mesh: &Mesh, origin: [f32; 3], pitch: f32, n: [usize; 3]) -> Vec<bool> {
+    let (nx, ny, nz) = (n[0], n[1], n[2]);
+    let mut inside = vec![false; nx * ny * nz];
+    for iz in 0..nz {
+        let z = origin[2] + (iz as f32 + 0.5) * pitch;
+        let mut segs = Vec::new();
+        for tri in mesh.indices.chunks_exact(3) {
+            let a = mesh.vertices[tri[0] as usize];
+            let b = mesh.vertices[tri[1] as usize];
+            let c = mesh.vertices[tri[2] as usize];
+            if let Some(seg) = clip_segment(a, b, c, z) {
+                segs.push(seg);
+            }
+        }
+        if segs.is_empty() {
+            continue;
+        }
+        for iy in 0..ny {
+            let y = origin[1] + (iy as f32 + 0.5) * pitch;
+            let mut xs = Vec::new();
+            for (a, b) in &segs {
+                if let Some(x) = cross_y(*a, *b, y) {
+                    xs.push(x);
+                }
+            }
+            if xs.len() < 2 {
+                continue;
+            }
+            xs.sort_by(|p, q| p.total_cmp(q));
+            let mut unique = Vec::with_capacity(xs.len());
+            for x in xs {
+                if unique
+                    .last()
+                    .is_none_or(|prev: &f32| (x - *prev).abs() > 1e-3)
+                {
+                    unique.push(x);
+                }
+            }
+            let mut i = 0;
+            while i + 1 < unique.len() {
+                let x0 = unique[i];
+                let x1 = unique[i + 1];
+                let start = ((x0 - origin[0]) / pitch - 0.5).ceil() as i32;
+                let end = ((x1 - origin[0]) / pitch - 0.5).floor() as i32;
+                let start = start.max(0) as usize;
+                if end >= 0 {
+                    let end = (end as usize).min(nx - 1);
+                    if start <= end {
+                        let row = (iz * ny + iy) * nx;
+                        for ix in start..=end {
+                            inside[row + ix] = true;
+                        }
+                    }
+                }
+                i += 2;
+            }
+        }
+    }
+    inside
+}
+
+fn clip_segment(v0: [f32; 3], v1: [f32; 3], v2: [f32; 3], z: f32) -> Option<([f32; 2], [f32; 2])> {
+    let vs = [v0, v1, v2];
+    let above = |v: [f32; 3]| v[2] >= z;
+    let mut pts = Vec::with_capacity(2);
+    for i in 0..3 {
+        let a = vs[i];
+        let b = vs[(i + 1) % 3];
+        if above(a) == above(b) {
+            continue;
+        }
+        let denom = b[2] - a[2];
+        if denom.abs() < 1e-12 {
+            continue;
+        }
+        let t = ((z - a[2]) / denom).clamp(0.0, 1.0);
+        pts.push([a[0] + t * (b[0] - a[0]), a[1] + t * (b[1] - a[1])]);
+    }
+    if pts.len() < 2 {
+        return None;
+    }
+    let p0 = pts[0];
+    let p1 = pts[pts.len() - 1];
+    if (p0[0] - p1[0]).abs() + (p0[1] - p1[1]).abs() < 1e-5 {
+        None
+    } else {
+        Some((p0, p1))
+    }
+}
+
+fn cross_y(a: [f32; 2], b: [f32; 2], y: f32) -> Option<f32> {
+    let (y0, y1) = (a[1], b[1]);
+    let crosses = (y0 <= y && y < y1) || (y1 <= y && y < y0);
+    if !crosses {
+        return None;
+    }
+    let dy = y1 - y0;
+    if dy.abs() < 1e-12 {
+        return None;
+    }
+    let t = (y - y0) / dy;
+    Some(a[0] + t * (b[0] - a[0]))
+}
+
+fn cells_to_mesh(inside: &[bool], origin: [f32; 3], pitch: f32, n: [usize; 3]) -> Mesh {
+    let (nx, ny, nz) = (n[0], n[1], n[2]);
+    let at = |x: usize, y: usize, z: usize| inside[(z * ny + y) * nx + x];
+    let solid = |x: i32, y: i32, z: i32| {
+        if x < 0 || y < 0 || z < 0 || x >= nx as i32 || y >= ny as i32 || z >= nz as i32 {
+            false
+        } else {
+            at(x as usize, y as usize, z as usize)
+        }
+    };
+    let mut mesh = Mesh::empty();
+    for z in 0..nz {
+        for y in 0..ny {
+            for x in 0..nx {
+                if !at(x, y, z) {
+                    continue;
+                }
+                let x0 = origin[0] + x as f32 * pitch;
+                let y0 = origin[1] + y as f32 * pitch;
+                let z0 = origin[2] + z as f32 * pitch;
+                let x1 = x0 + pitch;
+                let y1 = y0 + pitch;
+                let z1 = z0 + pitch;
+                let xi = x as i32;
+                let yi = y as i32;
+                let zi = z as i32;
+                if !solid(xi - 1, yi, zi) {
+                    add_quad(
+                        &mut mesh,
+                        [x0, y0, z0],
+                        [x0, y0, z1],
+                        [x0, y1, z1],
+                        [x0, y1, z0],
+                    );
+                }
+                if !solid(xi + 1, yi, zi) {
+                    add_quad(
+                        &mut mesh,
+                        [x1, y0, z0],
+                        [x1, y1, z0],
+                        [x1, y1, z1],
+                        [x1, y0, z1],
+                    );
+                }
+                if !solid(xi, yi - 1, zi) {
+                    add_quad(
+                        &mut mesh,
+                        [x0, y0, z0],
+                        [x1, y0, z0],
+                        [x1, y0, z1],
+                        [x0, y0, z1],
+                    );
+                }
+                if !solid(xi, yi + 1, zi) {
+                    add_quad(
+                        &mut mesh,
+                        [x0, y1, z0],
+                        [x0, y1, z1],
+                        [x1, y1, z1],
+                        [x1, y1, z0],
+                    );
+                }
+                if !solid(xi, yi, zi - 1) {
+                    add_quad(
+                        &mut mesh,
+                        [x0, y0, z0],
+                        [x0, y1, z0],
+                        [x1, y1, z0],
+                        [x1, y0, z0],
+                    );
+                }
+                if !solid(xi, yi, zi + 1) {
+                    add_quad(
+                        &mut mesh,
+                        [x0, y0, z1],
+                        [x1, y0, z1],
+                        [x1, y1, z1],
+                        [x0, y1, z1],
+                    );
+                }
+            }
+        }
+    }
+    mesh
+}
+
+fn add_quad(mesh: &mut Mesh, a: [f32; 3], b: [f32; 3], c: [f32; 3], d: [f32; 3]) {
+    let base = mesh.vertices.len() as u32;
+    mesh.vertices.extend_from_slice(&[a, b, c, d]);
+    mesh.indices
+        .extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -977,5 +1336,49 @@ mod tests {
         }
         let t = (e2[0] * q[0] + e2[1] * q[1] + e2[2] * q[2]) * inv;
         t > 1e-4
+    }
+
+    #[test]
+    fn two_separate_boxes_split_into_two_shells() {
+        let mut mesh = box_mesh([0.0, 0.0, 0.0], [10.0, 10.0, 10.0]);
+        mesh.append(&box_mesh([14.0, 0.0, 0.0], [20.0, 8.0, 6.0]));
+        let shells = connected_shells(&mesh);
+        assert_eq!(shells.len(), 2);
+        let mut volumes: Vec<f32> = shells.iter().map(|s| s.volume_mm3()).collect();
+        volumes.sort_by(|a, b| a.total_cmp(b));
+        assert!((volumes[0] - 8.0 * 6.0 * 6.0).abs() < 1.0, "{}", volumes[0]);
+        assert!((volumes[1] - 1000.0).abs() < 1.0, "{}", volumes[1]);
+    }
+
+    #[test]
+    fn a_single_box_is_one_shell() {
+        let mesh = box_mesh([0.0, 0.0, 0.0], [4.0, 5.0, 6.0]);
+        assert_eq!(connected_shells(&mesh).len(), 1);
+    }
+
+    #[test]
+    fn boolean_union_difference_and_intersection_keep_the_box_volumes() {
+        let a = box_mesh([0.0, 0.0, 0.0], [10.0, 10.0, 10.0]);
+        let b = box_mesh([5.0, 0.0, 0.0], [15.0, 10.0, 10.0]);
+        let union = mesh_boolean(&a, &b, BooleanOp::Union).unwrap();
+        let difference = mesh_boolean(&a, &b, BooleanOp::Difference).unwrap();
+        let cut = box_mesh([3.0, 3.0, 3.0], [7.0, 7.0, 7.0]);
+        let intersection = mesh_boolean(&a, &cut, BooleanOp::Intersection).unwrap();
+        let near = |mesh: &Mesh, expect: f32| {
+            let got = mesh.volume_mm3();
+            assert!(
+                (got - expect).abs() / expect < 0.08,
+                "volume {got} expected {expect}"
+            );
+        };
+        near(&union, 1500.0);
+        near(&difference, 500.0);
+        near(&intersection, 64.0);
+        assert!(mesh_boolean(
+            &a,
+            &box_mesh([20.0, 0.0, 0.0], [24.0, 4.0, 4.0]),
+            BooleanOp::Intersection
+        )
+        .is_none());
     }
 }

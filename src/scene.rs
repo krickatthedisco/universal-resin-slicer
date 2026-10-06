@@ -1,6 +1,6 @@
 //! The plate: models, supports, drain holes, and the edits the prepare view applies.
 
-use crate::mesh::{face_normal, load_mesh, Mesh};
+use crate::mesh::{face_normal, load_mesh, mesh_boolean, BooleanOp, Mesh};
 use crate::slice::{Drain, Hollow, Solid};
 use crate::supports::{self, Support, SupportStyle};
 use anyhow::Result;
@@ -26,6 +26,20 @@ pub struct ModelSupport {
     pub brace_angle: f32,
 }
 
+/// A part adds resin. A negative volume cuts it back out of the other parts
+/// in the same assembly, at the printer's own pixel size.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum VolumeKind {
+    Part,
+    Negative,
+}
+
+impl Default for VolumeKind {
+    fn default() -> Self {
+        Self::Part
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Object {
     pub id: u64,
@@ -34,6 +48,10 @@ pub struct Object {
     pub position: Vec3,
     pub rotation_deg: Vec3,
     pub scale: Vec3,
+    /// Other parts that share this id print as one model. Zero means this
+    /// object is its own assembly.
+    pub assembly: u64,
+    pub kind: VolumeKind,
     pub hollow: bool,
     pub wall_mm: f32,
     pub bottom_cap_mm: f32,
@@ -45,6 +63,17 @@ pub struct Object {
     /// Local-space bounding box, cached so a move does not scan the sculpt.
     pub bounds_min: [f32; 3],
     pub bounds_max: [f32; 3],
+}
+
+impl Object {
+    /// The assembly this part belongs to. A zero assembly is its own id.
+    pub fn assembly_id(&self) -> u64 {
+        if self.assembly == 0 {
+            self.id
+        } else {
+            self.assembly
+        }
+    }
 }
 
 fn default_hole_extend() -> f32 {
@@ -116,6 +145,14 @@ enum Undo {
     RestoreCut {
         lower: Object,
         upper: Object,
+    },
+    /// A split, an assemble, a boolean, or a RERF layout. The whole plate
+    /// goes back, because those edits add and remove several models at once.
+    Plate {
+        objects: Vec<Object>,
+        supports: Vec<Support>,
+        drains: Vec<DrainHole>,
+        selection: Selection,
     },
 }
 
@@ -291,6 +328,8 @@ impl Document {
             position: Vec3::ZERO,
             rotation_deg: Vec3::ZERO,
             scale: Vec3::ONE,
+            assembly: 0,
+            kind: VolumeKind::Part,
             hollow: false,
             wall_mm: 2.0,
             bottom_cap_mm: 1.5,
@@ -564,6 +603,7 @@ impl Document {
                     added: upper.id,
                 })
             }
+            Undo::Plate { .. } => Some(self.plate_snapshot()),
         }
     }
 
@@ -633,7 +673,42 @@ impl Document {
                 }
                 self.selection = Selection::Object(upper_id);
             }
+            Undo::Plate {
+                objects,
+                supports,
+                drains,
+                selection,
+            } => {
+                self.objects = objects;
+                self.supports = supports;
+                self.drains = drains;
+                self.selection = selection;
+                self.lift_next_id();
+            }
         }
+    }
+
+    fn plate_snapshot(&self) -> Undo {
+        Undo::Plate {
+            objects: self.objects.clone(),
+            supports: self.supports.clone(),
+            drains: self.drains.clone(),
+            selection: self.selection,
+        }
+    }
+
+    fn lift_next_id(&mut self) {
+        let mut next = self.next_id;
+        for obj in &self.objects {
+            next = next.max(obj.id.saturating_add(1));
+        }
+        for support in &self.supports {
+            next = next.max(support.id.saturating_add(1));
+        }
+        for drain in &self.drains {
+            next = next.max(drain.id.saturating_add(1));
+        }
+        self.next_id = next;
     }
 
     pub fn drop_object(&mut self, id: u64) {
@@ -753,6 +828,7 @@ impl Document {
         let new_id = self.alloc();
         let mut copy = obj;
         copy.id = new_id;
+        copy.assembly = 0;
         copy.name = format!("{} copy", copy.name);
         let delta = Vec3::new(12.0, 0.0, 0.0);
         copy.position += delta;
@@ -811,6 +887,7 @@ impl Document {
             let new_id = self.alloc();
             let mut copy = origin.clone();
             copy.id = new_id;
+            copy.assembly = 0;
             copy.name = format!("{} {}", origin.name, n + 2);
             let delta = Vec3::new(x - min.x, y - min.y, 0.0);
             copy.position += delta;
@@ -862,6 +939,7 @@ impl Document {
         upper.rotation_deg = Vec3::ZERO;
         upper.scale = Vec3::ONE;
         upper.mesh_rev = 1;
+        upper.assembly = 0;
         upper.name = format!("{} upper", obj.name);
         cache_bounds(&mut upper);
         self.objects.push(upper);
@@ -903,13 +981,16 @@ impl Document {
         let mut boxes = Vec::new();
         for obj in &self.objects {
             if let Some((min, max)) = Self::display_bounds(obj) {
-                boxes.push((obj.name.as_str(), min, max));
+                boxes.push((obj.name.as_str(), obj.assembly_id(), min, max));
             }
         }
         for i in 0..boxes.len() {
             for j in (i + 1)..boxes.len() {
-                let (an, a0, a1) = boxes[i];
-                let (bn, b0, b1) = boxes[j];
+                let (an, ag, a0, a1) = boxes[i];
+                let (bn, bg, b0, b1) = boxes[j];
+                if ag == bg {
+                    continue;
+                }
                 let hit = a0.x < b1.x - 0.2
                     && a1.x > b0.x + 0.2
                     && a0.y < b1.y - 0.2
@@ -1553,28 +1634,60 @@ impl Document {
 
     pub fn solids(&self) -> Vec<Solid> {
         let mut solids = Vec::new();
+        let mut seen = HashSet::new();
         for obj in &self.objects {
-            let world = Self::world_mesh(obj);
-            let (min, max) = world.bounds().unwrap_or(([0.0; 3], [0.0; 3]));
-            let hollow = if obj.hollow {
-                Some(Hollow {
-                    wall_mm: obj.wall_mm,
-                    bottom_cap_mm: obj.bottom_cap_mm,
-                    top_cap_mm: obj.top_cap_mm,
-                    infill_spacing_mm: 0.0,
-                    infill_thickness_mm: 0.0,
-                    gyroid: false,
-                    z_min: min[2],
-                    z_max: max[2],
-                })
-            } else {
-                None
-            };
-            solids.push(Solid {
-                vertices: world.vertices,
-                indices: world.indices,
-                hollow,
+            let group = obj.assembly_id();
+            if !seen.insert(group) {
+                continue;
+            }
+            let members: Vec<&Object> = self
+                .objects
+                .iter()
+                .filter(|member| member.assembly_id() == group)
+                .collect();
+            let mut positive = Mesh::empty();
+            let mut hollow_from = None;
+            for member in &members {
+                if member.kind == VolumeKind::Negative {
+                    continue;
+                }
+                if hollow_from.is_none() && member.hollow {
+                    hollow_from = Some((member.wall_mm, member.bottom_cap_mm, member.top_cap_mm));
+                }
+                positive.append(&Self::world_mesh(member));
+            }
+            if positive.triangle_count() == 0 {
+                continue;
+            }
+            let (min, max) = positive.bounds().unwrap_or(([0.0; 3], [0.0; 3]));
+            let hollow = hollow_from.map(|(wall, bottom, top)| Hollow {
+                wall_mm: wall,
+                bottom_cap_mm: bottom,
+                top_cap_mm: top,
+                infill_spacing_mm: 0.0,
+                infill_thickness_mm: 0.0,
+                gyroid: false,
+                z_min: min[2],
+                z_max: max[2],
             });
+            solids.push(Solid {
+                vertices: positive.vertices,
+                indices: positive.indices,
+                hollow,
+                negative: false,
+            });
+            for member in &members {
+                if member.kind != VolumeKind::Negative {
+                    continue;
+                }
+                let world = Self::world_mesh(member);
+                solids.push(Solid {
+                    vertices: world.vertices,
+                    indices: world.indices,
+                    hollow: None,
+                    negative: true,
+                });
+            }
         }
         let (rafts, forest) = self.baked_supports();
         for raft in rafts {
@@ -1582,6 +1695,7 @@ impl Document {
                 vertices: raft.vertices,
                 indices: raft.indices,
                 hollow: None,
+                negative: false,
             });
         }
         if forest.triangle_count() > 0 {
@@ -1589,9 +1703,206 @@ impl Document {
                 vertices: forest.vertices,
                 indices: forest.indices,
                 hollow: None,
+                negative: false,
             });
         }
         solids
+    }
+
+    /// Separate shells become their own models. `as_parts` keeps them in one assembly.
+    pub fn split_shells(&mut self, id: u64, as_parts: bool) -> Result<usize, &'static str> {
+        let obj = self.object(id).cloned().ok_or("Select a model first.")?;
+        let shells = crate::mesh::connected_shells(&Self::world_mesh(&obj));
+        if shells.len() < 2 {
+            return Err("This model is one shell. Split needs pieces that do not share an edge.");
+        }
+        let count = shells.len();
+        self.push_undo(self.plate_snapshot());
+        let assembly = if as_parts { obj.assembly_id() } else { 0 };
+        for (i, shell) in shells.into_iter().enumerate() {
+            if i == 0 {
+                if let Some(piece) = self.object_mut(id) {
+                    piece.mesh = shell;
+                    piece.position = Vec3::ZERO;
+                    piece.rotation_deg = Vec3::ZERO;
+                    piece.scale = Vec3::ONE;
+                    piece.assembly = assembly;
+                    piece.mesh_rev = piece.mesh_rev.wrapping_add(1);
+                    if as_parts {
+                        piece.name = format!("{} part", obj.name);
+                    }
+                    cache_bounds(piece);
+                }
+            } else {
+                let new_id = self.alloc();
+                let mut piece = obj.clone();
+                piece.id = new_id;
+                piece.mesh = shell;
+                piece.position = Vec3::ZERO;
+                piece.rotation_deg = Vec3::ZERO;
+                piece.scale = Vec3::ONE;
+                piece.assembly = assembly;
+                piece.mesh_rev = 1;
+                piece.name = if as_parts {
+                    format!("{} part {}", obj.name, i + 1)
+                } else {
+                    format!("{} {}", obj.name, i + 1)
+                };
+                cache_bounds(&mut piece);
+                self.objects.push(piece);
+            }
+        }
+        self.selection = Selection::Object(id);
+        self.touch();
+        Ok(count)
+    }
+
+    /// Selected models, and any parts already joined to them, become one assembly.
+    pub fn assemble(&mut self, ids: &[u64]) -> Result<(), &'static str> {
+        let ids: Vec<u64> = ids
+            .iter()
+            .copied()
+            .filter(|id| self.object(*id).is_some())
+            .collect();
+        if ids.len() < 2 {
+            return Err("Shift-click at least two models, then assemble them.");
+        }
+        let mut groups = HashSet::new();
+        for id in &ids {
+            if let Some(obj) = self.object(*id) {
+                groups.insert(obj.assembly_id());
+            }
+        }
+        let root = ids[0];
+        self.push_undo(self.plate_snapshot());
+        for obj in &mut self.objects {
+            if groups.contains(&obj.assembly_id()) || ids.contains(&obj.id) {
+                obj.assembly = root;
+            }
+        }
+        self.selection = Selection::Object(root);
+        self.touch();
+        Ok(())
+    }
+
+    pub fn set_volume_kind(&mut self, id: u64, kind: VolumeKind) {
+        if self.object(id).is_none() {
+            return;
+        }
+        self.push_undo(self.plate_snapshot());
+        if let Some(obj) = self.object_mut(id) {
+            obj.kind = kind;
+        }
+        self.touch_xform();
+    }
+
+    /// Bake `tool` into `keep` and remove the tool model.
+    pub fn boolean_objects(
+        &mut self,
+        keep: u64,
+        tool: u64,
+        op: BooleanOp,
+    ) -> Result<(), &'static str> {
+        if keep == tool {
+            return Err("Pick two different models. Shift-click the second one.");
+        }
+        let mesh_a = Self::world_mesh(self.object(keep).ok_or("Select a model first.")?);
+        let mesh_b = Self::world_mesh(self.object(tool).ok_or("Shift-click the other model.")?);
+        let result = mesh_boolean(&mesh_a, &mesh_b, op).ok_or(
+            "That boolean is empty. The two models need to overlap for a subtraction or an intersection.",
+        )?;
+        self.push_undo(self.plate_snapshot());
+        self.objects.retain(|obj| obj.id != tool);
+        self.supports.retain(|support| support.object_id != tool);
+        if let Some(obj) = self.object_mut(keep) {
+            obj.mesh = result;
+            obj.position = Vec3::ZERO;
+            obj.rotation_deg = Vec3::ZERO;
+            obj.scale = Vec3::ONE;
+            obj.kind = VolumeKind::Part;
+            obj.mesh_rev = obj.mesh_rev.wrapping_add(1);
+            cache_bounds(obj);
+        }
+        self.selection = Selection::Object(keep);
+        self.touch();
+        Ok(())
+    }
+
+    /// Copy the model into each column of this printer's RERF grid.
+    /// A digit is baked into the front of each copy so the zones stay labelled.
+    pub fn spread_on_rerf(
+        &mut self,
+        id: u64,
+        plate_x: f32,
+        plate_y: f32,
+        plate_z: f32,
+    ) -> Result<RerfSpread, &'static str> {
+        let obj = self.object(id).cloned().ok_or("Select a model first.")?;
+        let source = Self::world_mesh(&obj);
+        let (min, max) = source.bounds().ok_or("That model has no triangles.")?;
+        let slots = rerf_slots(plate_x, plate_y);
+        if slots.len() < 2 {
+            return Err("This plate is too small to lay out a RERF grid.");
+        }
+        let width = (max[0] - min[0]).max(0.2);
+        let depth = (max[1] - min[1]).max(0.2);
+        let height = (max[2] - min[2]).max(0.2);
+        let slot = &slots[0];
+        let fit = (slot.width / width)
+            .min(slot.depth / depth)
+            .min((plate_z - 0.4).max(0.2) / height)
+            .min(1.0)
+            .max(0.02);
+        self.push_undo(self.plate_snapshot());
+        self.supports.retain(|support| support.object_id != id);
+        let base = obj.name.clone();
+        let count = slots.len();
+        for (i, slot) in slots.iter().enumerate() {
+            let mut placed = source.clone();
+            let center = [(min[0] + max[0]) * 0.5, (min[1] + max[1]) * 0.5, min[2]];
+            for v in &mut placed.vertices {
+                v[0] = slot.center_x + (v[0] - center[0]) * fit;
+                v[1] = slot.center_y + (v[1] - center[1]) * fit;
+                v[2] = (v[2] - center[2]) * fit;
+            }
+            let mut digit = crate::shapes::digit_mesh(slot.index as u8);
+            let (dmin, dmax) = digit.bounds().unwrap_or(([0.0; 3], [1.0; 3]));
+            let dw = dmax[0] - dmin[0];
+            digit.translate([slot.center_x - dw * 0.5 - dmin[0], 1.2 - dmin[1], -dmin[2]]);
+            placed.append(&digit);
+            let name = format!("{base} {}", slot.index);
+            if i == 0 {
+                if let Some(piece) = self.object_mut(id) {
+                    piece.mesh = placed;
+                    piece.position = Vec3::ZERO;
+                    piece.rotation_deg = Vec3::ZERO;
+                    piece.scale = Vec3::ONE;
+                    piece.assembly = 0;
+                    piece.name = name;
+                    piece.mesh_rev = piece.mesh_rev.wrapping_add(1);
+                    cache_bounds(piece);
+                }
+            } else {
+                let new_id = self.alloc();
+                let mut piece = obj.clone();
+                piece.id = new_id;
+                piece.mesh = placed;
+                piece.position = Vec3::ZERO;
+                piece.rotation_deg = Vec3::ZERO;
+                piece.scale = Vec3::ONE;
+                piece.assembly = 0;
+                piece.mesh_rev = 1;
+                piece.name = name;
+                cache_bounds(&mut piece);
+                self.objects.push(piece);
+            }
+        }
+        self.selection = Selection::Object(id);
+        self.touch();
+        Ok(RerfSpread {
+            count: count as u32,
+            scale: fit,
+        })
     }
 
     /// Rafts and the support forest, each model with its own settings.
@@ -1714,6 +2025,47 @@ impl Default for Document {
     fn default() -> Self {
         Self::new()
     }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct RerfSpread {
+    pub count: u32,
+    pub scale: f32,
+}
+
+struct RerfSlot {
+    index: u8,
+    center_x: f32,
+    center_y: f32,
+    width: f32,
+    depth: f32,
+}
+
+/// Eight columns across the plate, fewer when a column would be under 12 mm.
+fn rerf_slots(plate_x: f32, plate_y: f32) -> Vec<RerfSlot> {
+    if plate_x < 24.0 || plate_y < 16.0 {
+        return Vec::new();
+    }
+    let mut columns = 8u32;
+    while columns > 2 && plate_x / (columns as f32) < 12.0 {
+        columns -= 1;
+    }
+    let cell = plate_x / columns as f32;
+    let digit_band = 9.0_f32.min(plate_y * 0.34);
+    let y0 = digit_band;
+    let y1 = plate_y - 1.0;
+    if y1 - y0 < 6.0 {
+        return Vec::new();
+    }
+    (0..columns)
+        .map(|i| RerfSlot {
+            index: (i + 1) as u8,
+            center_x: (i as f32 + 0.5) * cell,
+            center_y: (y0 + y1) * 0.5,
+            width: (cell - 1.6).max(1.0),
+            depth: (y1 - y0 - 1.0).max(1.0),
+        })
+        .collect()
 }
 
 fn cache_bounds(obj: &mut Object) {
@@ -2110,5 +2462,95 @@ mod tests {
         assert!(doc.redo());
         assert_eq!(doc.objects.len(), 2);
         assert_eq!(doc.drains.len(), 1);
+    }
+
+    #[test]
+    fn split_parts_share_an_assembly_and_objects_do_not() {
+        let mut doc = Document::new();
+        let mut mesh = box_mesh([0.0, 0.0, 0.0], [8.0, 8.0, 8.0]);
+        mesh.append(&box_mesh([12.0, 0.0, 0.0], [18.0, 6.0, 4.0]));
+        let id = doc.add_mesh("pair".into(), mesh);
+        assert_eq!(doc.split_shells(id, true).unwrap(), 2);
+        assert_eq!(doc.objects.len(), 2);
+        assert_eq!(doc.objects[0].assembly_id(), doc.objects[1].assembly_id());
+        assert!(doc.undo());
+        assert_eq!(doc.objects.len(), 1);
+        assert!(doc.redo());
+        assert_eq!(doc.objects.len(), 2);
+        let mut doc = Document::new();
+        let mut mesh = box_mesh([0.0, 0.0, 0.0], [8.0, 8.0, 8.0]);
+        mesh.append(&box_mesh([12.0, 0.0, 0.0], [18.0, 6.0, 4.0]));
+        let id = doc.add_mesh("pair".into(), mesh);
+        doc.split_shells(id, false).unwrap();
+        assert_ne!(doc.objects[0].assembly_id(), doc.objects[1].assembly_id());
+    }
+
+    #[test]
+    fn a_negative_cuts_only_its_own_assembly() {
+        use crate::printer::{Machine, PrintSettings};
+        use crate::slice::{slice, Request};
+        let mut doc = Document::new();
+        let block = doc.add_mesh(
+            "block".into(),
+            box_mesh([10.0, 20.0, 0.0], [30.0, 40.0, 10.0]),
+        );
+        let cutter = doc.add_mesh(
+            "cut".into(),
+            box_mesh([16.0, 26.0, 0.0], [24.0, 34.0, 10.0]),
+        );
+        doc.assemble(&[block, cutter]).unwrap();
+        doc.set_volume_kind(cutter, VolumeKind::Negative);
+        let solids = doc.solids();
+        assert!(solids.iter().any(|solid| solid.negative));
+        let mut settings = PrintSettings::default();
+        settings.layer_mm = 0.5;
+        settings.anti_alias = 1;
+        let mut machine = Machine::photon_m3_max();
+        machine.rotate_180 = false;
+        machine.mirror_x = false;
+        machine.mirror_y = false;
+        let sliced = slice(Request {
+            solids: &solids,
+            drains: &[],
+            machine,
+            settings: &settings,
+            cancel: None,
+            progress: None,
+        })
+        .unwrap();
+        let full = (20.0_f32 / machine.pixel_mm()) * (20.0 / machine.pixel_mm_y());
+        let hole = (8.0_f32 / machine.pixel_mm()) * (8.0 / machine.pixel_mm_y());
+        let got = sliced.layers[4].nonzero as f32;
+        let expect = full - hole;
+        assert!(
+            (got - expect).abs() / expect < 0.08,
+            "nonzero {got} expected about {expect}"
+        );
+    }
+
+    #[test]
+    fn rerf_puts_one_copy_in_each_column() {
+        let mut doc = Document::new();
+        let id = doc.add_mesh("pin".into(), box_mesh([0.0, 0.0, 0.0], [8.0, 8.0, 4.0]));
+        let spread = doc.spread_on_rerf(id, 160.0, 80.0, 100.0).unwrap();
+        assert_eq!(spread.count, 8);
+        assert_eq!(doc.objects.len(), 8);
+        assert!((spread.scale - 1.0).abs() < 1e-3);
+        let mut xs: Vec<f32> = doc
+            .objects
+            .iter()
+            .map(|obj| {
+                let (min, max) = Document::world_bounds(obj).unwrap();
+                (min.x + max.x) * 0.5
+            })
+            .collect();
+        xs.sort_by(|a, b| a.total_cmp(b));
+        let step = xs[1] - xs[0];
+        assert!((step - 20.0).abs() < 1.5, "step {step}");
+        for window in xs.windows(2) {
+            assert!(window[1] - window[0] > 10.0);
+        }
+        assert!(doc.undo());
+        assert_eq!(doc.objects.len(), 1);
     }
 }
