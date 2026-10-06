@@ -10,7 +10,7 @@ use crate::resins::{self, Resin, ResinProfile};
 use crate::scene::{Document, Selection};
 use crate::slice::{self, Slice};
 use crate::supports::{SectionShape, PRESETS};
-use crate::viewport::{self, Camera, LayerSheet, PlateFrame, PlateView, Renderer, ViewCache};
+use crate::viewport::{self, Camera, PlateFrame, PlateView, Renderer, ViewCache};
 use eframe::egui;
 use glam::Vec3;
 use glow::HasContext;
@@ -143,6 +143,8 @@ struct Persist {
     section: bool,
     #[serde(default = "default_section_z")]
     section_z: f32,
+    #[serde(default)]
+    section_lo: f32,
 }
 
 pub struct AmberApp {
@@ -204,12 +206,12 @@ pub struct AmberApp {
     plate_view: PlateView,
     /// 0 follows the printer. 1 photon, 2 ctb, 3 sl1, 4 png zip.
     export_as: u8,
-    /// Draw the current sliced layer on the prepare plate.
-    show_plate_layer: bool,
-    /// Hide the model above the layer while that sheet is on.
-    cut_at_layer: bool,
-    sheet_for: Option<(usize, &'static str)>,
-    sheet: Option<LayerSheet>,
+    /// The user has moved a cut handle, so loading a model does not reset it.
+    cuts_custom: bool,
+    /// Which cut handle is being dragged. 0 is the bottom, 1 is the top.
+    cut_drag: Option<u8>,
+    /// `doc.changed` the last time the cuts were fitted to the models.
+    cuts_fit_gen: u64,
     /// Models left out of the plate view. They still slice.
     hidden_models: HashSet<u64>,
     view_rev: u64,
@@ -271,6 +273,7 @@ impl AmberApp {
                     plate_view.rafts = saved.show_rafts;
                     plate_view.section = saved.section;
                     plate_view.section_z = saved.section_z;
+                    plate_view.section_lo = saved.section_lo;
                 }
             }
         }
@@ -356,10 +359,9 @@ impl AmberApp {
             tip_field_for: None,
             plate_view,
             export_as: 0,
-            show_plate_layer: true,
-            cut_at_layer: true,
-            sheet_for: None,
-            sheet: None,
+            cuts_custom: false,
+            cut_drag: None,
+            cuts_fit_gen: 0,
             hidden_models: HashSet::new(),
             view_rev: 0,
             view_drawn: 0,
@@ -379,7 +381,6 @@ impl AmberApp {
         self.slice = None;
         self.preview_tex = None;
         self.preview_for = None;
-        self.sheet_for = None;
     }
 
     fn poll_job(&mut self, ctx: &egui::Context) {
@@ -440,7 +441,6 @@ impl AmberApp {
                 self.slice_gen = generation;
                 self.preview_index = layers.saturating_sub(1);
                 self.preview_for = None;
-                self.sheet_for = None;
                 self.view = View::Preview;
                 if export_after {
                     self.export_print(None);
@@ -726,7 +726,6 @@ impl AmberApp {
             let mirror_y = data.mirror_y;
             self.machine = Machine::from_profile(profile);
             self.export_as = 0;
-            self.sheet_for = None;
             self.machine.rotate_180 = rotate;
             self.machine.mirror_x = mirror_x;
             self.machine.mirror_y = mirror_y;
@@ -942,6 +941,7 @@ impl eframe::App for AmberApp {
             show_rafts: self.plate_view.rafts,
             section: self.plate_view.section,
             section_z: self.plate_view.section_z,
+            section_lo: self.plate_view.section_lo,
         };
         if let Ok(raw) = serde_json::to_string(&saved) {
             storage.set_string("amber.print", raw);
@@ -967,6 +967,12 @@ impl eframe::App for AmberApp {
         self.sync_islands();
         for file in ctx.input(|i| i.raw.dropped_files.clone()) {
             self.import_path(file.path().to_path_buf());
+        }
+        if !self.cuts_custom && self.cuts_fit_gen != self.doc.changed {
+            if self.model_z_span().is_some() {
+                self.fit_cuts_to_models();
+            }
+            self.cuts_fit_gen = self.doc.changed;
         }
         if self.draw_gen != self.doc.changed
             || self.frame.is_none()
@@ -1663,23 +1669,98 @@ impl AmberApp {
         let mut on = self.plate_view.section;
         if ui.checkbox(&mut on, "Cut the view").changed() {
             self.plate_view.section = on;
+            self.cuts_custom = true;
             self.touch_view();
         }
+        let (min_z, max_z) = self.cut_limits();
         let mut z = self.plate_view.section_z;
-        if drag_f32(
-            ui,
-            "Cut height",
-            &mut z,
-            0.1,
-            0.0,
-            self.machine.size_z.max(1.0),
-            "mm",
-        ) {
-            self.plate_view.section_z = z;
+        if drag_f32(ui, "Top cut", &mut z, 0.1, min_z, max_z, "mm") {
+            self.plate_view.section_z = z.max(self.plate_view.section_lo + 0.15);
             self.plate_view.section = true;
+            self.cuts_custom = true;
             self.touch_view();
         }
-        ui.label("Hides the model above this height so you can click the surface that is left. Supports stay drawn. A hidden model still prints.");
+        let mut lo = self.plate_view.section_lo;
+        if drag_f32(ui, "Bottom cut", &mut lo, 0.1, min_z, max_z, "mm") {
+            self.plate_view.section_lo = lo.min(self.plate_view.section_z - 0.15);
+            self.plate_view.section = true;
+            self.cuts_custom = true;
+            self.touch_view();
+        }
+        ui.label("Hides the model outside the two cuts and fills each cut with a solid face. Supports stay drawn. A hidden model still prints.");
+    }
+
+    fn model_z_span(&self) -> Option<(f32, f32)> {
+        let mut lo = f32::MAX;
+        let mut hi = f32::MIN;
+        let mut any = false;
+        for obj in &self.doc.objects {
+            if self.hidden_models.contains(&obj.id) {
+                continue;
+            }
+            if let Some((min, max)) = Document::display_bounds(obj) {
+                lo = lo.min(min.z);
+                hi = hi.max(max.z);
+                any = true;
+            }
+        }
+        if any && hi > lo + 0.05 {
+            Some((lo, hi))
+        } else {
+            None
+        }
+    }
+
+    fn cut_limits(&self) -> (f32, f32) {
+        if let Some((lo, hi)) = self.model_z_span() {
+            (lo, hi.max(lo + 0.5))
+        } else {
+            (0.0, self.machine.size_z.max(1.0))
+        }
+    }
+
+    /// Park the handles on the top and bottom of the part until the user drags.
+    fn fit_cuts_to_models(&mut self) {
+        let Some((lo, hi)) = self.model_z_span() else {
+            return;
+        };
+        self.plate_view.section_lo = lo;
+        self.plate_view.section_z = hi;
+        self.plate_view.section = true;
+        self.touch_view();
+    }
+
+    fn nudge_top_cut(&mut self, dy: f32) {
+        let (_, max_z) = self.cut_limits();
+        let (min_z, _) = self.cut_limits();
+        let gap = 0.15;
+        self.plate_view.section_z = (self.plate_view.section_z + dy)
+            .clamp(self.plate_view.section_lo + gap, max_z.max(min_z));
+        self.plate_view.section = true;
+        self.cuts_custom = true;
+        self.touch_view();
+        self.sync_preview_to_cut();
+    }
+
+    fn sync_preview_to_cut(&mut self) {
+        let Some(slice) = &self.slice else {
+            return;
+        };
+        if slice.layers.is_empty() {
+            return;
+        }
+        let z = self.plate_view.section_z;
+        let mut best = 0usize;
+        let mut best_d = f32::MAX;
+        for (i, layer) in slice.layers.iter().enumerate() {
+            let d = (layer.z_top_mm - z).abs();
+            if d < best_d {
+                best_d = d;
+                best = i;
+            }
+        }
+        self.preview_index = best;
+        self.preview_for = None;
     }
 
     fn support_visibility(&mut self, ui: &mut egui::Ui) {
@@ -2712,7 +2793,6 @@ impl AmberApp {
         };
         self.machine = Machine::from_profile(profile);
         self.export_as = 0;
-        self.sheet_for = None;
         self.settings.light_off_s = profile.light_off_s;
         self.settings.lift_mm = profile.lift_mm.max(1.0);
         self.settings.lift_speed = profile.lift_speed;
@@ -3074,7 +3154,6 @@ impl AmberApp {
     }
 
     fn viewport(&mut self, ui: &mut egui::Ui) {
-        let count = self.slice.as_ref().map(|s| s.layers.len()).unwrap_or(0);
         let avail = ui.available_size();
         let bar = 96.0;
         ui.horizontal(|ui| {
@@ -3086,110 +3165,119 @@ impl AmberApp {
             ui.allocate_ui_with_layout(
                 egui::vec2(bar, avail.y),
                 egui::Layout::top_down(egui::Align::Center),
-                |ui| {
-                    if count == 0 {
-                        self.height_bar(ui);
-                    } else {
-                        ui.checkbox(&mut self.show_plate_layer, "On plate")
-                            .on_hover_text(
-                                "Draw this sliced layer on the bed, in the same pixels the file will cure.",
-                            );
-                        ui.checkbox(&mut self.cut_at_layer, "Cut model")
-                            .on_hover_text(
-                                "Hide the model above this layer so you can see the pixels on the cut.",
-                            );
-                        self.layer_bar(ui, count);
-                    }
-                },
+                |ui| self.cut_bar(ui),
             );
         });
     }
 
-    /// Height cut before a slice exists. The same bar shows layers afterwards.
-    fn height_bar(&mut self, ui: &mut egui::Ui) {
-        ui.label("Height");
+    /// Two cut handles. The top one starts at the top of the part.
+    fn cut_bar(&mut self, ui: &mut egui::Ui) {
         let step = self.settings.layer_mm.max(0.01);
-        let max_z = self.machine.size_z.max(step);
+        ui.label("Top");
         if ui
-            .add(egui::Button::new("▲").min_size(egui::vec2(64.0, 28.0)))
-            .on_hover_text("Up one layer height")
+            .add(egui::Button::new("▲").min_size(egui::vec2(64.0, 26.0)))
+            .on_hover_text("Raise the top cut by one layer")
             .clicked()
         {
-            self.plate_view.section_z = (self.plate_view.section_z + step).min(max_z);
-            self.plate_view.section = true;
-            self.touch_view();
+            self.nudge_top_cut(step);
         }
-        let footer = 110.0;
-        let slider_h = (ui.available_height() - footer).max(64.0);
-        ui.spacing_mut().slider_width = slider_h;
-        let mut z = self.plate_view.section_z.clamp(0.0, max_z);
+        let footer = 118.0;
+        let slider_h = (ui.available_height() - footer).max(72.0);
+        let (min_z, max_z) = self.cut_limits();
+        self.dual_cut_slider(ui, min_z, max_z, slider_h);
         if ui
-            .add(
-                egui::Slider::new(&mut z, 0.0..=max_z)
-                    .vertical()
-                    .show_value(false),
-            )
-            .changed()
-        {
-            self.plate_view.section_z = z;
-            self.plate_view.section = true;
-            self.touch_view();
-        }
-        if ui
-            .add(egui::Button::new("▼").min_size(egui::vec2(64.0, 28.0)))
-            .on_hover_text("Down one layer height")
+            .add(egui::Button::new("▼").min_size(egui::vec2(64.0, 26.0)))
+            .on_hover_text("Lower the top cut by one layer")
             .clicked()
         {
-            self.plate_view.section_z = (self.plate_view.section_z - step).max(0.0);
-            self.plate_view.section = true;
-            self.touch_view();
+            self.nudge_top_cut(-step);
         }
-        ui.add_space(4.0);
+        ui.label(format!("{:.2} mm", self.plate_view.section_z));
+        ui.label(format!("bottom {:.2}", self.plate_view.section_lo));
         let mut cut = self.plate_view.section;
         if ui
             .checkbox(&mut cut, "Cut")
-            .on_hover_text("Hide the model above this height so a hole can be placed on the cut.")
+            .on_hover_text("Hide the model outside the two handles and fill each cut solid.")
             .changed()
         {
             self.plate_view.section = cut;
+            self.cuts_custom = true;
             self.touch_view();
         }
-        ui.label(format!("{:.2} mm", self.plate_view.section_z));
     }
 
-    fn prepare_sheet(&mut self) -> Option<LayerSheet> {
-        let slice = self.slice.as_ref()?;
-        if slice.layers.is_empty() {
-            return None;
-        }
-        let index = self.preview_index.min(slice.layers.len() - 1);
-        let machine_id = self.machine.id;
-        if self.sheet_for != Some((index, machine_id)) {
-            let layer = slice.layers.get(index)?;
-            let (w, h, rgba) =
-                slice::layer_on_plate(&layer.rle, slice.width, slice.height, self.machine, 512)
-                    .ok()?;
-            let mut key = index as u64;
-            for byte in machine_id.bytes() {
-                key = key.wrapping_mul(131).wrapping_add(byte as u64);
+    /// Vertical range slider. The upper handle cuts down from the top.
+    /// The lower handle cuts up from the bottom.
+    fn dual_cut_slider(&mut self, ui: &mut egui::Ui, min_z: f32, max_z: f32, height: f32) -> bool {
+        let (rect, response) =
+            ui.allocate_exact_size(egui::vec2(36.0, height), egui::Sense::click_and_drag());
+        let span = (max_z - min_z).max(0.2);
+        let y_of = |v: f32| {
+            let t = ((v - min_z) / span).clamp(0.0, 1.0);
+            rect.bottom() - t * rect.height()
+        };
+        let v_of = |y: f32| {
+            let t = ((rect.bottom() - y) / rect.height().max(1.0)).clamp(0.0, 1.0);
+            min_z + t * span
+        };
+        let hi = self.plate_view.section_z.clamp(min_z, max_z);
+        let lo = self.plate_view.section_lo.clamp(min_z, hi);
+        let y_hi = y_of(hi);
+        let y_lo = y_of(lo);
+        let painter = ui.painter();
+        let track = egui::Rect::from_center_size(rect.center(), egui::vec2(6.0, rect.height()));
+        painter.rect_filled(track, 3.0, egui::Color32::from_rgb(48, 52, 58));
+        let band = egui::Rect::from_min_max(
+            egui::pos2(track.left(), y_hi.min(y_lo)),
+            egui::pos2(track.right(), y_hi.max(y_lo)),
+        );
+        painter.rect_filled(band, 3.0, egui::Color32::from_rgb(176, 112, 42));
+        painter.circle_filled(
+            egui::pos2(rect.center().x, y_hi),
+            7.0,
+            egui::Color32::from_rgb(232, 168, 72),
+        );
+        painter.circle_filled(
+            egui::pos2(rect.center().x, y_lo),
+            7.0,
+            egui::Color32::from_rgb(120, 156, 196),
+        );
+        let mut which = self.cut_drag;
+        if response.drag_started() || response.clicked() {
+            if let Some(pos) = response.interact_pointer_pos() {
+                let d_hi = (pos.y - y_hi).abs();
+                let d_lo = (pos.y - y_lo).abs();
+                which = Some(if d_hi <= d_lo { 1 } else { 0 });
+                self.cut_drag = which;
             }
-            self.sheet = Some(LayerSheet {
-                key,
-                w: w as i32,
-                h: h as i32,
-                rgba: Arc::new(rgba),
-                z: layer.z_top_mm,
-                size_x: self.machine.size_x,
-                size_y: self.machine.size_y,
-            });
-            self.sheet_for = Some((index, machine_id));
         }
-        let z = slice.layers.get(index)?.z_top_mm;
-        let mut sheet = self.sheet.clone()?;
-        sheet.z = z;
-        sheet.size_x = self.machine.size_x;
-        sheet.size_y = self.machine.size_y;
-        Some(sheet)
+        if !response.dragged() && !response.drag_started() {
+            return false;
+        }
+        let Some(pos) = response.interact_pointer_pos() else {
+            return false;
+        };
+        let v = v_of(pos.y);
+        let gap = 0.15;
+        let (next_lo, next_hi) = if which == Some(1) {
+            (lo, v.clamp(lo + gap, max_z))
+        } else if which == Some(0) {
+            (v.clamp(min_z, hi - gap), hi)
+        } else {
+            return false;
+        };
+        if (next_lo - self.plate_view.section_lo).abs() < 1e-4
+            && (next_hi - self.plate_view.section_z).abs() < 1e-4
+        {
+            return false;
+        }
+        self.plate_view.section_lo = next_lo;
+        self.plate_view.section_z = next_hi;
+        self.plate_view.section = true;
+        self.cuts_custom = true;
+        self.touch_view();
+        self.sync_preview_to_cut();
+        true
     }
 
     fn viewport_scene(&mut self, ui: &mut egui::Ui) {
@@ -3276,12 +3364,6 @@ impl AmberApp {
                 .map(|obj| obj.support.style.overhang_deg)
                 .unwrap_or(45.0)
         });
-        let count = self.slice.as_ref().map(|s| s.layers.len()).unwrap_or(0);
-        let sheet = if count > 0 && self.show_plate_layer {
-            self.prepare_sheet()
-        } else {
-            None
-        };
         let clip = self.view_clip();
         let ghost = self.hole_ghost(&response);
         let callback = egui::PaintCallback {
@@ -3303,15 +3385,7 @@ impl AmberApp {
                 if let Some(frame) = &frame {
                     gpu.sync(gl, frame);
                 }
-                gpu.paint(
-                    gl,
-                    &camera,
-                    aspect,
-                    overhang,
-                    clip,
-                    sheet.as_ref(),
-                    ghost.as_slice(),
-                );
+                gpu.paint(gl, &camera, aspect, overhang, clip, None, ghost.as_slice());
             })),
         };
         ui.painter().add(callback);
@@ -3633,18 +3707,16 @@ impl AmberApp {
         }
     }
 
-    fn view_clip(&self) -> Option<f32> {
-        let count = self.slice.as_ref().map(|s| s.layers.len()).unwrap_or(0);
-        if count > 0 && self.show_plate_layer && self.cut_at_layer {
-            self.slice.as_ref().and_then(|slice| {
-                let index = self.preview_index.min(slice.layers.len().saturating_sub(1));
-                slice.layers.get(index).map(|layer| layer.z_top_mm)
-            })
-        } else if self.plate_view.section {
-            Some(self.plate_view.section_z)
-        } else {
-            None
+    fn view_clip(&self) -> Option<(f32, f32)> {
+        if !self.plate_view.section {
+            return None;
         }
+        let mut lo = self.plate_view.section_lo;
+        let mut hi = self.plate_view.section_z;
+        if lo > hi {
+            std::mem::swap(&mut lo, &mut hi);
+        }
+        Some((lo, hi))
     }
 
     fn hole_ghost(&self, response: &egui::Response) -> Vec<f32> {
@@ -3693,7 +3765,7 @@ impl AmberApp {
                 ui.separator();
                 ui.label("Simple is the short path. Workshop is every control: rafts, rest times, compensation, and the rest.");
                 ui.label("Right-click a model for the same edits. Right-drag orbits, and you can swing under the bed. The bed turns clear so you can click an underside.");
-                ui.label("The bar on the right of Prepare is a height cut before you slice, and the sliced layers after. Cut hides the model above that height so a hole or a support can land on the surface that is left. View → Cut the view is the same height. The checkbox beside a model hides it in the view. It still prints. Tips only draws the contact points. After a slice, red marks on the plate are islands. Click one with Support to plant a tip there.");
+                ui.label("The bar on the right of Prepare cuts the model. The top handle starts at the top of the part so you can drag down through it, and the bottom handle cuts up from the base. Each cut is a solid face of the model. View → Cut the view is the same pair of heights. The checkbox beside a model hides it in the view. It still prints. Tips only draws the contact points. After a slice, red marks on the plate are islands. Click one with Support to plant a tip there.");
                 ui.label("The Hole tool draws the punch under the pointer. Perpendicular to the model follows the surface. Perpendicular to the screen follows the camera. Keep Hole saves the removed resin as its own model, set beside the part, so you can print it and glue it back.");
                 ui.separator();
                 ui.label("Ctrl+O open    Ctrl+Shift+S save the plate    Ctrl+S save the sliced file");
@@ -3867,9 +3939,11 @@ impl AmberApp {
         if click(ui, "Cut the view through this model") {
             if let Some((min, max)) = self.doc.object(id).and_then(Document::display_bounds) {
                 self.plate_view.section = true;
+                self.plate_view.section_lo = min.z;
                 self.plate_view.section_z = ((min.z + max.z) * 0.5).clamp(0.0, self.machine.size_z);
+                self.cuts_custom = true;
                 self.touch_view();
-                self.status = "The model above the orange line is hidden. Click the surface you can see to place a support.".into();
+                self.status = "The model outside the cut is hidden, and the cut is filled solid. Click the surface you can see to place a support.".into();
             }
             close = true;
         }

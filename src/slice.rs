@@ -841,6 +841,196 @@ fn clip_triangle(v0: [f32; 3], v1: [f32; 3], v2: [f32; 3], z: f32) -> Option<([f
     }
 }
 
+/// Filled cross-section of a mesh on a horizontal plane.
+///
+/// The outline is the mesh itself, sampled finely enough that the edge
+/// follows the cut instead of a coarse plate texture. `draw_z` is where the
+/// triangles sit, a hair inside the kept side so they do not flicker against
+/// the shell.
+pub fn solid_section(
+    vertices: &[[f32; 3]],
+    indices: &[u32],
+    plane_z: f32,
+    draw_z: f32,
+) -> crate::mesh::Mesh {
+    let mut segs: Vec<([f32; 2], [f32; 2])> = Vec::new();
+    for tri in indices.chunks_exact(3) {
+        let i0 = tri[0] as usize;
+        let i1 = tri[1] as usize;
+        let i2 = tri[2] as usize;
+        if i0 >= vertices.len() || i1 >= vertices.len() || i2 >= vertices.len() {
+            continue;
+        }
+        if let Some(seg) = clip_triangle(vertices[i0], vertices[i1], vertices[i2], plane_z) {
+            segs.push(seg);
+        }
+    }
+    section_fill(&segs, draw_z)
+}
+
+fn section_fill(segs: &[([f32; 2], [f32; 2])], draw_z: f32) -> crate::mesh::Mesh {
+    let empty = crate::mesh::Mesh {
+        vertices: Vec::new(),
+        indices: Vec::new(),
+    };
+    if segs.is_empty() {
+        return empty;
+    }
+    let mut min_x = f32::MAX;
+    let mut min_y = f32::MAX;
+    let mut max_x = f32::MIN;
+    let mut max_y = f32::MIN;
+    for (a, b) in segs {
+        min_x = min_x.min(a[0]).min(b[0]);
+        min_y = min_y.min(a[1]).min(b[1]);
+        max_x = max_x.max(a[0]).max(b[0]);
+        max_y = max_y.max(a[1]).max(b[1]);
+    }
+    let span_y = max_y - min_y;
+    let span_x = max_x - min_x;
+    if span_y < 1e-4 || span_x < 1e-4 {
+        return empty;
+    }
+    let span = span_x.max(span_y);
+    let mut pitch = (span / 2000.0).clamp(0.012, 0.04);
+    let mut rows = (span_y / pitch).ceil().max(1.0) as i32;
+    if rows > 4500 {
+        rows = 4500;
+        pitch = span_y / rows as f32;
+    }
+    #[derive(Clone, Copy)]
+    struct Edge {
+        ax: f32,
+        ay: f32,
+        bx: f32,
+        by: f32,
+        y_lo: f32,
+        y_hi: f32,
+    }
+    let mut buckets: Vec<Vec<Edge>> = vec![Vec::new(); rows as usize];
+    for (a, b) in segs {
+        let y_lo = a[1].min(b[1]);
+        let y_hi = a[1].max(b[1]);
+        if y_hi - y_lo < 1e-6 {
+            continue;
+        }
+        let mut row = ((y_lo - min_y) / pitch).floor() as i32;
+        if row < 0 {
+            row = 0;
+        }
+        if row >= rows {
+            continue;
+        }
+        buckets[row as usize].push(Edge {
+            ax: a[0],
+            ay: a[1],
+            bx: b[0],
+            by: b[1],
+            y_lo,
+            y_hi,
+        });
+    }
+    let mut active: Vec<Edge> = Vec::new();
+    let mut vertices = Vec::new();
+    let mut indices = Vec::new();
+    let dup = pitch * 0.35;
+    for row in 0..rows {
+        let y = min_y + (row as f32 + 0.5) * pitch;
+        active.retain(|e| y >= e.y_lo && y < e.y_hi);
+        for edge in &buckets[row as usize] {
+            if y >= edge.y_lo && y < edge.y_hi {
+                active.push(*edge);
+            }
+        }
+        if active.is_empty() {
+            continue;
+        }
+        let mut crossings: Vec<f32> = Vec::with_capacity(active.len());
+        for edge in &active {
+            let denom = edge.by - edge.ay;
+            if denom.abs() < 1e-8 {
+                continue;
+            }
+            let t = (y - edge.ay) / denom;
+            crossings.push(edge.ax + t * (edge.bx - edge.ax));
+        }
+        if crossings.is_empty() {
+            continue;
+        }
+        crossings.sort_by(|p, q| p.total_cmp(q));
+        let mut unique: Vec<f32> = Vec::with_capacity(crossings.len());
+        for x in crossings {
+            if let Some(prev) = unique.last() {
+                if (x - *prev).abs() < 0.02 {
+                    continue;
+                }
+            }
+            unique.push(x);
+        }
+        repair_odd_span(&mut unique, dup);
+        let y0 = min_y + row as f32 * pitch;
+        let y1 = y0 + pitch;
+        let mut i = 0;
+        while i + 1 < unique.len() {
+            let x0 = unique[i];
+            let x1 = unique[i + 1];
+            i += 2;
+            if x1 - x0 < 1e-4 {
+                continue;
+            }
+            let base = vertices.len() as u32;
+            vertices.push([x0, y0, draw_z]);
+            vertices.push([x1, y0, draw_z]);
+            vertices.push([x1, y1, draw_z]);
+            vertices.push([x0, y1, draw_z]);
+            indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+        }
+    }
+    crate::mesh::Mesh { vertices, indices }
+}
+
+fn repair_odd_span(crossings: &mut Vec<f32>, dup: f32) {
+    while crossings.len() % 2 == 1 && !crossings.is_empty() {
+        if crossings.len() == 1 {
+            crossings.clear();
+            return;
+        }
+        let mut close_i = 0usize;
+        let mut close_d = f32::MAX;
+        for i in 0..crossings.len() - 1 {
+            let d = crossings[i + 1] - crossings[i];
+            if d < close_d {
+                close_d = d;
+                close_i = i;
+            }
+        }
+        if close_d < dup {
+            crossings.remove(close_i + 1);
+            continue;
+        }
+        let mut lone_i = 0usize;
+        let mut lone_d = -1.0f32;
+        for i in 0..crossings.len() {
+            let left = if i == 0 {
+                f32::MAX
+            } else {
+                crossings[i] - crossings[i - 1]
+            };
+            let right = if i + 1 == crossings.len() {
+                f32::MAX
+            } else {
+                crossings[i + 1] - crossings[i]
+            };
+            let near = left.min(right);
+            if near > lone_d {
+                lone_d = near;
+                lone_i = i;
+            }
+        }
+        crossings.remove(lone_i);
+    }
+}
+
 fn fill_segments(segs: &[([f32; 2], [f32; 2])], machine: Machine, aa: u8) -> Image {
     if segs.is_empty() {
         return Image::empty();
@@ -2386,6 +2576,54 @@ mod tests {
         assert!(img.get(90, 25) > 0, "second shape missing");
         assert_eq!(img.get(42, 25), 0, "filled the gap up to the stray edge");
         assert_eq!(img.get(68, 25), 0, "filled the gap past the stray edge");
+    }
+
+    #[test]
+    fn a_cut_through_a_box_is_a_solid_square() {
+        let mesh = box_mesh([0.0, 0.0, 0.0], [10.0, 10.0, 10.0]);
+        let cap = solid_section(&mesh.vertices, &mesh.indices, 4.0, 3.96);
+        assert!(
+            cap.triangle_count() > 10,
+            "the cut produced no face, {} tris",
+            cap.triangle_count()
+        );
+        let mut area = 0.0f32;
+        for tri in cap.indices.chunks_exact(3) {
+            let a = cap.vertices[tri[0] as usize];
+            let b = cap.vertices[tri[1] as usize];
+            let c = cap.vertices[tri[2] as usize];
+            area += ((b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])).abs() * 0.5;
+            assert!((a[2] - 3.96).abs() < 1e-4, "cap z {}", a[2]);
+        }
+        assert!(
+            (area - 100.0).abs() < 2.0,
+            "a 10 mm square should fill about 100 mm², got {area}"
+        );
+        assert!(
+            section_covers(&cap, [5.0, 5.0]),
+            "the middle of the cut is empty"
+        );
+        assert!(
+            !section_covers(&cap, [12.0, 5.0]),
+            "the cut spilled past the box"
+        );
+    }
+
+    fn section_covers(mesh: &crate::mesh::Mesh, p: [f32; 2]) -> bool {
+        for tri in mesh.indices.chunks_exact(3) {
+            let a = mesh.vertices[tri[0] as usize];
+            let b = mesh.vertices[tri[1] as usize];
+            let c = mesh.vertices[tri[2] as usize];
+            let c0 = (b[0] - a[0]) * (p[1] - a[1]) - (b[1] - a[1]) * (p[0] - a[0]);
+            let c1 = (c[0] - b[0]) * (p[1] - b[1]) - (c[1] - b[1]) * (p[0] - b[0]);
+            let c2 = (a[0] - c[0]) * (p[1] - c[1]) - (a[1] - c[1]) * (p[0] - c[0]);
+            if (c0 >= -1e-4 && c1 >= -1e-4 && c2 >= -1e-4)
+                || (c0 <= 1e-4 && c1 <= 1e-4 && c2 <= 1e-4)
+            {
+                return true;
+            }
+        }
+        false
     }
 
     #[test]

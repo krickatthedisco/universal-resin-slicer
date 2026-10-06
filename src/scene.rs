@@ -1674,14 +1674,15 @@ impl Document {
         self.raycast_visible(origin, dir, &HashSet::new(), None)
     }
 
-    /// Closest hit on a model that is still shown. `clip_z` drops hits above a
-    /// section plane, so a click lands on the surface the cut left visible.
+    /// Closest hit on a model that is still shown. `clip` is `(bottom, top)`:
+    /// hits outside that slab are dropped, so a click lands on the surface
+    /// the cut left visible.
     pub fn raycast_visible(
         &self,
         origin: Vec3,
         dir: Vec3,
         hidden: &HashSet<u64>,
-        clip_z: Option<f32>,
+        clip: Option<(f32, f32)>,
     ) -> Option<(u64, Vec3, Vec3)> {
         let mut best: Option<(f32, u64, Vec3, Vec3)> = None;
         for obj in &self.objects {
@@ -1694,8 +1695,8 @@ impl Document {
                 let b = Vec3::from_array(world.vertices[tri[1] as usize]);
                 let c = Vec3::from_array(world.vertices[tri[2] as usize]);
                 if let Some((t, p, n)) = ray_triangle(origin, dir, a, b, c) {
-                    if let Some(z) = clip_z {
-                        if p.z > z + 0.02 {
+                    if let Some((lo, hi)) = clip {
+                        if p.z > hi + 0.02 || p.z < lo - 0.02 {
                             continue;
                         }
                     }
@@ -1972,9 +1973,18 @@ mod tests {
         let (_, top, _) = doc.raycast(origin, dir).unwrap();
         assert!(top.z > 9.0, "top hit {}", top.z);
         let (_, cut, _) = doc
-            .raycast_visible(origin, dir, &HashSet::new(), Some(4.0))
+            .raycast_visible(origin, dir, &HashSet::new(), Some((0.0, 4.0)))
             .unwrap();
         assert!(cut.z <= 4.05, "section hit {}", cut.z);
+        let from_below = Vec3::new(5.0, 5.0, -10.0);
+        let (_, lower, _) = doc
+            .raycast_visible(from_below, Vec3::Z, &HashSet::new(), Some((4.0, 20.0)))
+            .unwrap();
+        assert!(
+            lower.z >= 3.95,
+            "the cut from the bottom should hide the underside, hit {}",
+            lower.z
+        );
     }
 
     #[test]

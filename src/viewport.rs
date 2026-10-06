@@ -83,6 +83,9 @@ pub struct PlateFrame {
     pub line_gen: u64,
     pub objects: Vec<ObjectFrame>,
     pub rafts: Vec<RaftFrame>,
+    /// Opaque cut faces, in the same vertex layout as `world`.
+    pub caps: Arc<Vec<f32>>,
+    pub cap_gen: u64,
 }
 
 #[derive(Clone)]
@@ -113,7 +116,10 @@ pub struct PlateView {
     pub braces: bool,
     pub rafts: bool,
     pub section: bool,
+    /// Upper cut. Geometry above this is hidden.
     pub section_z: f32,
+    /// Lower cut. Geometry below this is hidden.
+    pub section_lo: f32,
 }
 
 impl Default for PlateView {
@@ -128,6 +134,7 @@ impl Default for PlateView {
             rafts: true,
             section: false,
             section_z: 10.0,
+            section_lo: 0.0,
         }
     }
 }
@@ -186,6 +193,7 @@ pub struct ViewCache {
     bed: Arc<Vec<f32>>,
     grid_lines: Vec<f32>,
     locals: HashMap<(u64, u64), Arc<Vec<f32>>>,
+    caps: HashMap<u64, Arc<Vec<f32>>>,
 }
 
 impl ViewCache {
@@ -196,6 +204,7 @@ impl ViewCache {
             bed: Arc::new(Vec::new()),
             grid_lines: Vec::new(),
             locals: HashMap::new(),
+            caps: HashMap::new(),
         }
     }
 
@@ -318,19 +327,24 @@ impl ViewCache {
             }
         }
         self.locals.retain(|key, _| live_locals.contains(key));
-        if view.section {
-            let z = view.section_z.clamp(0.0, plate.z.max(0.0));
-            let color = [0.95, 0.55, 0.18];
-            let corners = [
-                [0.0, 0.0, z],
-                [plate.x, 0.0, z],
-                [plate.x, plate.y, z],
-                [0.0, plate.y, z],
-            ];
-            for i in 0..4 {
-                push_line(&mut lines, corners[i], corners[(i + 1) % 4], color);
+        let (caps, cap_gen) = if view.section {
+            let mut lo = view.section_lo;
+            let mut hi = view.section_z;
+            if lo > hi {
+                std::mem::swap(&mut lo, &mut hi);
             }
-        }
+            if let Some((min_z, max_z)) = model_span(doc, hidden) {
+                if hi > min_z + 0.03 && hi < max_z - 0.03 {
+                    self.plane_lines(&mut lines, plate, hi, [0.95, 0.55, 0.18]);
+                }
+                if lo > min_z + 0.03 && lo < max_z - 0.03 {
+                    self.plane_lines(&mut lines, plate, lo, [0.45, 0.62, 0.82]);
+                }
+            }
+            self.cut_caps(doc, hidden, &objects, lo, hi)
+        } else {
+            (Arc::new(Vec::new()), 0)
+        };
         PlateFrame {
             world_gen,
             world: self.world.clone(),
@@ -339,8 +353,117 @@ impl ViewCache {
             line_gen: doc.changed,
             objects,
             rafts: Vec::new(),
+            caps,
+            cap_gen,
         }
     }
+
+    fn plane_lines(&self, lines: &mut Vec<f32>, plate: Vec3, z: f32, color: [f32; 3]) {
+        let z = z.clamp(-1.0, plate.z.max(0.0) + 1.0);
+        let corners = [
+            [0.0, 0.0, z],
+            [plate.x, 0.0, z],
+            [plate.x, plate.y, z],
+            [0.0, plate.y, z],
+        ];
+        for i in 0..4 {
+            push_line(lines, corners[i], corners[(i + 1) % 4], color);
+        }
+    }
+
+    /// Solid faces where the upper and lower cuts pass through each model.
+    fn cut_caps(
+        &mut self,
+        doc: &Document,
+        hidden: &HashSet<u64>,
+        objects: &[ObjectFrame],
+        lo: f32,
+        hi: f32,
+    ) -> (Arc<Vec<f32>>, u64) {
+        let gap = (hi - lo).max(0.0);
+        let bias = (gap * 0.12).clamp(0.015, 0.06);
+        let mut combined = Vec::new();
+        let mut gen = 0u64;
+        let mut live = HashSet::new();
+        for obj in &doc.objects {
+            if hidden.contains(&obj.id) {
+                continue;
+            }
+            let Some((min, max)) = Document::display_bounds(obj) else {
+                continue;
+            };
+            let color = objects
+                .iter()
+                .find(|frame| frame.id == obj.id)
+                .map(|frame| frame.color)
+                .unwrap_or([0.76, 0.64, 0.46]);
+            let planes = [(hi, hi - bias), (lo, lo + bias)];
+            for (plane, draw_z) in planes {
+                if plane <= min.z + 0.03 || plane >= max.z - 0.03 {
+                    continue;
+                }
+                let key = cap_stamp(obj, plane, draw_z, color);
+                live.insert(key);
+                let tris = if let Some(buf) = self.caps.get(&key) {
+                    buf.clone()
+                } else {
+                    let world = Document::world_mesh(obj);
+                    let mesh =
+                        crate::slice::solid_section(&world.vertices, &world.indices, plane, draw_z);
+                    let buf = Arc::new(colored_tris(&mesh, color));
+                    self.caps.insert(key, buf.clone());
+                    buf
+                };
+                gen = gen
+                    .wrapping_mul(131)
+                    .wrapping_add(key)
+                    .wrapping_add(tris.len() as u64);
+                combined.extend_from_slice(&tris);
+            }
+        }
+        self.caps.retain(|key, _| live.contains(key));
+        (Arc::new(combined), gen)
+    }
+}
+
+fn model_span(doc: &Document, hidden: &HashSet<u64>) -> Option<(f32, f32)> {
+    let mut lo = f32::MAX;
+    let mut hi = f32::MIN;
+    let mut any = false;
+    for obj in &doc.objects {
+        if hidden.contains(&obj.id) {
+            continue;
+        }
+        if let Some((min, max)) = Document::display_bounds(obj) {
+            lo = lo.min(min.z);
+            hi = hi.max(max.z);
+            any = true;
+        }
+    }
+    any.then_some((lo, hi))
+}
+
+fn cap_stamp(obj: &crate::scene::Object, plane: f32, draw_z: f32, color: [f32; 3]) -> u64 {
+    let mut h = obj.id.wrapping_mul(0x9E37_79B1).wrapping_add(obj.mesh_rev);
+    for n in [
+        quant(plane) as u64,
+        quant(draw_z) as u64,
+        quant(obj.position.x) as u64,
+        quant(obj.position.y) as u64,
+        quant(obj.position.z) as u64,
+        quant(obj.rotation_deg.x) as u64,
+        quant(obj.rotation_deg.y) as u64,
+        quant(obj.rotation_deg.z) as u64,
+        (obj.scale.x * 1000.0).round() as u64,
+        (obj.scale.y * 1000.0).round() as u64,
+        (obj.scale.z * 1000.0).round() as u64,
+        (color[0] * 255.0) as u64,
+        (color[1] * 255.0) as u64,
+        (color[2] * 255.0) as u64,
+    ] {
+        h = h.wrapping_mul(131).wrapping_add(n);
+    }
+    h
 }
 
 impl PlateFrame {
@@ -557,8 +680,9 @@ uniform float u_show_overhang;
 uniform float u_overhang_deg;
 uniform float u_clip_on;
 uniform float u_clip_z;
+uniform float u_clip_lo;
 void main() {
-    if (u_clip_on > 0.5 && v_pos.z > u_clip_z) {
+    if (u_clip_on > 0.5 && (v_pos.z > u_clip_z || v_pos.z < u_clip_lo)) {
         discard;
     }
     float len2 = dot(v_nrm, v_nrm);
@@ -676,6 +800,7 @@ struct SolidLocs {
     overhang_deg: Option<glow::UniformLocation>,
     clip_on: Option<glow::UniformLocation>,
     clip_z: Option<glow::UniformLocation>,
+    clip_lo: Option<glow::UniformLocation>,
 }
 
 pub struct Renderer {
@@ -699,6 +824,8 @@ pub struct Renderer {
     sheet_tex: glow::Texture,
     sheet_key: u64,
     ghost: MeshGpu,
+    caps: MeshGpu,
+    cap_gen: u64,
 }
 
 impl Renderer {
@@ -721,6 +848,7 @@ impl Renderer {
                 overhang_deg: gl.get_uniform_location(program, "u_overhang_deg"),
                 clip_on: gl.get_uniform_location(program, "u_clip_on"),
                 clip_z: gl.get_uniform_location(program, "u_clip_z"),
+                clip_lo: gl.get_uniform_location(program, "u_clip_lo"),
             };
             let line_mvp = gl.get_uniform_location(line_program, "u_mvp");
             let sheet_mvp = gl.get_uniform_location(sheet_program, "u_mvp");
@@ -756,6 +884,10 @@ impl Renderer {
                 ghost: MeshGpu {
                     batches: Vec::new(),
                 },
+                caps: MeshGpu {
+                    batches: Vec::new(),
+                },
+                cap_gen: u64::MAX,
             })
         }
     }
@@ -782,6 +914,10 @@ impl Renderer {
         }
         self.sync_objects(gl, frame);
         self.sync_rafts(gl, frame);
+        if frame.cap_gen != self.cap_gen {
+            upload_mesh(gl, &mut self.caps.batches, &frame.caps);
+            self.cap_gen = frame.cap_gen;
+        }
     }
 
     fn sync_objects(&mut self, gl: &glow::Context, frame: &PlateFrame) {
@@ -854,7 +990,7 @@ impl Renderer {
         camera: &Camera,
         aspect: f32,
         overhang_deg: Option<f32>,
-        clip_z: Option<f32>,
+        clip: Option<(f32, f32)>,
         sheet: Option<&LayerSheet>,
         ghost: &[f32],
     ) {
@@ -879,8 +1015,10 @@ impl Renderer {
                 self.locs.overhang_deg.as_ref(),
                 overhang_deg.unwrap_or(45.0),
             );
+            let (clip_lo, clip_hi) = clip.unwrap_or((0.0, 0.0));
             gl.uniform_1_f32(self.locs.clip_on.as_ref(), 0.0);
-            gl.uniform_1_f32(self.locs.clip_z.as_ref(), clip_z.unwrap_or(0.0));
+            gl.uniform_1_f32(self.locs.clip_lo.as_ref(), clip_lo);
+            gl.uniform_1_f32(self.locs.clip_z.as_ref(), clip_hi);
             let under = camera.under_bed();
             if !under {
                 self.draw_solid(
@@ -909,7 +1047,7 @@ impl Renderer {
             if overhang_deg.is_some() {
                 gl.uniform_1_f32(self.locs.show_overhang.as_ref(), 1.0);
             }
-            if clip_z.is_some() {
+            if clip.is_some() {
                 gl.uniform_1_f32(self.locs.clip_on.as_ref(), 1.0);
             }
             for obj in &self.objects {
@@ -917,6 +1055,20 @@ impl Renderer {
             }
             gl.uniform_1_f32(self.locs.show_overhang.as_ref(), 0.0);
             gl.uniform_1_f32(self.locs.clip_on.as_ref(), 0.0);
+            // Pull the cut face toward the camera just enough to cover the
+            // clipped edge of the shell without a flicker.
+            gl.enable(glow::POLYGON_OFFSET_FILL);
+            gl.polygon_offset(-1.0, -1.5);
+            self.draw_solid(
+                gl,
+                &self.caps.batches,
+                Mat4::IDENTITY,
+                [1.0, 1.0, 1.0],
+                0.0,
+                1.0,
+                vp,
+            );
+            gl.disable(glow::POLYGON_OFFSET_FILL);
             if !ghost.is_empty() {
                 upload_mesh(gl, &mut self.ghost.batches, ghost);
                 gl.enable(glow::BLEND);
@@ -1090,6 +1242,7 @@ impl Renderer {
                 drop_batches(gl, &raft.batches);
             }
             drop_batches(gl, &self.ghost.batches);
+            drop_batches(gl, &self.caps.batches);
             gl.delete_vertex_array(self.line_vao);
             gl.delete_buffer(self.line_vbo);
         }
