@@ -404,6 +404,56 @@ struct Trunk {
     radius: f32,
 }
 
+fn empty_mesh() -> Mesh {
+    Mesh {
+        vertices: vec![],
+        indices: vec![],
+    }
+}
+
+/// The support forest split so the plate can show one piece at a time.
+/// The slice still uses [`forest_mesh`], which is these pieces joined.
+#[derive(Clone, Debug)]
+pub struct SupportParts {
+    pub contacts: Mesh,
+    pub necks: Mesh,
+    pub trunks: Mesh,
+    pub feet: Mesh,
+    pub branches: Mesh,
+    pub braces: Mesh,
+}
+
+impl SupportParts {
+    pub fn empty() -> Self {
+        Self {
+            contacts: empty_mesh(),
+            necks: empty_mesh(),
+            trunks: empty_mesh(),
+            feet: empty_mesh(),
+            branches: empty_mesh(),
+            braces: empty_mesh(),
+        }
+    }
+
+    pub fn append(&mut self, other: &SupportParts) {
+        self.contacts.append(&other.contacts);
+        self.necks.append(&other.necks);
+        self.trunks.append(&other.trunks);
+        self.feet.append(&other.feet);
+        self.branches.append(&other.branches);
+        self.braces.append(&other.braces);
+    }
+
+    pub fn append_into(&self, mesh: &mut Mesh) {
+        mesh.append(&self.contacts);
+        mesh.append(&self.necks);
+        mesh.append(&self.trunks);
+        mesh.append(&self.feet);
+        mesh.append(&self.branches);
+        mesh.append(&self.braces);
+    }
+}
+
 /// Tips, angled branches, shared trunks, feet, and cross-braces for the whole plate.
 pub fn forest_mesh(
     supports: &[Support],
@@ -413,13 +463,32 @@ pub fn forest_mesh(
     brace_dist: f32,
     brace_angle: f32,
 ) -> Mesh {
+    let mut mesh = empty_mesh();
+    forest_parts(
+        supports,
+        style,
+        raft_top,
+        braces_on,
+        brace_dist,
+        brace_angle,
+    )
+    .append_into(&mut mesh);
+    mesh
+}
+
+/// The same forest as [`forest_mesh`], kept in separate meshes for the view.
+pub fn forest_parts(
+    supports: &[Support],
+    style: &SupportStyle,
+    raft_top: f32,
+    braces_on: bool,
+    brace_dist: f32,
+    brace_angle: f32,
+) -> SupportParts {
     let style = style.sanitized();
-    let mut mesh = Mesh {
-        vertices: vec![],
-        indices: vec![],
-    };
+    let mut parts = SupportParts::empty();
     if supports.is_empty() {
-        return mesh;
+        return parts;
     }
     let mut trunks = Vec::new();
     for group in cluster(supports, style.cluster_mm) {
@@ -432,10 +501,18 @@ pub fn forest_mesh(
         }
         let trunk_r = style.trunk_mm * 0.5;
         let tip_end = tip_end_z(host, z_base, &style);
-        add_tip(&mut mesh, host, tip_end, &style);
+        add_tip(&mut parts.contacts, &mut parts.necks, host, tip_end, &style);
         let shaft_top = tip_end;
         add_foot_and_shaft(
-            &mut mesh, host.x, host.y, z_base, shaft_top, trunk_r, on_bed, &style,
+            &mut parts.trunks,
+            &mut parts.feet,
+            host.x,
+            host.y,
+            z_base,
+            shaft_top,
+            trunk_r,
+            on_bed,
+            &style,
         );
         trunks.push(Trunk {
             x: host.x,
@@ -452,7 +529,13 @@ pub fn forest_mesh(
             }
             let tip = &supports[idx];
             let branch_end = tip_end_z(tip, z_base, &style);
-            add_tip(&mut mesh, tip, branch_end, &style);
+            add_tip(
+                &mut parts.contacts,
+                &mut parts.necks,
+                tip,
+                branch_end,
+                &style,
+            );
             let horiz = ((tip.x - host.x).powi(2) + (tip.y - host.y).powi(2)).sqrt();
             let drop = horiz / style.branch_deg.to_radians().tan().max(0.15);
             let join_z = if branch_end > ceiling {
@@ -463,35 +546,40 @@ pub fn forest_mesh(
             let from = Vec3::new(tip.x, tip.y, branch_end);
             let to = Vec3::new(host.x, host.y, join_z);
             if from.distance(to) > 0.2 {
-                mesh.append(&tapered(
+                parts.branches.append(&tapered(
                     from,
                     style.tip_lower_mm * 0.5,
                     to,
                     trunk_r * 0.92,
                     8,
                 ));
-                mesh.append(&sphere(to, trunk_r * 0.85, 5, 7));
+                parts.branches.append(&sphere(to, trunk_r * 0.85, 5, 7));
             }
         }
     }
     if braces_on {
         for brace in trunk_braces(&trunks, brace_dist, style.brace_mm * 0.5, brace_angle) {
-            mesh.append(&tapered(brace.a, brace.radius, brace.b, brace.radius, 6));
+            parts
+                .braces
+                .append(&tapered(brace.a, brace.radius, brace.b, brace.radius, 6));
         }
     }
-    mesh
+    parts
 }
 
 /// The contact alone, used to highlight the support under the cursor.
 pub fn tip_marker(support: &Support, style: &SupportStyle) -> Mesh {
+    contact_marker(support, style)
+}
+
+/// Just the point or ball that touches the model, without the neck.
+pub fn contact_marker(support: &Support, style: &SupportStyle) -> Mesh {
     let style = style.sanitized();
-    let mut mesh = Mesh {
-        vertices: vec![],
-        indices: vec![],
-    };
+    let mut contacts = empty_mesh();
+    let mut necks = empty_mesh();
     let end = tip_end_z(support, support.z_base.max(0.0), &style);
-    add_tip(&mut mesh, support, end, &style);
-    mesh
+    add_tip(&mut contacts, &mut necks, support, end, &style);
+    contacts
 }
 
 fn tip_end_z(support: &Support, z_base: f32, style: &SupportStyle) -> f32 {
@@ -500,7 +588,13 @@ fn tip_end_z(support: &Support, z_base: f32, style: &SupportStyle) -> f32 {
     (support.z_top - len).max(z_base + 0.2)
 }
 
-fn add_tip(mesh: &mut Mesh, support: &Support, tip_end_z: f32, style: &SupportStyle) {
+fn add_tip(
+    contacts: &mut Mesh,
+    necks: &mut Mesh,
+    support: &Support,
+    tip_end_z: f32,
+    style: &SupportStyle,
+) {
     let contact_r = style.contact_mm * 0.5;
     let upper_r = (style.tip_upper_mm * 0.5).max(contact_r);
     let lower_r = (style.tip_lower_mm * 0.5).max(upper_r * 0.8);
@@ -511,7 +605,7 @@ fn add_tip(mesh: &mut Mesh, support: &Support, tip_end_z: f32, style: &SupportSt
             support.y,
             support.z_top + style.contact_depth * 0.45,
         );
-        mesh.append(&sphere(center, r, 6, 8));
+        contacts.append(&sphere(center, r, 6, 8));
         let neck = Vec3::new(
             support.x,
             support.y,
@@ -519,14 +613,14 @@ fn add_tip(mesh: &mut Mesh, support: &Support, tip_end_z: f32, style: &SupportSt
         );
         let end = Vec3::new(support.x, support.y, tip_end_z.min(neck.z - 0.05));
         if neck.z - end.z > 0.12 {
-            mesh.append(&tapered(neck, r * 0.9, end, lower_r, 8));
+            necks.append(&tapered(neck, r * 0.9, end, lower_r, 8));
         }
         return;
     }
     let apex = Vec3::new(support.x, support.y, support.z_top + style.contact_depth);
     let surface = Vec3::new(support.x, support.y, support.z_top);
     let end = Vec3::new(support.x, support.y, tip_end_z);
-    mesh.append(&tapered(
+    contacts.append(&tapered(
         apex,
         (contact_r * 0.35).max(0.04),
         surface,
@@ -534,12 +628,13 @@ fn add_tip(mesh: &mut Mesh, support: &Support, tip_end_z: f32, style: &SupportSt
         8,
     ));
     if surface.z - end.z > 0.12 {
-        mesh.append(&tapered(surface, upper_r, end, lower_r, 8));
+        necks.append(&tapered(surface, upper_r, end, lower_r, 8));
     }
 }
 
 fn add_foot_and_shaft(
-    mesh: &mut Mesh,
+    trunks: &mut Mesh,
+    feet: &mut Mesh,
     x: f32,
     y: f32,
     z_base: f32,
@@ -559,7 +654,7 @@ fn add_foot_and_shaft(
         z_base
     };
     if shaft_top - shaft_bottom > 0.15 {
-        mesh.append(&tapered(
+        trunks.append(&tapered(
             Vec3::new(x, y, shaft_bottom),
             trunk_r,
             Vec3::new(x, y, shaft_top),
@@ -573,7 +668,7 @@ fn add_foot_and_shaft(
         } else {
             trunk_r * 2.1
         };
-        mesh.append(&tapered(
+        feet.append(&tapered(
             Vec3::new(x, y, z_base),
             foot_r,
             Vec3::new(x, y, shaft_bottom),
@@ -583,7 +678,7 @@ fn add_foot_and_shaft(
     } else if !on_bed && foot_h > 0.08 {
         // Lower contact where the trunk lands on the model.
         let sole = Vec3::new(x, y, z_base - style.contact_depth * 0.5);
-        mesh.append(&tapered(
+        feet.append(&tapered(
             sole,
             style.contact_mm * 0.22,
             Vec3::new(x, y, shaft_bottom),
@@ -1304,6 +1399,40 @@ mod tests {
             .iter()
             .any(|v| (v[0] - 3.2).abs() < 0.3 && v[2] > 18.0);
         assert!(reached, "expected a tip on the second contact");
+    }
+
+    #[test]
+    fn contact_points_are_separate_from_the_trunk() {
+        let supports = [Support {
+            id: 1,
+            object_id: 0,
+            x: 0.0,
+            y: 0.0,
+            z_top: 22.0,
+            z_base: 0.0,
+        }];
+        let style = &PRESETS[1].style;
+        let parts = forest_parts(&supports, style, 0.0, false, 8.0, 45.0);
+        assert!(parts.contacts.triangle_count() > 0);
+        assert!(parts.necks.triangle_count() > 0);
+        assert!(parts.trunks.triangle_count() > 0);
+        assert!(parts.feet.triangle_count() > 0);
+        assert!(
+            parts.contacts.vertices.iter().any(|v| v[2] > 21.5),
+            "the contact should reach the tip"
+        );
+        assert!(
+            parts.trunks.vertices.iter().all(|v| v[2] < 21.0),
+            "the trunk should stop below the contact"
+        );
+        let mesh = forest_mesh(&supports, style, 0.0, false, 8.0, 45.0);
+        let split = parts.contacts.triangle_count()
+            + parts.necks.triangle_count()
+            + parts.trunks.triangle_count()
+            + parts.feet.triangle_count()
+            + parts.branches.triangle_count()
+            + parts.braces.triangle_count();
+        assert_eq!(mesh.triangle_count(), split);
     }
 
     #[test]

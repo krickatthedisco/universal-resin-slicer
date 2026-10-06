@@ -10,11 +10,12 @@ use crate::scene::{Document, Selection};
 use crate::sl1::write_sl1;
 use crate::slice::{self, Slice};
 use crate::supports::PRESETS;
-use crate::viewport::{self, Camera, PlateFrame, Renderer, ViewCache};
+use crate::viewport::{self, Camera, PlateFrame, PlateView, Renderer, ViewCache};
 use eframe::egui;
 use glam::Vec3;
 use glow::HasContext;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -80,6 +81,10 @@ fn default_brace_dist() -> f32 {
     8.0
 }
 
+fn default_section_z() -> f32 {
+    10.0
+}
+
 #[derive(Serialize, Deserialize)]
 struct Persist {
     settings: PrintSettings,
@@ -120,6 +125,24 @@ struct Persist {
     workshop: bool,
     #[serde(default)]
     recent: Vec<String>,
+    #[serde(default = "default_true")]
+    show_contacts: bool,
+    #[serde(default = "default_true")]
+    show_necks: bool,
+    #[serde(default = "default_true")]
+    show_trunks: bool,
+    #[serde(default = "default_true")]
+    show_feet: bool,
+    #[serde(default = "default_true")]
+    show_branches: bool,
+    #[serde(default = "default_true")]
+    show_braces: bool,
+    #[serde(default = "default_true")]
+    show_rafts: bool,
+    #[serde(default)]
+    section: bool,
+    #[serde(default = "default_section_z")]
+    section_z: f32,
 }
 
 pub struct AmberApp {
@@ -164,6 +187,11 @@ pub struct AmberApp {
     measure_drawn: u64,
     /// Round a dragged move to whole millimetres.
     snap_mm: bool,
+    plate_view: PlateView,
+    /// Models left out of the plate view. They still slice.
+    hidden_models: HashSet<u64>,
+    view_rev: u64,
+    view_drawn: u64,
 }
 
 impl AmberApp {
@@ -185,6 +213,7 @@ impl AmberApp {
         let mut only_profiled = true;
         let mut workshop = false;
         let mut recent = Vec::new();
+        let mut plate_view = PlateView::default();
         if let Some(storage) = cc.storage {
             if let Some(raw) = storage.get_string("amber.print") {
                 if let Ok(saved) = serde_json::from_str::<Persist>(&raw) {
@@ -209,6 +238,15 @@ impl AmberApp {
                     only_profiled = saved.only_profiled;
                     workshop = saved.workshop;
                     recent = saved.recent;
+                    plate_view.contacts = saved.show_contacts;
+                    plate_view.necks = saved.show_necks;
+                    plate_view.trunks = saved.show_trunks;
+                    plate_view.feet = saved.show_feet;
+                    plate_view.branches = saved.show_branches;
+                    plate_view.braces = saved.show_braces;
+                    plate_view.rafts = saved.show_rafts;
+                    plate_view.section = saved.section;
+                    plate_view.section_z = saved.section_z;
                 }
             }
         }
@@ -283,6 +321,10 @@ impl AmberApp {
             measure_gen: 0,
             measure_drawn: 0,
             snap_mm: false,
+            plate_view,
+            hidden_models: HashSet::new(),
+            view_rev: 0,
+            view_drawn: 0,
         }
     }
 
@@ -643,6 +685,15 @@ impl eframe::App for AmberApp {
             only_profiled: self.only_profiled,
             workshop: self.workshop,
             recent: self.recent.clone(),
+            show_contacts: self.plate_view.contacts,
+            show_necks: self.plate_view.necks,
+            show_trunks: self.plate_view.trunks,
+            show_feet: self.plate_view.feet,
+            show_branches: self.plate_view.branches,
+            show_braces: self.plate_view.braces,
+            show_rafts: self.plate_view.rafts,
+            section: self.plate_view.section,
+            section_z: self.plate_view.section_z,
         };
         if let Ok(raw) = serde_json::to_string(&saved) {
             storage.set_string("amber.print", raw);
@@ -670,18 +721,26 @@ impl eframe::App for AmberApp {
         if self.draw_gen != self.doc.changed
             || self.frame.is_none()
             || self.measure_drawn != self.measure_gen
+            || self.view_drawn != self.view_rev
         {
-            let mut frame = self
-                .view_cache
-                .frame(&self.doc, self.plate(), self.doc.selection);
+            let mut frame = self.view_cache.frame(
+                &self.doc,
+                self.plate(),
+                self.doc.selection,
+                &self.plate_view,
+                &self.hidden_models,
+            );
             self.paint_measure(&mut frame);
             frame.line_gen = frame
                 .line_gen
                 .wrapping_mul(31)
-                .wrapping_add(self.measure_gen);
+                .wrapping_add(self.measure_gen)
+                .wrapping_mul(31)
+                .wrapping_add(self.view_rev);
             self.frame = Some(frame);
             self.draw_gen = self.doc.changed;
             self.measure_drawn = self.measure_gen;
+            self.view_drawn = self.view_rev;
         }
 
         egui::Panel::top("menu").show(ui, |ui| self.menu(ui));
@@ -784,6 +843,10 @@ impl AmberApp {
                     self.fit_view();
                     ui.close();
                 }
+                ui.separator();
+                self.section_controls(ui);
+                ui.separator();
+                self.support_visibility(ui);
             });
             ui.menu_button("Setting", |ui| {
                 let mut changed = false;
@@ -902,7 +965,7 @@ impl AmberApp {
             (
                 Tool::Support,
                 "Support",
-                "Click an underside to plant a support on that model. Orbit under the bed and the plate turns clear.",
+                "Click an underside to plant a support. Cut the view to reach a surface that was hidden above. Orbit under the bed and the plate turns clear.",
             ),
             (
                 Tool::Measure,
@@ -1061,6 +1124,12 @@ impl AmberApp {
             return;
         }
         self.model_list(ui);
+        ui.separator();
+        self.section_controls(ui);
+        if ui.button("Show only the contact points").clicked() {
+            self.plate_view.tips_only();
+            self.touch_view();
+        }
         ui.separator();
         ui.strong("Before you print");
         for line in self.readiness() {
@@ -1235,6 +1304,70 @@ impl AmberApp {
         self.recent.truncate(8);
     }
 
+    fn touch_view(&mut self) {
+        self.view_rev = self.view_rev.wrapping_add(1);
+    }
+
+    fn toggle_view(&mut self, ui: &mut egui::Ui, label: &str, value: bool) -> bool {
+        let mut value = value;
+        if ui.checkbox(&mut value, label).changed() {
+            self.touch_view();
+        }
+        value
+    }
+
+    fn toggle_hidden(&mut self, id: u64) {
+        if !self.hidden_models.remove(&id) {
+            self.hidden_models.insert(id);
+        }
+        self.touch_view();
+    }
+
+    fn section_controls(&mut self, ui: &mut egui::Ui) {
+        let mut on = self.plate_view.section;
+        if ui.checkbox(&mut on, "Cut the view").changed() {
+            self.plate_view.section = on;
+            self.touch_view();
+        }
+        let mut z = self.plate_view.section_z;
+        if drag_f32(
+            ui,
+            "Cut height",
+            &mut z,
+            0.1,
+            0.0,
+            self.machine.size_z.max(1.0),
+            "mm",
+        ) {
+            self.plate_view.section_z = z;
+            self.plate_view.section = true;
+            self.touch_view();
+        }
+        ui.label("Hides the model above this height so you can click the surface that is left. Supports stay drawn. A hidden model still prints.");
+    }
+
+    fn support_visibility(&mut self, ui: &mut egui::Ui) {
+        ui.label("Support pieces");
+        self.plate_view.contacts = self.toggle_view(ui, "Contact points", self.plate_view.contacts);
+        self.plate_view.necks = self.toggle_view(ui, "Necks", self.plate_view.necks);
+        self.plate_view.trunks = self.toggle_view(ui, "Trunks", self.plate_view.trunks);
+        self.plate_view.feet = self.toggle_view(ui, "Feet", self.plate_view.feet);
+        self.plate_view.branches = self.toggle_view(ui, "Branches", self.plate_view.branches);
+        self.plate_view.braces = self.toggle_view(ui, "Braces", self.plate_view.braces);
+        self.plate_view.rafts = self.toggle_view(ui, "Rafts", self.plate_view.rafts);
+        ui.horizontal_wrapped(|ui| {
+            if ui.button("Tips only").clicked() {
+                self.plate_view.tips_only();
+                self.touch_view();
+            }
+            if ui.button("Show all pieces").clicked() {
+                self.plate_view.show_all_pieces();
+                self.touch_view();
+            }
+        });
+        ui.label("Tips only draws the contact points. Hiding a piece only changes the view. The slice still includes it.");
+    }
+
     fn model_list(&mut self, ui: &mut egui::Ui) {
         ui.heading("Models");
         ui.label(format!(
@@ -1244,23 +1377,54 @@ impl AmberApp {
         if self.doc.objects.is_empty() {
             ui.label("Open an STL, OBJ, or 3MF, or drop it on the plate.");
         }
+        let rows: Vec<(u64, String, usize)> = self
+            .doc
+            .objects
+            .iter()
+            .map(|obj| {
+                let n = self
+                    .doc
+                    .supports
+                    .iter()
+                    .filter(|s| s.object_id == obj.id)
+                    .count();
+                (obj.id, obj.name.clone(), n)
+            })
+            .collect();
         let mut select = None;
-        for obj in &self.doc.objects {
-            let selected = self.doc.selection == Selection::Object(obj.id);
-            let n = self
-                .doc
-                .supports
-                .iter()
-                .filter(|s| s.object_id == obj.id)
-                .count();
+        let mut toggle = None;
+        for (id, name, n) in rows {
+            let selected = self.doc.selection == Selection::Object(id);
             let label = if n > 0 {
-                format!("{}  ·  {n}", obj.name)
+                format!("{name}  ·  {n}")
             } else {
-                obj.name.clone()
+                name
             };
-            if ui.selectable_label(selected, label).clicked() {
-                select = Some(Selection::Object(obj.id));
+            ui.horizontal(|ui| {
+                let mut shown = !self.hidden_models.contains(&id);
+                if ui
+                    .checkbox(&mut shown, "")
+                    .on_hover_text("Show or hide this model in the view. It still prints.")
+                    .changed()
+                {
+                    toggle = Some((id, shown));
+                }
+                if ui.selectable_label(selected, label).clicked() {
+                    select = Some(Selection::Object(id));
+                }
+            });
+        }
+        if !self.hidden_models.is_empty() && ui.button("Show every model").clicked() {
+            self.hidden_models.clear();
+            self.touch_view();
+        }
+        if let Some((id, shown)) = toggle {
+            if shown {
+                self.hidden_models.remove(&id);
+            } else {
+                self.hidden_models.insert(id);
             }
+            self.touch_view();
         }
         if let Some(sel) = select {
             self.doc.selection = sel;
@@ -1837,6 +2001,10 @@ impl AmberApp {
     fn support_ui(&mut self, ui: &mut egui::Ui) {
         ui.heading("Support");
         ui.label("Tips branch into a shared trunk. Click an underside to add one by hand. Every control here applies only to the selected model.");
+        self.section_controls(ui);
+        ui.add_space(4.0);
+        self.support_visibility(ui);
+        ui.separator();
         let Some(id) = self.doc.edit_target() else {
             ui.label("Select a model first.");
             return;
@@ -2520,6 +2688,7 @@ impl AmberApp {
                 .map(|obj| obj.support.style.overhang_deg)
                 .unwrap_or(45.0)
         });
+        let clip = self.plate_view.section.then_some(self.plate_view.section_z);
         let callback = egui::PaintCallback {
             rect,
             callback: Arc::new(egui_glow::CallbackFn::new(move |info, painter| {
@@ -2539,7 +2708,7 @@ impl AmberApp {
                 if let Some(frame) = &frame {
                     gpu.sync(gl, frame);
                 }
-                gpu.paint(gl, &camera, aspect, overhang);
+                gpu.paint(gl, &camera, aspect, overhang, clip);
             })),
         };
         ui.painter().add(callback);
@@ -2653,12 +2822,18 @@ impl AmberApp {
         let rel_y = (pointer.y - response.rect.top()) / response.rect.height().max(1.0);
         let aspect = (response.rect.width() / response.rect.height().max(1.0)).clamp(0.2, 5.0);
         let (origin, dir) = self.camera.ray(rel_x, rel_y, aspect);
-        if let Some((id, _, _)) = self.doc.raycast(origin, dir) {
+        if let Some((id, _, _)) = self.visible_hit(origin, dir) {
             self.doc.selection = Selection::Object(id);
             self.doc.touch_xform();
             self.part_menu = Some(pointer);
             self.part_menu_fresh = true;
         }
+    }
+
+    fn visible_hit(&self, origin: Vec3, dir: Vec3) -> Option<(u64, Vec3, Vec3)> {
+        let clip = self.plate_view.section.then_some(self.plate_view.section_z);
+        self.doc
+            .raycast_visible(origin, dir, &self.hidden_models, clip)
     }
 
     fn show_help(&mut self, ctx: &egui::Context) {
@@ -2680,6 +2855,7 @@ impl AmberApp {
                 ui.separator();
                 ui.label("Simple is the short path. Workshop is every control: rafts, rest times, compensation, and the rest.");
                 ui.label("Right-click a model for the same edits. Right-drag orbits, and you can swing under the bed. The bed turns clear so you can click an underside.");
+                ui.label("View → Cut the view hides the model above a height, so you can click the surface that is left and place a support there. The checkbox beside a model hides it in the view. It still prints. Tips only draws the contact points.");
                 ui.separator();
                 ui.label("Ctrl+O open    Ctrl+Z undo    Ctrl+D duplicate    Delete remove");
                 ui.label("Ctrl+Enter slice    Ctrl+S save    F1 this page");
@@ -2836,6 +3012,32 @@ impl AmberApp {
             self.grow_supports(true);
             close = true;
         }
+        let hidden = self.hidden_models.contains(&id);
+        if click(
+            ui,
+            if hidden {
+                "Show this model"
+            } else {
+                "Hide this model"
+            },
+        ) {
+            self.toggle_hidden(id);
+            close = true;
+        }
+        if click(ui, "Cut the view through this model") {
+            if let Some((min, max)) = self.doc.object(id).and_then(Document::display_bounds) {
+                self.plate_view.section = true;
+                self.plate_view.section_z = ((min.z + max.z) * 0.5).clamp(0.0, self.machine.size_z);
+                self.touch_view();
+                self.status = "The model above the orange line is hidden. Click the surface you can see to place a support.".into();
+            }
+            close = true;
+        }
+        if click(ui, "Show only the contact points") {
+            self.plate_view.tips_only();
+            self.touch_view();
+            close = true;
+        }
         if click(ui, "Clear supports") {
             if self.doc.clear_supports() {
                 self.invalidate_slice();
@@ -2895,21 +3097,20 @@ impl AmberApp {
         let (origin, dir) = self.camera.ray(rel_x, rel_y, aspect);
         match self.tool {
             Tool::Support => {
-                if let Some((id, point, _)) = self.doc.raycast(origin, dir) {
+                if let Some((id, point, _)) = self.visible_hit(origin, dir) {
                     self.doc.add_support_at(point, id);
                     self.invalidate_slice();
                 }
             }
             Tool::Drain => {
-                if let Some((_, point, normal)) = self.doc.raycast(origin, dir) {
+                if let Some((_, point, normal)) = self.visible_hit(origin, dir) {
                     self.doc.add_drain(point, normal);
                     self.invalidate_slice();
                 }
             }
             Tool::Measure => {
                 let point = self
-                    .doc
-                    .raycast(origin, dir)
+                    .visible_hit(origin, dir)
                     .map(|(_, p, _)| p)
                     .or_else(|| {
                         hit_z(origin, dir, 0.0).filter(|p| {
@@ -2930,7 +3131,7 @@ impl AmberApp {
                 }
             }
             _ => {
-                if let Some((id, _, _)) = self.doc.raycast(origin, dir) {
+                if let Some((id, _, _)) = self.visible_hit(origin, dir) {
                     self.doc.selection = Selection::Object(id);
                 } else {
                     self.doc.selection = Selection::None;

@@ -5,6 +5,7 @@ use crate::slice::{Drain, Hollow, Solid};
 use crate::supports::{self, Support, SupportStyle};
 use anyhow::Result;
 use glam::{EulerRot, Mat4, Quat, Vec3};
+use std::collections::HashSet;
 use std::path::Path;
 
 /// Support and raft settings that belong to one model. Changing them does
@@ -1101,11 +1102,20 @@ impl Document {
 
     /// Rafts and the support forest, each model with its own settings.
     pub fn baked_supports(&self) -> (Vec<Mesh>, Mesh) {
-        let mut rafts = Vec::new();
+        let (rafts, parts) = self.display_supports();
         let mut forest = Mesh {
             vertices: Vec::new(),
             indices: Vec::new(),
         };
+        parts.append_into(&mut forest);
+        (rafts, forest)
+    }
+
+    /// Rafts plus each support piece, so the view can hide a piece.
+    /// The slice uses [`Self::baked_supports`], which joins these pieces back.
+    pub fn display_supports(&self) -> (Vec<Mesh>, supports::SupportParts) {
+        let mut rafts = Vec::new();
+        let mut parts = supports::SupportParts::empty();
         for obj in &self.objects {
             let mine: Vec<Support> = self
                 .supports
@@ -1139,7 +1149,7 @@ impl Document {
             } else {
                 0.0
             };
-            forest.append(&supports::forest_mesh(
+            parts.append(&supports::forest_parts(
                 &mine,
                 style,
                 raft_top,
@@ -1148,7 +1158,7 @@ impl Document {
                 obj.support.brace_angle,
             ));
         }
-        (rafts, forest)
+        (rafts, parts)
     }
 
     pub fn drain_inputs(&self) -> Vec<Drain> {
@@ -1165,14 +1175,34 @@ impl Document {
 
     /// Closest triangle hit. Returns the object id, the point, and the geometric normal.
     pub fn raycast(&self, origin: Vec3, dir: Vec3) -> Option<(u64, Vec3, Vec3)> {
+        self.raycast_visible(origin, dir, &HashSet::new(), None)
+    }
+
+    /// Closest hit on a model that is still shown. `clip_z` drops hits above a
+    /// section plane, so a click lands on the surface the cut left visible.
+    pub fn raycast_visible(
+        &self,
+        origin: Vec3,
+        dir: Vec3,
+        hidden: &HashSet<u64>,
+        clip_z: Option<f32>,
+    ) -> Option<(u64, Vec3, Vec3)> {
         let mut best: Option<(f32, u64, Vec3, Vec3)> = None;
         for obj in &self.objects {
+            if hidden.contains(&obj.id) {
+                continue;
+            }
             let world = Self::world_mesh(obj);
             for tri in world.indices.chunks_exact(3) {
                 let a = Vec3::from_array(world.vertices[tri[0] as usize]);
                 let b = Vec3::from_array(world.vertices[tri[1] as usize]);
                 let c = Vec3::from_array(world.vertices[tri[2] as usize]);
                 if let Some((t, p, n)) = ray_triangle(origin, dir, a, b, c) {
+                    if let Some(z) = clip_z {
+                        if p.z > z + 0.02 {
+                            continue;
+                        }
+                    }
                     if best.map(|(bt, ..)| t < bt).unwrap_or(true) {
                         best = Some((t, obj.id, p, n));
                     }
@@ -1374,5 +1404,31 @@ mod tests {
         assert!(doc.clear_supports());
         assert!(doc.supports.iter().all(|s| s.object_id == b));
         assert_eq!(doc.supports.len(), b_count);
+    }
+
+    #[test]
+    fn a_section_ignores_the_model_above_the_cut() {
+        let mut doc = Document::new();
+        doc.add_mesh("box".into(), box_mesh([0.0, 0.0, 0.0], [10.0, 10.0, 10.0]));
+        let origin = Vec3::new(5.0, 5.0, 30.0);
+        let dir = Vec3::new(0.0, 0.0, -1.0);
+        let (_, top, _) = doc.raycast(origin, dir).unwrap();
+        assert!(top.z > 9.0, "top hit {}", top.z);
+        let (_, cut, _) = doc
+            .raycast_visible(origin, dir, &HashSet::new(), Some(4.0))
+            .unwrap();
+        assert!(cut.z <= 4.05, "section hit {}", cut.z);
+    }
+
+    #[test]
+    fn a_hidden_model_is_not_clickable() {
+        let mut doc = Document::new();
+        let id = doc.add_mesh("box".into(), box_mesh([0.0, 0.0, 0.0], [10.0, 10.0, 10.0]));
+        let origin = Vec3::new(5.0, 5.0, 30.0);
+        let dir = Vec3::new(0.0, 0.0, -1.0);
+        let mut hidden = HashSet::new();
+        hidden.insert(id);
+        assert!(doc.raycast_visible(origin, dir, &hidden, None).is_none());
+        assert!(doc.raycast(origin, dir).is_some());
     }
 }

@@ -102,6 +102,84 @@ pub struct RaftFrame {
     pub tris: Arc<Vec<f32>>,
 }
 
+/// What the plate draws. Hiding a piece does not change the slice.
+#[derive(Clone, Copy, Debug)]
+pub struct PlateView {
+    pub contacts: bool,
+    pub necks: bool,
+    pub trunks: bool,
+    pub feet: bool,
+    pub branches: bool,
+    pub braces: bool,
+    pub rafts: bool,
+    pub section: bool,
+    pub section_z: f32,
+}
+
+impl Default for PlateView {
+    fn default() -> Self {
+        Self {
+            contacts: true,
+            necks: true,
+            trunks: true,
+            feet: true,
+            branches: true,
+            braces: true,
+            rafts: true,
+            section: false,
+            section_z: 10.0,
+        }
+    }
+}
+
+impl PlateView {
+    pub fn tips_only(&mut self) {
+        self.contacts = true;
+        self.necks = false;
+        self.trunks = false;
+        self.feet = false;
+        self.branches = false;
+        self.braces = false;
+        self.rafts = false;
+    }
+
+    pub fn show_all_pieces(&mut self) {
+        self.contacts = true;
+        self.necks = true;
+        self.trunks = true;
+        self.feet = true;
+        self.branches = true;
+        self.braces = true;
+        self.rafts = true;
+    }
+
+    fn piece_bits(&self) -> u64 {
+        let mut bits = 0u64;
+        if self.contacts {
+            bits |= 1;
+        }
+        if self.necks {
+            bits |= 2;
+        }
+        if self.trunks {
+            bits |= 4;
+        }
+        if self.feet {
+            bits |= 8;
+        }
+        if self.branches {
+            bits |= 16;
+        }
+        if self.braces {
+            bits |= 32;
+        }
+        if self.rafts {
+            bits |= 64;
+        }
+        bits
+    }
+}
+
 pub struct ViewCache {
     world_gen: u64,
     world: Arc<Vec<f32>>,
@@ -121,19 +199,45 @@ impl ViewCache {
         }
     }
 
-    pub fn frame(&mut self, doc: &Document, plate: Vec3, selection: Selection) -> PlateFrame {
-        let world_gen = world_stamp(doc.structure, plate, selection);
+    pub fn frame(
+        &mut self,
+        doc: &Document,
+        plate: Vec3,
+        selection: Selection,
+        view: &PlateView,
+        hidden: &HashSet<u64>,
+    ) -> PlateFrame {
+        let world_gen = world_stamp(doc.structure, plate, selection, view);
         if world_gen != self.world_gen {
             let mut tris = Vec::new();
             let mut lines = Vec::new();
             let mut bed = Vec::new();
             push_bed(&mut bed, plate);
             push_plate_lines(&mut lines, plate);
-            let (rafts, forest) = doc.baked_supports();
-            for raft in &rafts {
-                push_mesh_flat(&mut tris, raft, [0.45, 0.38, 0.28]);
+            let (rafts, parts) = doc.display_supports();
+            if view.rafts {
+                for raft in &rafts {
+                    push_mesh_flat(&mut tris, raft, [0.45, 0.38, 0.28]);
+                }
             }
-            push_mesh_flat(&mut tris, &forest, [0.22, 0.55, 0.52]);
+            if view.contacts {
+                push_mesh_flat(&mut tris, &parts.contacts, [0.93, 0.62, 0.28]);
+            }
+            if view.necks {
+                push_mesh_flat(&mut tris, &parts.necks, [0.36, 0.70, 0.58]);
+            }
+            if view.trunks {
+                push_mesh_flat(&mut tris, &parts.trunks, [0.22, 0.55, 0.52]);
+            }
+            if view.feet {
+                push_mesh_flat(&mut tris, &parts.feet, [0.55, 0.42, 0.30]);
+            }
+            if view.branches {
+                push_mesh_flat(&mut tris, &parts.branches, [0.30, 0.58, 0.46]);
+            }
+            if view.braces {
+                push_mesh_flat(&mut tris, &parts.braces, [0.38, 0.50, 0.68]);
+            }
             if let Selection::Support(id) = selection {
                 if let Some(support) = doc.supports.iter().find(|s| s.id == id) {
                     let style = doc
@@ -142,7 +246,7 @@ impl ViewCache {
                         .unwrap_or(doc.style);
                     push_mesh_flat(
                         &mut tris,
-                        &supports::tip_marker(support, &style),
+                        &supports::contact_marker(support, &style),
                         [0.95, 0.78, 0.35],
                     );
                 }
@@ -166,6 +270,9 @@ impl ViewCache {
         let mut objects = Vec::with_capacity(doc.objects.len());
         let mut live_locals = HashSet::new();
         for obj in &doc.objects {
+            if hidden.contains(&obj.id) {
+                continue;
+            }
             let selected = selection == Selection::Object(obj.id);
             let outside = Document::display_bounds(obj).is_some_and(|(min, max)| {
                 min.x < -0.2
@@ -204,6 +311,19 @@ impl ViewCache {
             }
         }
         self.locals.retain(|key, _| live_locals.contains(key));
+        if view.section {
+            let z = view.section_z.clamp(0.0, plate.z.max(0.0));
+            let color = [0.95, 0.55, 0.18];
+            let corners = [
+                [0.0, 0.0, z],
+                [plate.x, 0.0, z],
+                [plate.x, plate.y, z],
+                [0.0, plate.y, z],
+            ];
+            for i in 0..4 {
+                push_line(&mut lines, corners[i], corners[(i + 1) % 4], color);
+            }
+        }
         PlateFrame {
             world_gen,
             world: self.world.clone(),
@@ -226,7 +346,7 @@ fn quant(v: f32) -> i32 {
     (v * 100.0).round() as i32
 }
 
-fn world_stamp(structure: u64, plate: Vec3, selection: Selection) -> u64 {
+fn world_stamp(structure: u64, plate: Vec3, selection: Selection, view: &PlateView) -> u64 {
     let sel = match selection {
         Selection::Support(id) => id.wrapping_add(1),
         Selection::Drain(id) => id.wrapping_add(0x1000_0001),
@@ -238,6 +358,7 @@ fn world_stamp(structure: u64, plate: Vec3, selection: Selection) -> u64 {
         quant(plate.y) as u64,
         quant(plate.z) as u64,
         sel,
+        view.piece_bits(),
     ] {
         h = h.wrapping_mul(0x9E3779B1).wrapping_add(n);
     }
@@ -433,7 +554,12 @@ uniform vec3 u_eye;
 uniform float u_alpha;
 uniform float u_show_overhang;
 uniform float u_overhang_deg;
+uniform float u_clip_on;
+uniform float u_clip_z;
 void main() {
+    if (u_clip_on > 0.5 && v_pos.z > u_clip_z) {
+        discard;
+    }
     float len2 = dot(v_nrm, v_nrm);
     vec3 n = len2 > 1e-8 ? normalize(v_nrm) : vec3(0.0, 0.0, 1.0);
     if (!gl_FrontFacing) { n = -n; }
@@ -511,6 +637,8 @@ struct SolidLocs {
     alpha: Option<glow::UniformLocation>,
     show_overhang: Option<glow::UniformLocation>,
     overhang_deg: Option<glow::UniformLocation>,
+    clip_on: Option<glow::UniformLocation>,
+    clip_z: Option<glow::UniformLocation>,
 }
 
 pub struct Renderer {
@@ -546,6 +674,8 @@ impl Renderer {
                 alpha: gl.get_uniform_location(program, "u_alpha"),
                 show_overhang: gl.get_uniform_location(program, "u_show_overhang"),
                 overhang_deg: gl.get_uniform_location(program, "u_overhang_deg"),
+                clip_on: gl.get_uniform_location(program, "u_clip_on"),
+                clip_z: gl.get_uniform_location(program, "u_clip_z"),
             };
             let line_mvp = gl.get_uniform_location(line_program, "u_mvp");
             let line_vao = gl.create_vertex_array().map_err(|e| e.to_string())?;
@@ -666,6 +796,7 @@ impl Renderer {
         camera: &Camera,
         aspect: f32,
         overhang_deg: Option<f32>,
+        clip_z: Option<f32>,
     ) {
         unsafe {
             let vp = camera.view_proj(aspect);
@@ -688,6 +819,8 @@ impl Renderer {
                 self.locs.overhang_deg.as_ref(),
                 overhang_deg.unwrap_or(45.0),
             );
+            gl.uniform_1_f32(self.locs.clip_on.as_ref(), 0.0);
+            gl.uniform_1_f32(self.locs.clip_z.as_ref(), clip_z.unwrap_or(0.0));
             let under = camera.under_bed();
             if !under {
                 self.draw_solid(
@@ -716,10 +849,14 @@ impl Renderer {
             if overhang_deg.is_some() {
                 gl.uniform_1_f32(self.locs.show_overhang.as_ref(), 1.0);
             }
+            if clip_z.is_some() {
+                gl.uniform_1_f32(self.locs.clip_on.as_ref(), 1.0);
+            }
             for obj in &self.objects {
                 self.draw_solid(gl, &obj.batches, obj.model, obj.color, 1.0, 1.0, vp);
             }
             gl.uniform_1_f32(self.locs.show_overhang.as_ref(), 0.0);
+            gl.uniform_1_f32(self.locs.clip_on.as_ref(), 0.0);
             if under {
                 gl.enable(glow::BLEND);
                 gl.blend_func(glow::SRC_ALPHA, glow::ONE_MINUS_SRC_ALPHA);
