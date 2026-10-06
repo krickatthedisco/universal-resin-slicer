@@ -1,6 +1,6 @@
 # Amber
 
-Amber is a desktop resin slicer. The machine it was built around is the **Anycubic Photon M3 Max** (298.08 × 165.6 × 300 mm, 6480×3600, 46 µm). It also knows the build volume and pixel grid of the other printers in the UVtools printer list, and it can write a Photon Workshop **v516** file for the machines whose profile is version 516. Every printer can be saved as an open `.sl1` zip. Encrypted CTB, GOO, and similar files are not written.
+Amber is a desktop resin slicer. The machine it was built around is the **Anycubic Photon M3 Max** (298.08 × 165.6 × 300 mm, 6480×3600, 46 µm). It also knows the build volume and pixel grid of the other printers in the UVtools printer list. The save dialog defaults to the file that printer reads when Amber can write it: Photon Workshop **v516** (`.pm3m` and the other v516 suffixes), unencrypted Chitubox **`.ctb`**, Prusa **`.sl1`**, or a PNG layer zip (`.cws`, `.zip`, NanoDLP). You can pick any of those four for any printer. Encrypted CTB, GOO, and the other locked containers are not written; those machines default to `.sl1`.
 
 The window is a native app (Rust, egui, OpenGL), version 0.1.0. The same program builds on Windows and on Linux. It is not a web app.
 
@@ -53,7 +53,7 @@ Amber is not affiliated with Anycubic or Elegoo. A resin row is copied from a ma
 - Fill enclosed voids heals speckled gaps and cures accidental pockets. A model you hollowed stays empty. Drains are cut after the fill. Rest before the cure and rest after the lift are added to the light-off the Photon file stores, and counted once in the time estimate. Image blur is off until you set it.
 - Layer preview with a vertical bar on the right: step up or down one layer, drag the bar, or type a layer number. A new slice opens on the last layer. Islands are tinted, and a layer that seals a cavity is called out. The same islands are red marks on the plate. Click a mark with Support to plant a tip there. Marks stay until a model moves.
 - The plate uses a 24-bit depth buffer and smooth shading, the same way PrusaSlicer and OrcaSlicer draw a solid STL, so the front of the shell hides the inside. Dragging right turns the build plate to the right. Moving a model sends a new matrix; the sculpt and the support forest stay on the GPU until the mesh or the supports change.
-- Volume, weight, and a time estimate. Export the native v516 file when the printer has one, or `.sl1` for every machine, or one layer as PNG.
+- Volume, weight, and a time estimate. Export defaults to the file the selected printer reads. Photon Workshop v516, unencrypted CTB, Prusa SL1, and a PNG layer zip are all in the file-format menu. One layer can also be saved as PNG.
 - Large meshes stay on the CPU path that only clips triangles crossing the current layer, and each scanline only tests the edges that cross it. Layers are rasterized in parallel, several bands of height per core so a wide base does not stall the top. Islands and sealed pockets are finished in order afterwards, because those depend on the previous layer. The island scan keeps one visited mask for the whole height and restamps it, instead of allocating a new one every layer. The slice bar estimates the time left. The layer view splits the print time into light and lifting.
 - Settings persist between launches.
 
@@ -65,7 +65,7 @@ The slicer keeps empty layers under a floating part. The printer stacks exposure
 amber slice model.stl -o model.pm3m --printer anycubic-photon-m3-max --layer 0.05 --exposure 3 --supports medium --hollow 2.0
 ```
 
-`--printer` is a catalog id such as `anycubic-photon-m3-max` or `elegoo-mars-4`. `--supports` is `none`, `light`, `medium`, `heavy`, or `hairpin`. Layer height is clamped to 0.01–0.20 mm. The CLI uses the Colored UV starting point unless you pass `--exposure`. A printer without a v516 profile is written as `.sl1` even if the output name says otherwise. Pass `-o file.sl1` to force that zip on a Photon machine.
+`--printer` is a catalog id such as `anycubic-photon-m3-max` or `elegoo-mars-4`. `--supports` is `none`, `light`, `medium`, `heavy`, or `hairpin`. Layer height is clamped to 0.01–0.20 mm. The CLI uses the Colored UV starting point unless you pass `--exposure`. The output suffix picks the container: `.pm3m` (and the other v516 suffixes), `.ctb`, `.sl1`, `.cws`, or `.zip`. With any other suffix, Amber writes the printer's default format into that path.
 
 ## Build
 
@@ -96,11 +96,11 @@ cargo build --release --target x86_64-pc-windows-gnu
 
 ## File format
 
-Photon Workshop v516 (`.pm3m` and the other v516 suffixes in the catalog) uses `pw0Img` run-length layers and a 224 × 168 preview. The M3 Max file is 6480 × 3600 at 46 µm. Each layer record stores that layer's thickness, not an absolute Z. Motion in the file is single-stage. Anti-aliasing is 1, 2, 4, or 8 levels. `.sl1` is a zip of `config.ini` plus one grayscale PNG per layer.
+Photon Workshop v516 (`.pm3m` and the other v516 suffixes in the catalog) uses `pw0Img` run-length layers and a 224 × 168 preview. The M3 Max file is 6480 × 3600 at 46 µm. Each layer record stores that layer's thickness, not an absolute Z. Motion in the file is single-stage. Anti-aliasing is 1, 2, 4, or 8 levels. Unencrypted `.ctb` is the Catibo layout (magic `0x12FD0086`, version 2, RLE7 layers, encryption key 0). `.sl1` and the PNG zip are a zip of `config.ini` plus one grayscale PNG per layer.
 
 ## Not in this version
 
-- Encrypted or proprietary printer files (CTB, GOO, and the rest). Those machines export `.sl1` for a converter.
+- Encrypted CTB, GOO, and the other locked printer files. Those machines export `.sl1` unless you pick another open format from the menu. CTB version 4 is in that group; the CTB menu item is the unencrypted version 3 container.
 - Mesh-boolean union. Overlapping solids are unioned in the raster.
 - Variable layer height, two-stage lift as its own mode, and a measured exposure for every resin on every printer.
 - Live re-slice while you drag a model.

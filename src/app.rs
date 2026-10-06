@@ -2,16 +2,15 @@
 
 use crate::catalog;
 use crate::community;
+use crate::formats::{self, format_from_extension};
 use crate::mesh::{calibration_cube, overhang_bridge};
 use crate::plate::{self, PlateData};
-use crate::pm3m::write_pm3m;
-use crate::printer::{Machine, PrintSettings};
+use crate::printer::{Machine, PrintFormat, PrintSettings};
 use crate::resins::{self, Resin, ResinProfile};
 use crate::scene::{Document, Selection};
-use crate::sl1::write_sl1;
 use crate::slice::{self, Slice};
-use crate::supports::PRESETS;
-use crate::viewport::{self, Camera, PlateFrame, PlateView, Renderer, ViewCache};
+use crate::supports::{SectionShape, PRESETS};
+use crate::viewport::{self, Camera, LayerSheet, PlateFrame, PlateView, Renderer, ViewCache};
 use eframe::egui;
 use glam::Vec3;
 use glow::HasContext;
@@ -203,6 +202,14 @@ pub struct AmberApp {
     /// The tip whose X/Y fields already have one undo snapshot for this edit.
     tip_field_for: Option<u64>,
     plate_view: PlateView,
+    /// 0 follows the printer. 1 photon, 2 ctb, 3 sl1, 4 png zip.
+    export_as: u8,
+    /// Draw the current sliced layer on the prepare plate.
+    show_plate_layer: bool,
+    /// Hide the model above the layer while that sheet is on.
+    cut_at_layer: bool,
+    sheet_for: Option<(usize, &'static str)>,
+    sheet: Option<LayerSheet>,
     /// Models left out of the plate view. They still slice.
     hidden_models: HashSet<u64>,
     view_rev: u64,
@@ -346,6 +353,11 @@ impl AmberApp {
             stroke_saved: false,
             tip_field_for: None,
             plate_view,
+            export_as: 0,
+            show_plate_layer: true,
+            cut_at_layer: true,
+            sheet_for: None,
+            sheet: None,
             hidden_models: HashSet::new(),
             view_rev: 0,
             view_drawn: 0,
@@ -364,6 +376,7 @@ impl AmberApp {
         self.slice = None;
         self.preview_tex = None;
         self.preview_for = None;
+        self.sheet_for = None;
     }
 
     fn poll_job(&mut self, ctx: &egui::Context) {
@@ -424,9 +437,10 @@ impl AmberApp {
                 self.slice_gen = generation;
                 self.preview_index = layers.saturating_sub(1);
                 self.preview_for = None;
+                self.sheet_for = None;
                 self.view = View::Preview;
                 if export_after {
-                    self.export_print(false);
+                    self.export_print(None);
                 }
             }
             Ok(_) => {
@@ -485,7 +499,50 @@ impl AmberApp {
         self.status = "Slicing…".into();
     }
 
-    fn export_print(&mut self, force_sl1: bool) {
+    fn chosen_format(&self) -> PrintFormat {
+        match self.export_as {
+            1 => PrintFormat::Photon516,
+            2 => PrintFormat::Ctb,
+            3 => PrintFormat::Sl1,
+            4 => PrintFormat::PngZip,
+            _ => self.machine.default_format(),
+        }
+    }
+
+    fn set_export_ext(&mut self, ext: &str) {
+        let stem = self
+            .export_name
+            .rsplit_once('.')
+            .map(|(stem, _)| stem)
+            .unwrap_or(self.export_name.as_str());
+        self.export_name = format!("{stem}.{ext}");
+    }
+
+    fn format_combo(&mut self, ui: &mut egui::Ui) {
+        let auto = self.machine.default_format();
+        let mut pick = self.export_as;
+        let selected = if self.export_as == 0 {
+            format!("{} (this printer)", auto.label())
+        } else {
+            self.chosen_format().label().to_string()
+        };
+        egui::ComboBox::from_label("File format")
+            .selected_text(selected)
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut pick, 0, format!("{} (this printer)", auto.label()));
+                ui.selectable_value(&mut pick, 1, PrintFormat::Photon516.label());
+                ui.selectable_value(&mut pick, 2, PrintFormat::Ctb.label());
+                ui.selectable_value(&mut pick, 3, PrintFormat::Sl1.label());
+                ui.selectable_value(&mut pick, 4, PrintFormat::PngZip.label());
+            });
+        if pick != self.export_as {
+            self.export_as = pick;
+            let ext = self.machine.format_extension(self.chosen_format());
+            self.set_export_ext(ext);
+        }
+    }
+
+    fn export_print(&mut self, force: Option<PrintFormat>) {
         let Some(slice) = &self.slice else {
             self.start_slice(true);
             return;
@@ -494,49 +551,50 @@ impl AmberApp {
             self.start_slice(true);
             return;
         }
-        let native = self.machine.native_photon && !force_sl1;
-        let ext = if native {
-            self.machine.extension
-        } else {
-            "sl1"
-        };
+        let chosen = force.unwrap_or_else(|| self.chosen_format());
+        let ext = self.machine.format_extension(chosen);
         let name = sanitize_filename(&self.export_name, ext);
-        if native && name.len() > 24 {
+        if chosen == PrintFormat::Photon516 && name.len() > 24 {
             self.status = format!(
                 "Keep the file name short. {} skips very long names on the USB stick.",
                 self.machine.name
             );
         }
-        let filter_name = if native {
-            format!("Photon Workshop v516 (.{})", self.machine.extension)
-        } else {
-            "Prusa SL1".into()
-        };
-        let Some(path) = rfd::FileDialog::new()
-            .set_file_name(&name)
-            .add_filter(&filter_name, &[ext])
-            .save_file()
-        else {
+        let mut dialog = rfd::FileDialog::new().set_file_name(&name);
+        let mut seen: Vec<&str> = Vec::new();
+        for format in [
+            chosen,
+            PrintFormat::Photon516,
+            PrintFormat::Ctb,
+            PrintFormat::Sl1,
+            PrintFormat::PngZip,
+        ] {
+            let filter_ext = self.machine.format_extension(format);
+            if seen.contains(&filter_ext) {
+                continue;
+            }
+            seen.push(filter_ext);
+            dialog = dialog.add_filter(
+                &format!("{} (.{filter_ext})", format.label()),
+                &[filter_ext],
+            );
+        }
+        let Some(path) = dialog.save_file() else {
             return;
         };
-        let written = if native {
-            write_pm3m(&path, slice, self.machine, &self.settings)
-        } else {
-            write_sl1(&path, slice, self.machine, &self.settings)
-        };
+        let format = path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .and_then(format_from_extension)
+            .unwrap_or(chosen);
+        let written = formats::write_print(&path, slice, self.machine, &self.settings, format);
         match written {
             Ok(()) => {
-                let note = if native {
-                    "copy it to a USB stick and print from the machine"
-                } else if self.machine.native_photon {
-                    "open .sl1 in a converter if you want a different file"
-                } else {
-                    "this printer does not read .sl1 directly; convert it, or use it to check the layers"
-                };
                 self.status = format!(
-                    "Wrote {} · {:.1} MB · {note}.",
+                    "Wrote {} · {:.1} MB. {}",
                     path.display(),
-                    slice_bytes(slice) as f64 / 1_048_576.0
+                    slice_bytes(slice) as f64 / 1_048_576.0,
+                    formats::describe(self.machine, format)
                 );
             }
             Err(err) => self.status = format!("Could not write the file: {err}"),
@@ -664,6 +722,8 @@ impl AmberApp {
             let mirror_x = data.mirror_x;
             let mirror_y = data.mirror_y;
             self.machine = Machine::from_profile(profile);
+            self.export_as = 0;
+            self.sheet_for = None;
             self.machine.rotate_180 = rotate;
             self.machine.mirror_x = mirror_x;
             self.machine.mirror_y = mirror_y;
@@ -754,7 +814,7 @@ impl AmberApp {
             self.save_plate(false);
         }
         if save && self.job.is_none() {
-            self.export_print(false);
+            self.export_print(None);
         }
         if undo {
             self.undo_edit();
@@ -1075,17 +1135,17 @@ impl AmberApp {
                     self.start_slice(true);
                     ui.close();
                 }
-                let export_label = if self.machine.native_photon {
-                    format!("Export .{}…", self.machine.extension)
-                } else {
-                    "Export .sl1…".into()
-                };
+                let export_label = format!(
+                    "Export .{}…",
+                    self.machine.format_extension(self.chosen_format())
+                );
                 if ui.button(export_label).clicked() {
-                    self.export_print(false);
+                    self.export_print(None);
                     ui.close();
                 }
-                if self.machine.native_photon && ui.button("Export .sl1…").clicked() {
-                    self.export_print(true);
+                if self.chosen_format() != PrintFormat::Sl1 && ui.button("Export .sl1…").clicked()
+                {
+                    self.export_print(Some(PrintFormat::Sl1));
                     ui.close();
                 }
                 if ui.button("Export preview PNG…").clicked() {
@@ -1125,7 +1185,7 @@ impl AmberApp {
                     .add_enabled(!slicing, egui::Button::new("Export"))
                     .clicked()
                 {
-                    self.export_print(false);
+                    self.export_print(None);
                 }
                 let slice = egui::Button::new("Slice").fill(egui::Color32::from_rgb(224, 122, 47));
                 if ui.add_enabled(!slicing, slice).clicked() {
@@ -1388,10 +1448,16 @@ impl AmberApp {
         self.model_list(ui);
         ui.separator();
         self.section_controls(ui);
-        if ui.button("Show only the contact points").clicked() {
-            self.plate_view.tips_only();
-            self.touch_view();
-        }
+        ui.horizontal_wrapped(|ui| {
+            if ui.button("Show only the contact points").clicked() {
+                self.plate_view.tips_only();
+                self.touch_view();
+            }
+            if ui.button("Show all pieces").clicked() {
+                self.plate_view.show_all_pieces();
+                self.touch_view();
+            }
+        });
         ui.separator();
         ui.strong("Before you print");
         for line in self.readiness() {
@@ -1419,6 +1485,7 @@ impl AmberApp {
         }
         ui.add_space(8.0);
         ui.label("File name on the USB stick");
+        self.format_combo(ui);
         ui.text_edit_singleline(&mut self.export_name);
         ui.label("Keep it short. The Photon skips a very long name.");
         if ui.button("Save this plate…").clicked() {
@@ -2376,6 +2443,7 @@ impl AmberApp {
             "mm",
         );
         changed |= ui.checkbox(&mut style.ball, "Ball contact").changed();
+        ui.strong("Tip");
         ui.label(if style.ball {
             "Ball contact: a sphere bitten into the surface."
         } else {
@@ -2426,6 +2494,7 @@ impl AmberApp {
             8.0,
             "mm",
         );
+        ui.strong("Middle");
         changed |= drag_f32(
             ui,
             "Trunk diameter",
@@ -2435,6 +2504,22 @@ impl AmberApp {
             5.0,
             "mm",
         );
+        let before_shape = style.section;
+        egui::ComboBox::from_label("Cross section")
+            .selected_text(style.section.label())
+            .show_ui(ui, |ui| {
+                for shape in [
+                    SectionShape::Hexagon,
+                    SectionShape::Round,
+                    SectionShape::Square,
+                ] {
+                    ui.selectable_value(&mut style.section, shape, shape.label());
+                }
+            });
+        if style.section != before_shape {
+            changed = true;
+        }
+        ui.label("Hexagon is the usual pillar. The diameter is measured flat to flat.");
         changed |= drag_f32(
             ui,
             "Branch angle",
@@ -2453,6 +2538,7 @@ impl AmberApp {
             20.0,
             "mm",
         );
+        ui.strong("Foot");
         changed |= drag_f32(ui, "Foot height", &mut style.foot_mm, 0.02, 0.2, 3.0, "mm");
         let mut foot_diam = if style.foot_diam_mm > 0.05 {
             style.foot_diam_mm
@@ -2567,6 +2653,8 @@ impl AmberApp {
             return;
         };
         self.machine = Machine::from_profile(profile);
+        self.export_as = 0;
+        self.sheet_for = None;
         self.settings.light_off_s = profile.light_off_s;
         self.settings.lift_mm = profile.lift_mm.max(1.0);
         self.settings.lift_speed = profile.lift_speed;
@@ -2637,15 +2725,15 @@ impl AmberApp {
             self.machine.size_y,
             self.machine.size_z
         ));
-        if self.machine.native_photon {
-            ui.label(format!(
-                "Writes Photon Workshop v{} .{}",
-                self.machine.file_version, self.machine.extension
-            ));
+        self.format_combo(ui);
+        let format = self.chosen_format();
+        let ext = self.machine.format_extension(format);
+        if self.machine.reads_format(format) {
+            ui.label(format!("Saves .{ext}, which {} reads.", self.machine.name));
         } else {
             ui.label(format!(
-                "Writes .sl1. This printer reads .{} ({}), which Amber does not encode.",
-                self.machine.printer_extension, self.machine.format_name
+                "Saves .{ext}. {} reads .{} ({}), which Amber does not encode.",
+                self.machine.name, self.machine.printer_extension, self.machine.format_name
             ));
         }
         ui.strong("Printer");
@@ -2897,23 +2985,15 @@ impl AmberApp {
             {
                 self.start_slice(false);
             }
-            let export_label = if self.machine.native_photon {
-                format!("Export .{}", self.machine.extension)
-            } else {
-                "Export .sl1".to_string()
-            };
+            let export_label = format!(
+                "Export .{}",
+                self.machine.format_extension(self.chosen_format())
+            );
             if ui
                 .add_enabled(!slicing, egui::Button::new(export_label))
                 .clicked()
             {
-                self.export_print(false);
-            }
-            if self.machine.native_photon
-                && ui
-                    .add_enabled(!slicing, egui::Button::new("Export .sl1"))
-                    .clicked()
-            {
-                self.export_print(true);
+                self.export_print(None);
             }
             if slicing && ui.button("Cancel").clicked() {
                 if let Some(job) = &self.job {
@@ -2936,6 +3016,73 @@ impl AmberApp {
     }
 
     fn viewport(&mut self, ui: &mut egui::Ui) {
+        let count = self.slice.as_ref().map(|s| s.layers.len()).unwrap_or(0);
+        if count == 0 {
+            self.viewport_scene(ui);
+            return;
+        }
+        let avail = ui.available_size();
+        let bar = 96.0;
+        ui.horizontal(|ui| {
+            ui.allocate_ui_with_layout(
+                egui::vec2((avail.x - bar - 8.0).max(1.0), avail.y),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| self.viewport_scene(ui),
+            );
+            ui.allocate_ui_with_layout(
+                egui::vec2(bar, avail.y),
+                egui::Layout::top_down(egui::Align::Center),
+                |ui| {
+                    ui.checkbox(&mut self.show_plate_layer, "On plate")
+                        .on_hover_text(
+                            "Draw this sliced layer on the bed, in the same pixels the file will cure.",
+                        );
+                    ui.checkbox(&mut self.cut_at_layer, "Cut model")
+                        .on_hover_text(
+                            "Hide the model above this layer so you can see the pixels on the cut.",
+                        );
+                    self.layer_bar(ui, count);
+                },
+            );
+        });
+    }
+
+    fn prepare_sheet(&mut self) -> Option<LayerSheet> {
+        let slice = self.slice.as_ref()?;
+        if slice.layers.is_empty() {
+            return None;
+        }
+        let index = self.preview_index.min(slice.layers.len() - 1);
+        let machine_id = self.machine.id;
+        if self.sheet_for != Some((index, machine_id)) {
+            let layer = slice.layers.get(index)?;
+            let (w, h, rgba) =
+                slice::layer_on_plate(&layer.rle, slice.width, slice.height, self.machine, 512)
+                    .ok()?;
+            let mut key = index as u64;
+            for byte in machine_id.bytes() {
+                key = key.wrapping_mul(131).wrapping_add(byte as u64);
+            }
+            self.sheet = Some(LayerSheet {
+                key,
+                w: w as i32,
+                h: h as i32,
+                rgba: Arc::new(rgba),
+                z: layer.z_top_mm,
+                size_x: self.machine.size_x,
+                size_y: self.machine.size_y,
+            });
+            self.sheet_for = Some((index, machine_id));
+        }
+        let z = slice.layers.get(index)?.z_top_mm;
+        let mut sheet = self.sheet.clone()?;
+        sheet.z = z;
+        sheet.size_x = self.machine.size_x;
+        sheet.size_y = self.machine.size_y;
+        Some(sheet)
+    }
+
+    fn viewport_scene(&mut self, ui: &mut egui::Ui) {
         let response = ui.allocate_response(ui.available_size(), egui::Sense::click_and_drag());
         let rect = response.rect;
         if response.hovered() {
@@ -3019,7 +3166,20 @@ impl AmberApp {
                 .map(|obj| obj.support.style.overhang_deg)
                 .unwrap_or(45.0)
         });
-        let clip = self.plate_view.section.then_some(self.plate_view.section_z);
+        let count = self.slice.as_ref().map(|s| s.layers.len()).unwrap_or(0);
+        let sheet = if count > 0 && self.show_plate_layer {
+            self.prepare_sheet()
+        } else {
+            None
+        };
+        let clip = if count > 0 && self.show_plate_layer && self.cut_at_layer {
+            self.slice.as_ref().and_then(|slice| {
+                let index = self.preview_index.min(slice.layers.len().saturating_sub(1));
+                slice.layers.get(index).map(|layer| layer.z_top_mm)
+            })
+        } else {
+            self.plate_view.section.then_some(self.plate_view.section_z)
+        };
         let callback = egui::PaintCallback {
             rect,
             callback: Arc::new(egui_glow::CallbackFn::new(move |info, painter| {
@@ -3039,7 +3199,7 @@ impl AmberApp {
                 if let Some(frame) = &frame {
                     gpu.sync(gl, frame);
                 }
-                gpu.paint(gl, &camera, aspect, overhang, clip);
+                gpu.paint(gl, &camera, aspect, overhang, clip, sheet.as_ref());
             })),
         };
         ui.painter().add(callback);
@@ -3568,6 +3728,11 @@ impl AmberApp {
         }
         if click(ui, "Show only the contact points") {
             self.plate_view.tips_only();
+            self.touch_view();
+            close = true;
+        }
+        if click(ui, "Show all pieces") {
+            self.plate_view.show_all_pieces();
             self.touch_view();
             close = true;
         }

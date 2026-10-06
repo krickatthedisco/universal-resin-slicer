@@ -600,6 +600,42 @@ void main() {
 }
 "#;
 
+const SHEET_VERT: &str = r#"
+layout(location = 0) in vec3 a_pos;
+layout(location = 1) in vec2 a_uv;
+uniform mat4 u_mvp;
+out vec2 v_uv;
+void main() {
+    v_uv = a_uv;
+    gl_Position = u_mvp * vec4(a_pos, 1.0);
+}
+"#;
+
+const SHEET_FRAG: &str = r#"
+in vec2 v_uv;
+out vec4 out_color;
+uniform sampler2D u_tex;
+void main() {
+    vec4 c = texture(u_tex, v_uv);
+    if (c.a < 0.04) {
+        discard;
+    }
+    out_color = vec4(c.rgb, c.a * 0.92);
+}
+"#;
+
+/// One sliced layer, laid on the plate in millimetres.
+#[derive(Clone)]
+pub struct LayerSheet {
+    pub key: u64,
+    pub w: i32,
+    pub h: i32,
+    pub rgba: Arc<Vec<u8>>,
+    pub z: f32,
+    pub size_x: f32,
+    pub size_y: f32,
+}
+
 struct Batch {
     vao: glow::VertexArray,
     vbo: glow::Buffer,
@@ -644,8 +680,10 @@ struct SolidLocs {
 pub struct Renderer {
     program: glow::Program,
     line_program: glow::Program,
+    sheet_program: glow::Program,
     locs: SolidLocs,
     line_mvp: Option<glow::UniformLocation>,
+    sheet_mvp: Option<glow::UniformLocation>,
     world: MeshGpu,
     bed: MeshGpu,
     world_gen: u64,
@@ -655,6 +693,10 @@ pub struct Renderer {
     line_vbo: glow::Buffer,
     line_verts: i32,
     line_gen: u64,
+    sheet_vao: glow::VertexArray,
+    sheet_vbo: glow::Buffer,
+    sheet_tex: glow::Texture,
+    sheet_key: u64,
 }
 
 impl Renderer {
@@ -662,6 +704,7 @@ impl Renderer {
         unsafe {
             let program = link(gl, VERT, FRAG)?;
             let line_program = link(gl, LINE_VERT, LINE_FRAG)?;
+            let sheet_program = link(gl, SHEET_VERT, SHEET_FRAG)?;
             let locs = SolidLocs {
                 mvp: gl.get_uniform_location(program, "u_mvp"),
                 model: gl.get_uniform_location(program, "u_model"),
@@ -678,13 +721,19 @@ impl Renderer {
                 clip_z: gl.get_uniform_location(program, "u_clip_z"),
             };
             let line_mvp = gl.get_uniform_location(line_program, "u_mvp");
+            let sheet_mvp = gl.get_uniform_location(sheet_program, "u_mvp");
             let line_vao = gl.create_vertex_array().map_err(|e| e.to_string())?;
             let line_vbo = gl.create_buffer().map_err(|e| e.to_string())?;
+            let sheet_vao = gl.create_vertex_array().map_err(|e| e.to_string())?;
+            let sheet_vbo = gl.create_buffer().map_err(|e| e.to_string())?;
+            let sheet_tex = gl.create_texture().map_err(|e| e.to_string())?;
             Ok(Self {
                 program,
                 line_program,
+                sheet_program,
                 locs,
                 line_mvp,
+                sheet_mvp,
                 world: MeshGpu {
                     batches: Vec::new(),
                 },
@@ -698,6 +747,10 @@ impl Renderer {
                 line_vbo,
                 line_verts: 0,
                 line_gen: u64::MAX,
+                sheet_vao,
+                sheet_vbo,
+                sheet_tex,
+                sheet_key: u64::MAX,
             })
         }
     }
@@ -791,12 +844,13 @@ impl Renderer {
     }
 
     pub fn paint(
-        &self,
+        &mut self,
         gl: &glow::Context,
         camera: &Camera,
         aspect: f32,
         overhang_deg: Option<f32>,
         clip_z: Option<f32>,
+        sheet: Option<&LayerSheet>,
     ) {
         unsafe {
             let vp = camera.view_proj(aspect);
@@ -874,12 +928,87 @@ impl Renderer {
                 gl.disable(glow::BLEND);
             }
 
+            if let Some(sheet) = sheet {
+                self.draw_sheet(gl, vp, sheet);
+            }
+
             gl.use_program(Some(self.line_program));
             gl.uniform_matrix_4_f32_slice(self.line_mvp.as_ref(), false, vp.as_ref());
             gl.bind_vertex_array(Some(self.line_vao));
             gl.draw_arrays(glow::LINES, 0, self.line_verts);
             gl.bind_vertex_array(None);
             gl.disable(glow::DEPTH_TEST);
+        }
+    }
+
+    fn draw_sheet(&mut self, gl: &glow::Context, vp: Mat4, sheet: &LayerSheet) {
+        unsafe {
+            if self.sheet_key != sheet.key
+                && sheet.w > 0
+                && sheet.h > 0
+                && sheet.rgba.len() >= (sheet.w * sheet.h * 4) as usize
+            {
+                gl.bind_texture(glow::TEXTURE_2D, Some(self.sheet_tex));
+                gl.tex_parameter_i32(
+                    glow::TEXTURE_2D,
+                    glow::TEXTURE_MIN_FILTER,
+                    glow::LINEAR as i32,
+                );
+                gl.tex_parameter_i32(
+                    glow::TEXTURE_2D,
+                    glow::TEXTURE_MAG_FILTER,
+                    glow::LINEAR as i32,
+                );
+                gl.tex_parameter_i32(
+                    glow::TEXTURE_2D,
+                    glow::TEXTURE_WRAP_S,
+                    glow::CLAMP_TO_EDGE as i32,
+                );
+                gl.tex_parameter_i32(
+                    glow::TEXTURE_2D,
+                    glow::TEXTURE_WRAP_T,
+                    glow::CLAMP_TO_EDGE as i32,
+                );
+                gl.tex_image_2d(
+                    glow::TEXTURE_2D,
+                    0,
+                    glow::RGBA as i32,
+                    sheet.w,
+                    sheet.h,
+                    0,
+                    glow::RGBA,
+                    glow::UNSIGNED_BYTE,
+                    glow::PixelUnpackData::Slice(Some(sheet.rgba.as_slice())),
+                );
+                self.sheet_key = sheet.key;
+            }
+            let z = sheet.z + 0.04;
+            let sx = sheet.size_x;
+            let sy = sheet.size_y;
+            let quad = [
+                0.0, 0.0, z, 0.0, 0.0, sx, 0.0, z, 1.0, 0.0, sx, sy, z, 1.0, 1.0, 0.0, 0.0, z, 0.0,
+                0.0, sx, sy, z, 1.0, 1.0, 0.0, sy, z, 0.0, 1.0,
+            ];
+            upload_attrib(
+                gl,
+                self.sheet_vao,
+                self.sheet_vbo,
+                &quad,
+                5,
+                &[(0, 3, 0), (1, 2, 3)],
+            );
+            gl.enable(glow::BLEND);
+            gl.blend_func(glow::SRC_ALPHA, glow::ONE_MINUS_SRC_ALPHA);
+            gl.depth_mask(false);
+            gl.use_program(Some(self.sheet_program));
+            gl.uniform_matrix_4_f32_slice(self.sheet_mvp.as_ref(), false, vp.as_ref());
+            gl.active_texture(glow::TEXTURE0);
+            gl.bind_texture(glow::TEXTURE_2D, Some(self.sheet_tex));
+            gl.bind_vertex_array(Some(self.sheet_vao));
+            gl.draw_arrays(glow::TRIANGLES, 0, 6);
+            gl.bind_vertex_array(None);
+            gl.depth_mask(true);
+            gl.disable(glow::BLEND);
         }
     }
 
@@ -913,6 +1042,10 @@ impl Renderer {
         unsafe {
             gl.delete_program(self.program);
             gl.delete_program(self.line_program);
+            gl.delete_program(self.sheet_program);
+            gl.delete_texture(self.sheet_tex);
+            gl.delete_vertex_array(self.sheet_vao);
+            gl.delete_buffer(self.sheet_vbo);
             drop_batches(gl, &self.world.batches);
             drop_batches(gl, &self.bed.batches);
             for obj in &self.objects {

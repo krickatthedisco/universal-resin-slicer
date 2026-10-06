@@ -3,10 +3,9 @@
 //! `amber slice model.stl -o model.pm3m`
 
 use crate::catalog;
-use crate::pm3m::write_pm3m;
+use crate::formats::{self, format_from_extension};
 use crate::printer::{Machine, PrintSettings};
 use crate::scene::Document;
-use crate::sl1::write_sl1;
 use crate::slice::{slice, Request};
 use crate::supports;
 use anyhow::{bail, Context, Result};
@@ -92,20 +91,25 @@ pub fn run(args: &[String]) -> Result<()> {
         progress: None,
     })
     .map_err(|e| anyhow::anyhow!(e))?;
-    let want_sl1 = output
+    let asked = output
         .extension()
         .and_then(|ext| ext.to_str())
-        .is_some_and(|ext| ext.eq_ignore_ascii_case("sl1"));
-    if machine.native_photon && !want_sl1 {
-        write_pm3m(&output, &sliced, machine, &settings)?;
-    } else {
-        write_sl1(&output, &sliced, machine, &settings)?;
-        if !want_sl1 {
-            println!(
-                "{} reads .{}, which Amber does not encode. Wrote an .sl1 zip to this path instead.",
-                machine.name, machine.printer_extension
-            );
-        }
+        .and_then(format_from_extension);
+    let format = asked.unwrap_or_else(|| machine.default_format());
+    let native_ext = machine.format_extension(format);
+    formats::write_print(&output, &sliced, machine, &settings, format)?;
+    if !machine.reads_format(format) {
+        println!("{}", formats::describe(machine, format));
+    } else if asked.is_none()
+        && output
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| !ext.eq_ignore_ascii_case(native_ext))
+    {
+        println!(
+            "{} reads .{native_ext}. The bytes are that format, under the name you passed.",
+            machine.name
+        );
     }
     println!(
         "wrote {}  {} layers  {:.2} ml  {} min  {} supports",

@@ -560,7 +560,85 @@ impl Sweep {
 fn raster_solid(solid: &Solid, z: f32, machine: Machine, aa: u8, tris: &[u32]) -> Image {
     let mut segs = clip_tris(solid, z, machine, tris);
     stitch_open_ends(&mut segs);
-    fill_segments(&segs, machine, aa)
+    // Two supports in one mesh are two closed loops. Even-odd on both at
+    // once paints the overlap as a hole, which shows up as a one-layer
+    // line where a branch, a trunk, or a foot touch. Fill each loop on
+    // its own and keep the darker pixel, the same as a union.
+    fill_components(&segs, machine, aa)
+}
+
+fn fill_components(segs: &[([f32; 2], [f32; 2])], machine: Machine, aa: u8) -> Image {
+    if segs.len() <= 1 {
+        return fill_segments(segs, machine, aa);
+    }
+    let n = segs.len();
+    let mut parent: Vec<usize> = (0..n).collect();
+    let mut rank = vec![0u8; n];
+    let quant = |p: [f32; 2]| ((p[0] * 2.0).round() as i32, (p[1] * 2.0).round() as i32);
+    let mut ends: HashMap<(i32, i32), usize> = HashMap::with_capacity(n);
+    for (i, (a, b)) in segs.iter().copied().enumerate() {
+        for p in [a, b] {
+            let key = quant(p);
+            if let Some(&other) = ends.get(&key) {
+                union_seg(&mut parent, &mut rank, i, other);
+            } else {
+                ends.insert(key, i);
+            }
+        }
+    }
+    let first = find_seg(&mut parent, 0);
+    let mut split = false;
+    for i in 1..n {
+        if find_seg(&mut parent, i) != first {
+            split = true;
+            break;
+        }
+    }
+    if !split {
+        return fill_segments(segs, machine, aa);
+    }
+    let mut groups: Vec<Vec<([f32; 2], [f32; 2])>> = Vec::new();
+    let mut slot: HashMap<usize, usize> = HashMap::new();
+    for i in 0..n {
+        let root = find_seg(&mut parent, i);
+        let index = if let Some(&index) = slot.get(&root) {
+            index
+        } else {
+            let index = groups.len();
+            slot.insert(root, index);
+            groups.push(Vec::new());
+            index
+        };
+        groups[index].push(segs[i]);
+    }
+    let mut image = Image::empty();
+    for group in &groups {
+        blit_max(&mut image, &fill_segments(group, machine, aa));
+    }
+    image
+}
+
+fn find_seg(parent: &mut [usize], mut i: usize) -> usize {
+    while parent[i] != i {
+        parent[i] = parent[parent[i]];
+        i = parent[i];
+    }
+    i
+}
+
+fn union_seg(parent: &mut [usize], rank: &mut [u8], a: usize, b: usize) {
+    let mut a = find_seg(parent, a);
+    let mut b = find_seg(parent, b);
+    if a == b {
+        return;
+    }
+    if rank[a] < rank[b] {
+        std::mem::swap(&mut a, &mut b);
+    }
+    parent[b] = a;
+    if rank[a] == rank[b] {
+        rank[a] = rank[a].saturating_add(1);
+    }
 }
 
 fn clip_tris(solid: &Solid, z: f32, machine: Machine, tris: &[u32]) -> Vec<([f32; 2], [f32; 2])> {
@@ -2216,6 +2294,52 @@ pub fn preview_rgba(
     Ok((dw, dh, rgba))
 }
 
+/// The sliced layer as a plate-aligned image. Empty pixels are transparent.
+/// World millimetres go through the same mirror and rotation as the file,
+/// so a white pixel sits on the model that produced it.
+pub fn layer_on_plate(
+    rle: &[u8],
+    width: u32,
+    height: u32,
+    machine: Machine,
+    max_edge: u32,
+) -> Result<(u32, u32, Vec<u8>), String> {
+    if width == 0 || height == 0 {
+        return Err("empty layer".into());
+    }
+    let src = decode_rle(rle, width, height)?;
+    let aspect = machine.size_x / machine.size_y.max(0.1);
+    let max_edge = max_edge.clamp(32, 1024);
+    let (dw, dh) = if aspect >= 1.0 {
+        (max_edge, ((max_edge as f32 / aspect).round() as u32).max(1))
+    } else {
+        (((max_edge as f32 * aspect).round() as u32).max(1), max_edge)
+    };
+    let mut rgba = vec![0u8; (dw * dh * 4) as usize];
+    for y in 0..dh {
+        for x in 0..dw {
+            let mx = (x as f32 + 0.5) / dw as f32 * machine.size_x;
+            let my = (y as f32 + 0.5) / dh as f32 * machine.size_y;
+            let [px, py] = to_px([mx, my], machine);
+            let ix = px.floor() as i32;
+            let iy = py.floor() as i32;
+            let v = if ix >= 0 && iy >= 0 && (ix as u32) < width && (iy as u32) < height {
+                src[(iy as u32 * width + ix as u32) as usize]
+            } else {
+                0
+            };
+            let o = ((y * dw + x) * 4) as usize;
+            if v > 0 {
+                rgba[o] = 232;
+                rgba[o + 1] = 148;
+                rgba[o + 2] = 48;
+                rgba[o + 3] = v.max(170);
+            }
+        }
+    }
+    Ok((dw, dh, rgba))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2242,6 +2366,32 @@ mod tests {
         assert!(img.get(90, 25) > 0, "second shape missing");
         assert_eq!(img.get(42, 25), 0, "filled the gap up to the stray edge");
         assert_eq!(img.get(68, 25), 0, "filled the gap past the stray edge");
+    }
+
+    #[test]
+    fn overlapping_supports_stay_solid_where_they_cross() {
+        let machine = machine_no_flip();
+        let mut mesh = box_mesh([0.0, 0.0, 0.0], [10.0, 10.0, 5.0]);
+        mesh.append(&box_mesh([7.0, 0.0, 0.0], [15.0, 10.0, 5.0]));
+        let solid = Solid {
+            vertices: mesh.vertices,
+            indices: mesh.indices,
+            hollow: None,
+        };
+        let sweep = Sweep::build(&solid);
+        let mut sweep = sweep;
+        let active = sweep.activate(2.0).to_vec();
+        let img = raster_solid(&solid, 2.0, machine, 1, &active);
+        let px = |x_mm: f32, y_mm: f32| {
+            let [x, y] = to_px([x_mm, y_mm], machine);
+            img.get(x.round() as i32, y.round() as i32)
+        };
+        assert!(px(3.0, 5.0) > 0, "left pillar missing");
+        assert!(px(13.0, 5.0) > 0, "right pillar missing");
+        assert!(
+            px(8.5, 5.0) > 0,
+            "the overlap was left empty, which is the one-layer line between supports"
+        );
     }
 
     #[test]

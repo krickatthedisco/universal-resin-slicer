@@ -11,6 +11,35 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+/// Cross section of trunks, necks, branches, braces, and feet.
+/// The diameter is measured flat to flat, so a hexagon and a square
+/// are as wide across the flats as a round pillar of the same diameter.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SectionShape {
+    #[serde(rename = "hexagon")]
+    Hexagon,
+    #[serde(rename = "round")]
+    Round,
+    #[serde(rename = "square")]
+    Square,
+}
+
+impl Default for SectionShape {
+    fn default() -> Self {
+        Self::Hexagon
+    }
+}
+
+impl SectionShape {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Hexagon => "Hexagon",
+            Self::Round => "Round",
+            Self::Square => "Square",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct SupportStyle {
     pub overhang_deg: f32,
@@ -22,6 +51,9 @@ pub struct SupportStyle {
     pub tip_lower_mm: f32,
     pub tip_len_mm: f32,
     pub trunk_mm: f32,
+    /// Hexagon unless an older file, or the user, picked something else.
+    #[serde(default)]
+    pub section: SectionShape,
     pub branch_deg: f32,
     pub cluster_mm: f32,
     pub foot_mm: f32,
@@ -54,6 +86,7 @@ pub const PRESETS: &[SupportPreset] = &[
             tip_lower_mm: 0.55,
             tip_len_mm: 2.0,
             trunk_mm: 0.90,
+            section: SectionShape::Hexagon,
             branch_deg: 40.0,
             cluster_mm: 5.5,
             foot_mm: 0.6,
@@ -73,6 +106,7 @@ pub const PRESETS: &[SupportPreset] = &[
             tip_lower_mm: 0.80,
             tip_len_mm: 2.4,
             trunk_mm: 1.20,
+            section: SectionShape::Hexagon,
             branch_deg: 45.0,
             cluster_mm: 7.0,
             foot_mm: 0.8,
@@ -92,6 +126,7 @@ pub const PRESETS: &[SupportPreset] = &[
             tip_lower_mm: 1.10,
             tip_len_mm: 3.0,
             trunk_mm: 1.70,
+            section: SectionShape::Hexagon,
             branch_deg: 50.0,
             cluster_mm: 9.0,
             foot_mm: 1.1,
@@ -111,6 +146,7 @@ pub const PRESETS: &[SupportPreset] = &[
             tip_lower_mm: 0.32,
             tip_len_mm: 1.2,
             trunk_mm: 0.50,
+            section: SectionShape::Hexagon,
             branch_deg: 35.0,
             cluster_mm: 3.5,
             foot_mm: 0.4,
@@ -136,6 +172,7 @@ impl SupportStyle {
             tip_lower_mm: self.tip_lower_mm.clamp(0.15, 4.0),
             tip_len_mm: self.tip_len_mm.clamp(0.4, 8.0),
             trunk_mm: self.trunk_mm.clamp(0.3, 5.0),
+            section: self.section,
             branch_deg: self.branch_deg.clamp(10.0, 75.0),
             cluster_mm: self.cluster_mm.clamp(1.5, 20.0),
             foot_mm: self.foot_mm.clamp(0.2, 3.0),
@@ -608,12 +645,13 @@ pub fn forest_parts(
             let from = Vec3::new(tip.x, tip.y, branch_end);
             let to = Vec3::new(host.x, host.y, join_z);
             if from.distance(to) > 0.2 {
-                parts.branches.append(&tapered(
+                parts.branches.append(&shaft(
                     from,
                     style.tip_lower_mm * 0.5,
                     to,
                     trunk_r * 0.92,
-                    8,
+                    &style,
+                    10,
                 ));
                 parts.branches.append(&sphere(to, trunk_r * 0.85, 5, 7));
             }
@@ -621,9 +659,14 @@ pub fn forest_parts(
     }
     if braces_on {
         for brace in trunk_braces(&trunks, brace_dist, style.brace_mm * 0.5, brace_angle) {
-            parts
-                .braces
-                .append(&tapered(brace.a, brace.radius, brace.b, brace.radius, 6));
+            parts.braces.append(&shaft(
+                brace.a,
+                brace.radius,
+                brace.b,
+                brace.radius,
+                &style,
+                8,
+            ));
         }
     }
     parts
@@ -675,22 +718,23 @@ fn add_tip(
         );
         let end = Vec3::new(support.x, support.y, tip_end_z.min(neck.z - 0.05));
         if neck.z - end.z > 0.12 {
-            necks.append(&tapered(neck, r * 0.9, end, lower_r, 8));
+            necks.append(&shaft(neck, r * 0.9, end, lower_r, style, 10));
         }
         return;
     }
     let apex = Vec3::new(support.x, support.y, support.z_top + style.contact_depth);
     let surface = Vec3::new(support.x, support.y, support.z_top);
     let end = Vec3::new(support.x, support.y, tip_end_z);
-    contacts.append(&tapered(
+    contacts.append(&shaft(
         apex,
         (contact_r * 0.35).max(0.04),
         surface,
         contact_r.max(0.06),
-        8,
+        style,
+        10,
     ));
     if surface.z - end.z > 0.12 {
-        necks.append(&tapered(surface, upper_r, end, lower_r, 8));
+        necks.append(&shaft(surface, upper_r, end, lower_r, style, 10));
     }
 }
 
@@ -716,12 +760,13 @@ fn add_foot_and_shaft(
         z_base
     };
     if shaft_top - shaft_bottom > 0.15 {
-        trunks.append(&tapered(
+        trunks.append(&shaft(
             Vec3::new(x, y, shaft_bottom),
             trunk_r,
             Vec3::new(x, y, shaft_top),
             trunk_r,
-            10,
+            style,
+            12,
         ));
     }
     if on_bed && foot_h > 0.12 {
@@ -730,22 +775,24 @@ fn add_foot_and_shaft(
         } else {
             trunk_r * 2.1
         };
-        feet.append(&tapered(
+        feet.append(&shaft(
             Vec3::new(x, y, z_base),
             foot_r,
             Vec3::new(x, y, shaft_bottom),
             trunk_r,
-            10,
+            style,
+            12,
         ));
     } else if !on_bed && foot_h > 0.08 {
         // Lower contact where the trunk lands on the model.
         let sole = Vec3::new(x, y, z_base - style.contact_depth * 0.5);
-        feet.append(&tapered(
+        feet.append(&shaft(
             sole,
             style.contact_mm * 0.22,
             Vec3::new(x, y, shaft_bottom),
             trunk_r,
-            8,
+            style,
+            10,
         ));
     }
 }
@@ -907,7 +954,20 @@ pub fn raft_mesh(supports: &[Support], margin: f32, thickness: f32, reach: f32) 
 }
 
 pub fn brace_mesh(brace: &Brace) -> Mesh {
-    tapered(brace.a, brace.radius, brace.b, brace.radius, 8)
+    tapered(brace.a, brace.radius, brace.b, brace.radius, 8, true)
+}
+
+/// A pillar whose flat-to-flat width is the given radius times two.
+fn shaft(a: Vec3, ra: f32, b: Vec3, rb: f32, style: &SupportStyle, round_seg: usize) -> Mesh {
+    let (seg, scale) = match style.section {
+        SectionShape::Round => (round_seg.max(8), 1.0),
+        SectionShape::Square => (4, std::f32::consts::SQRT_2),
+        SectionShape::Hexagon => {
+            let across_flats = (std::f32::consts::PI / 6.0).cos();
+            (6, 1.0 / across_flats)
+        }
+    };
+    tapered(a, ra * scale, b, rb * scale, seg, true)
 }
 
 fn sphere(center: Vec3, radius: f32, stacks: usize, slices: usize) -> Mesh {
@@ -944,7 +1004,7 @@ fn sphere(center: Vec3, radius: f32, stacks: usize, slices: usize) -> Mesh {
     Mesh { vertices, indices }
 }
 
-fn tapered(a: Vec3, ra: f32, b: Vec3, rb: f32, seg: usize) -> Mesh {
+fn tapered(a: Vec3, ra: f32, b: Vec3, rb: f32, seg: usize, caps: bool) -> Mesh {
     let seg = seg.max(3);
     let mut axis = b - a;
     let len = axis.length();
@@ -978,8 +1038,10 @@ fn tapered(a: Vec3, ra: f32, b: Vec3, rb: f32, seg: usize) -> Mesh {
         let j0 = i0 + seg as u32;
         let j1 = i1 + seg as u32;
         indices.extend_from_slice(&[i0, j0, j1, i0, j1, i1]);
-        indices.extend_from_slice(&[cap_a, i1, i0]);
-        indices.extend_from_slice(&[cap_b, j0, j1]);
+        if caps {
+            indices.extend_from_slice(&[cap_a, i1, i0]);
+            indices.extend_from_slice(&[cap_b, j0, j1]);
+        }
     }
     Mesh { vertices, indices }
 }
@@ -1488,6 +1550,11 @@ mod tests {
             "the trunk should stop below the contact"
         );
         let mesh = forest_mesh(&supports, style, 0.0, false, 8.0, 45.0);
+        let angles = pillar_angles(&parts.trunks);
+        assert_eq!(
+            angles, 6,
+            "the default trunk is a hexagon, got {angles} directions"
+        );
         let split = parts.contacts.triangle_count()
             + parts.necks.triangle_count()
             + parts.trunks.triangle_count()
@@ -1590,6 +1657,23 @@ mod tests {
             30.0,
         )
         .is_none());
+    }
+
+    fn pillar_angles(mesh: &Mesh) -> usize {
+        let mut bins = [false; 12];
+        for v in &mesh.vertices {
+            let r = (v[0] * v[0] + v[1] * v[1]).sqrt();
+            if r < 0.15 {
+                continue;
+            }
+            let mut deg = v[1].atan2(v[0]).to_degrees();
+            if deg < 0.0 {
+                deg += 360.0;
+            }
+            let bin = ((deg / 30.0).round() as usize) % 12;
+            bins[bin] = true;
+        }
+        bins.iter().filter(|on| **on).count()
     }
 
     fn covers_xy(mesh: &Mesh, x: f32, y: f32) -> bool {

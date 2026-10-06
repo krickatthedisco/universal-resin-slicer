@@ -7,6 +7,8 @@ pub mod app;
 pub mod catalog;
 pub mod cli;
 pub mod community;
+pub mod ctb;
+pub mod formats;
 pub mod mesh;
 pub mod plate;
 pub mod pm3m;

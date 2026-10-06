@@ -3,10 +3,35 @@
 use crate::catalog::{self, PrinterProfile};
 use serde::{Deserialize, Serialize};
 
+/// A file Amber can actually write. The printer's own suffix is used when
+/// that container is the one the machine reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PrintFormat {
+    /// Photon Workshop v516 (`.pm3m` and the other v516 suffixes).
+    Photon516,
+    /// Unencrypted Chitubox `.ctb`.
+    Ctb,
+    /// Prusa `.sl1` zip of PNG layers.
+    Sl1,
+    /// Numbered PNG layers in a zip. Used for `.cws`, `.zip`, and NanoDLP.
+    PngZip,
+}
+
+impl PrintFormat {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Photon516 => "Photon Workshop v516",
+            Self::Ctb => "Chitubox CTB",
+            Self::Sl1 => "Prusa SL1",
+            Self::PngZip => "Layer PNG zip",
+        }
+    }
+}
+
 /// One printer from the catalog, plus the orientation toggles for this job.
 ///
-/// `extension` is what Amber writes. `printer_extension` is the suffix the
-/// machine's own slicer would use. Those match for Photon Workshop v516.
+/// `extension` is what Amber writes by default. `printer_extension` is the
+/// suffix the machine's own slicer would use.
 #[derive(Clone, Copy, Debug)]
 pub struct Machine {
     pub id: &'static str,
@@ -42,15 +67,11 @@ impl Machine {
         // Photonic Etcher. The community mirror flag is a different convention.
         let m3 = profile.id == "anycubic-photon-m3-max";
         let native = profile.native_photon;
-        Self {
+        let mut machine = Self {
             id: profile.id,
             name: profile.name,
             vendor: profile.vendor,
-            extension: if native {
-                profile.printer_extension
-            } else {
-                "sl1"
-            },
+            extension: "sl1",
             printer_extension: profile.printer_extension,
             format_name: profile.format_name,
             file_version: if native { 516 } else { profile.file_version },
@@ -65,6 +86,52 @@ impl Machine {
             rotate_180: m3,
             mirror_x: if m3 { false } else { profile.mirror_x },
             mirror_y: if m3 { false } else { profile.mirror_y },
+        };
+        machine.extension = machine.format_extension(machine.default_format());
+        machine
+    }
+
+    /// The container this printer should get unless the user picks another.
+    pub fn default_format(self) -> PrintFormat {
+        if self.native_photon {
+            return PrintFormat::Photon516;
+        }
+        match self.format_name {
+            "CTB" if self.file_version == 3 => PrintFormat::Ctb,
+            "SL1" => PrintFormat::Sl1,
+            "ZIP" | "CWS" | "NANODLP" | "RGB" | "OSF" => PrintFormat::PngZip,
+            _ => PrintFormat::Sl1,
+        }
+    }
+
+    pub fn format_extension(self, format: PrintFormat) -> &'static str {
+        match format {
+            PrintFormat::Photon516 => {
+                if self.native_photon {
+                    self.printer_extension
+                } else {
+                    "pm3m"
+                }
+            }
+            PrintFormat::Ctb => "ctb",
+            PrintFormat::Sl1 => "sl1",
+            PrintFormat::PngZip => match self.printer_extension {
+                "cws" | "zip" | "nanodlp" | "rgb" | "osf" => self.printer_extension,
+                _ => "zip",
+            },
+        }
+    }
+
+    /// True when this container is the one the machine's own slicer writes.
+    /// A fallback `.sl1` for an encrypted printer is not that file.
+    pub fn reads_format(self, format: PrintFormat) -> bool {
+        match format {
+            PrintFormat::Photon516 => self.native_photon,
+            PrintFormat::Ctb => self.format_name == "CTB" && self.file_version == 3,
+            PrintFormat::Sl1 => self.format_name == "SL1",
+            PrintFormat::PngZip => {
+                matches!(self.format_name, "ZIP" | "CWS" | "NANODLP" | "RGB" | "OSF")
+            }
         }
     }
 
