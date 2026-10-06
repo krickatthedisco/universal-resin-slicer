@@ -248,6 +248,37 @@ impl<'a> TriGrid<'a> {
         }
         best
     }
+
+    fn nearest_at(&self, best: &mut Option<(f32, f32)>, t: usize, x: f32, y: f32, z: f32) {
+        let tri = &self.indices[t * 3..t * 3 + 3];
+        let a = self.verts[tri[0] as usize];
+        let b = self.verts[tri[1] as usize];
+        let c = self.verts[tri[2] as usize];
+        if let Some(hit_z) = vertical_hit(x, y, a, b, c) {
+            let dist = (hit_z - z).abs();
+            if best.map(|(old, _)| dist < old).unwrap_or(true) {
+                *best = Some((dist, hit_z));
+            }
+        }
+    }
+
+    /// The triangle the vertical line hits that sits closest to `z`.
+    fn nearest_surface(&self, x: f32, y: f32, z: f32) -> Option<f32> {
+        let key = (
+            (x / self.cell).floor() as i32,
+            (y / self.cell).floor() as i32,
+        );
+        let mut best: Option<(f32, f32)> = None;
+        if let Some(tris) = self.map.get(&key) {
+            for &t in tris {
+                self.nearest_at(&mut best, t, x, y, z);
+            }
+        }
+        for &t in &self.large {
+            self.nearest_at(&mut best, t, x, y, z);
+        }
+        best.map(|(_, hit_z)| hit_z)
+    }
 }
 
 fn face_samples(
@@ -394,6 +425,37 @@ pub fn manual_support(
         z_top: z,
         z_base: base,
     }
+}
+
+/// Drop a tip onto the surface nearest `hint_z` at this column.
+/// Returns nothing when the column misses the mesh, so a nudge cannot float the tip.
+pub fn seat_on_mesh(
+    x: f32,
+    y: f32,
+    hint_z: f32,
+    verts: &[[f32; 3]],
+    indices: &[u32],
+    platform_only: bool,
+    id: u64,
+) -> Option<Support> {
+    if verts.is_empty() || indices.len() < 3 {
+        return None;
+    }
+    let grid = TriGrid::build(verts, indices);
+    let z = grid.nearest_surface(x, y, hint_z)?;
+    let base = if platform_only {
+        0.0
+    } else {
+        grid.highest_below(x, y, z).unwrap_or(0.0).max(0.0)
+    };
+    Some(Support {
+        id,
+        object_id: 0,
+        x,
+        y,
+        z_top: z,
+        z_base: base,
+    })
 }
 
 struct Trunk {

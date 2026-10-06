@@ -1193,6 +1193,43 @@ impl Document {
         best.map(|(_, id)| id)
     }
 
+    fn seated_support(&self, id: u64, x: f32, y: f32) -> Option<Support> {
+        let current = self.supports.iter().find(|s| s.id == id).copied()?;
+        let obj = self.object(current.object_id)?;
+        let platform_only = obj.support.platform_only;
+        let world = Self::world_mesh(obj);
+        let mut next = supports::seat_on_mesh(
+            x,
+            y,
+            current.z_top,
+            &world.vertices,
+            &world.indices,
+            platform_only,
+            id,
+        )?;
+        next.object_id = current.object_id;
+        Some(next)
+    }
+
+    /// True when this column hits the tip's own model.
+    pub fn tip_can_land(&self, id: u64, x: f32, y: f32) -> bool {
+        self.seated_support(id, x, y).is_some()
+    }
+
+    /// Move one tip to a new column and seat it on the nearest surface.
+    /// The caller records undo. A miss leaves the tip where it was.
+    pub fn reseat_support(&mut self, id: u64, x: f32, y: f32) -> bool {
+        let Some(next) = self.seated_support(id, x, y) else {
+            return false;
+        };
+        if let Some(slot) = self.supports.iter_mut().find(|s| s.id == id) {
+            *slot = next;
+        }
+        self.selection = Selection::Support(id);
+        self.touch();
+        true
+    }
+
     /// Move one tip onto a new point on its own model. The caller records undo.
     pub fn relocate_support(&mut self, id: u64, point: Vec3) -> bool {
         let Some(current) = self.supports.iter().find(|s| s.id == id).copied() else {
@@ -1779,6 +1816,44 @@ mod tests {
         assert!(doc.supports.iter().all(|s| s.object_id == id));
         doc.undo();
         assert_eq!(doc.supports.len(), 2);
+    }
+
+    #[test]
+    fn reseating_a_tip_follows_the_surface_and_stays_on_the_model() {
+        let mut doc = Document::new();
+        let ramp = Mesh {
+            vertices: vec![
+                [0.0, 0.0, 10.0],
+                [10.0, 0.0, 20.0],
+                [10.0, 10.0, 20.0],
+                [0.0, 10.0, 10.0],
+                [0.0, 0.0, 0.0],
+                [10.0, 0.0, 0.0],
+                [10.0, 10.0, 0.0],
+                [0.0, 10.0, 0.0],
+            ],
+            indices: vec![0, 1, 2, 0, 2, 3, 4, 6, 5, 4, 7, 6],
+        };
+        let id = doc.add_mesh("ramp".into(), ramp);
+        doc.add_support_at(Vec3::new(2.0, 5.0, 12.0), id);
+        let sid = doc.supports[0].id;
+        doc.remember_supports();
+        assert!(doc.reseat_support(sid, 8.0, 5.0));
+        let moved = doc.supports.iter().find(|s| s.id == sid).unwrap();
+        assert!((moved.x - 8.0).abs() < 0.05, "x {}", moved.x);
+        assert!((moved.y - 5.0).abs() < 0.05, "y {}", moved.y);
+        assert!(
+            (moved.z_top - 18.0).abs() < 0.05,
+            "tip should sit on the ramp, z {}",
+            moved.z_top
+        );
+        assert!(moved.z_base < 0.35, "foot {}", moved.z_base);
+        assert!(!doc.reseat_support(sid, 30.0, 5.0));
+        let stayed = doc.supports.iter().find(|s| s.id == sid).unwrap();
+        assert!((stayed.x - 8.0).abs() < 0.05, "off-mesh x {}", stayed.x);
+        assert!(doc.undo());
+        let back = doc.supports.iter().find(|s| s.id == sid).unwrap();
+        assert!((back.x - 2.0).abs() < 0.05, "undo x {}", back.x);
     }
 
     #[test]

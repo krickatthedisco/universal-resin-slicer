@@ -200,6 +200,8 @@ pub struct AmberApp {
     erase_mm: f32,
     /// True after this drag has already stored one undo snapshot.
     stroke_saved: bool,
+    /// The tip whose X/Y fields already have one undo snapshot for this edit.
+    tip_field_for: Option<u64>,
     plate_view: PlateView,
     /// Models left out of the plate view. They still slice.
     hidden_models: HashSet<u64>,
@@ -342,6 +344,7 @@ impl AmberApp {
             erase_supports: false,
             erase_mm: 3.0,
             stroke_saved: false,
+            tip_field_for: None,
             plate_view,
             hidden_models: HashSet::new(),
             view_rev: 0,
@@ -790,14 +793,36 @@ impl AmberApp {
                 0.0
             };
             if dx != 0.0 || dy != 0.0 {
-                if let Selection::Object(id) = self.doc.selection {
-                    self.doc.push_xform_undo(id);
-                    if let Some(obj) = self.doc.object_mut(id) {
-                        obj.position.x += dx;
-                        obj.position.y += dy;
+                match self.doc.selection {
+                    Selection::Object(id) => {
+                        self.tip_field_for = None;
+                        self.doc.push_xform_undo(id);
+                        if let Some(obj) = self.doc.object_mut(id) {
+                            obj.position.x += dx;
+                            obj.position.y += dy;
+                        }
+                        self.doc.touch_xform();
+                        self.invalidate_slice();
                     }
-                    self.doc.touch_xform();
-                    self.invalidate_slice();
+                    Selection::Support(id) => {
+                        let tip = self.doc.supports.iter().find(|s| s.id == id).copied();
+                        if let Some(tip) = tip {
+                            let x = tip.x + dx;
+                            let y = tip.y + dy;
+                            if self.doc.tip_can_land(id, x, y) {
+                                self.doc.remember_supports();
+                                self.tip_field_for = None;
+                                let _ = self.doc.reseat_support(id, x, y);
+                                self.invalidate_slice();
+                                self.status =
+                                    "Moved that tip along the model. Undo puts it back.".into();
+                            } else {
+                                self.status =
+                                    "That nudge leaves the model, so the tip stayed put.".into();
+                            }
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
@@ -1202,6 +1227,7 @@ impl AmberApp {
     }
 
     fn undo_edit(&mut self) {
+        self.tip_field_for = None;
         if self.doc.undo() {
             self.invalidate_slice();
             self.status = "Undid the last edit.".into();
@@ -1211,6 +1237,7 @@ impl AmberApp {
     }
 
     fn redo_edit(&mut self) {
+        self.tip_field_for = None;
         if self.doc.redo() {
             self.invalidate_slice();
             self.status = "Redid that edit.".into();
@@ -1811,21 +1838,60 @@ impl AmberApp {
         }
     }
 
+    fn tip_fields(&mut self, ui: &mut egui::Ui) {
+        let Selection::Support(id) = self.doc.selection else {
+            self.tip_field_for = None;
+            return;
+        };
+        let Some(support) = self.doc.supports.iter().find(|s| s.id == id).copied() else {
+            self.tip_field_for = None;
+            return;
+        };
+        ui.label(
+            "X and Y move this tip and keep it on the model. Arrow keys do the same, 1 mm, or 0.1 mm with Shift.",
+        );
+        let mut x = support.x;
+        let mut y = support.y;
+        let mut started = false;
+        let mut changed = false;
+        ui.horizontal(|ui| {
+            ui.label("X");
+            let rx = ui.add(egui::DragValue::new(&mut x).speed(0.1).suffix(" mm"));
+            ui.label("Y");
+            let ry = ui.add(egui::DragValue::new(&mut y).speed(0.1).suffix(" mm"));
+            started = rx.drag_started() || ry.drag_started();
+            changed = rx.changed() || ry.changed();
+        });
+        ui.label(format!(
+            "Tip {:.1} mm up. Foot at {:.1} mm.",
+            support.z_top, support.z_base
+        ));
+        let moved = (x - support.x).abs() > 1e-4 || (y - support.y).abs() > 1e-4;
+        if (started || changed) && moved {
+            if self.doc.tip_can_land(id, x, y) {
+                if self.tip_field_for != Some(id) {
+                    self.doc.remember_supports();
+                    self.tip_field_for = Some(id);
+                }
+                let _ = self.doc.reseat_support(id, x, y);
+                self.invalidate_slice();
+            } else {
+                self.status = "That spot is off the model, so the tip stayed put.".into();
+            }
+        }
+        if ui.button("Delete this support").clicked() {
+            self.tip_field_for = None;
+            self.doc.delete_selection();
+            self.invalidate_slice();
+        }
+    }
+
     fn select_ui(&mut self, ui: &mut egui::Ui) {
         ui.heading("Select");
         ui.label("Left-drag moves the selected model in X and Y. Right-drag orbits, and can swing under the bed. Right-click the model for hollow, holes, supports, and the rest.");
         ui.checkbox(&mut self.snap_mm, "Snap moves to 1 mm");
-        if let Selection::Support(id) = self.doc.selection {
-            if let Some(support) = self.doc.supports.iter().find(|s| s.id == id).copied() {
-                ui.label(format!(
-                    "Tip at {:.1}, {:.1} mm, {:.1} mm up. Foot at {:.1} mm.",
-                    support.x, support.y, support.z_top, support.z_base
-                ));
-                if ui.button("Delete this support").clicked() {
-                    self.doc.delete_selection();
-                    self.invalidate_slice();
-                }
-            }
+        if let Selection::Support(_) = self.doc.selection {
+            self.tip_fields(ui);
             return;
         }
         if let Selection::Drain(id) = self.doc.selection {
@@ -2239,7 +2305,11 @@ impl AmberApp {
 
     fn support_ui(&mut self, ui: &mut egui::Ui) {
         ui.heading("Support");
-        ui.label("Click an underside to plant a tip. Click a tip to select it, then drag it to a new spot. Every control here applies only to the selected model.");
+        ui.label("Click an underside to plant a tip. Click a tip to select it, then drag it, type X and Y, or nudge it with the arrow keys. Every control here applies only to the selected model.");
+        if let Selection::Support(_) = self.doc.selection {
+            self.tip_fields(ui);
+            ui.separator();
+        }
         if !self.island_marks.is_empty() && self.model_stamp() == self.island_stamp {
             ui.label(format!(
                 "{} red marks are islands from the last slice. Click one to plant a support. They stay until a model moves.",
@@ -3322,7 +3392,7 @@ impl AmberApp {
                 ui.label("Ctrl+O open    Ctrl+Shift+S save the plate    Ctrl+S save the sliced file");
                 ui.label("Ctrl+Z undo    Ctrl+Y redo    Ctrl+D duplicate    Delete remove");
                 ui.label("Ctrl+Enter slice    Ctrl+S save    F1 this page");
-                ui.label("On the plate, the arrow keys nudge the model by 1 mm (Shift is 0.1 mm). F fits the camera. In the layer view, the arrows step through layers.");
+                ui.label("On the plate, the arrow keys nudge the selected model by 1 mm (Shift is 0.1 mm). A selected tip moves the same way and stays on the model. F fits the camera. In the layer view, the arrows step through layers.");
                 ui.separator();
                 ui.label(format!(
                     "Amber {}  ·  built for the Anycubic Photon M3 Max, and the other printers in the list.",
