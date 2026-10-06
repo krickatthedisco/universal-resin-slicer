@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.7
+
+- The layer preview zooms and pans. Scroll zooms toward the pointer, drag moves the plate, and Fit or a double-click shows the whole layer again. 1:1 is one printer pixel per screen pixel, which is the slice itself. Zoomed out, any exposed printer pixel in a texel still shows, so a thin line is not dropped.
+
 ## 0.2.6
 
 - The plate view keeps a hard edge. A flat top no longer blends into the wall under it, so the validation matrix, lettering, and other sharp detail read as the mesh instead of a soft blob.

@@ -195,6 +195,25 @@ struct Persist {
     light_scheme: Scheme,
 }
 
+struct PreviewPlate {
+    gen: u64,
+    layer: usize,
+    width: u32,
+    height: u32,
+    gray: Vec<u8>,
+    islands: Vec<slice::Island>,
+}
+
+struct PreviewStamp {
+    gen: u64,
+    layer: usize,
+    width: u32,
+    height: u32,
+    zoom: u32,
+    cx: u32,
+    cy: u32,
+}
+
 pub struct AmberApp {
     machine: Machine,
     settings: PrintSettings,
@@ -216,7 +235,13 @@ pub struct AmberApp {
     island_gen: u64,
     island_drawn: u64,
     preview_index: usize,
-    preview_for: Option<usize>,
+    /// 0 fits the whole plate. Otherwise, screen pixels per printer pixel.
+    preview_zoom: f32,
+    /// Printer-pixel point kept in the middle of the preview.
+    preview_center: [f32; 2],
+    preview_plate: Option<PreviewPlate>,
+    preview_pixels: Vec<u8>,
+    preview_stamp: Option<PreviewStamp>,
     preview_tex: Option<egui::TextureHandle>,
     gesture: bool,
     export_name: String,
@@ -392,7 +417,11 @@ impl AmberApp {
             island_gen: 0,
             island_drawn: 0,
             preview_index: 0,
-            preview_for: None,
+            preview_zoom: 0.0,
+            preview_center: [0.0, 0.0],
+            preview_plate: None,
+            preview_pixels: Vec::new(),
+            preview_stamp: None,
             preview_tex: None,
             gesture: false,
             export_name: format!("print.{}", machine.extension),
@@ -448,7 +477,8 @@ impl AmberApp {
     fn invalidate_slice(&mut self) {
         self.slice = None;
         self.preview_tex = None;
-        self.preview_for = None;
+        self.preview_plate = None;
+        self.preview_stamp = None;
     }
 
     fn poll_job(&mut self, ctx: &egui::Context) {
@@ -508,7 +538,7 @@ impl AmberApp {
                 self.slice = Some(slice);
                 self.slice_gen = generation;
                 self.preview_index = layers.saturating_sub(1);
-                self.preview_for = None;
+                self.preview_plate = None;
                 self.view = View::Preview;
                 if export_after {
                     self.export_print(None);
@@ -2050,7 +2080,6 @@ impl AmberApp {
             }
         }
         self.preview_index = best;
-        self.preview_for = None;
     }
 
     fn support_visibility(&mut self, ui: &mut egui::Ui) {
@@ -4634,34 +4663,200 @@ impl AmberApp {
     }
 
     fn preview_image(&mut self, ui: &mut egui::Ui) {
-        if self.preview_for != Some(self.preview_index) {
-            let decoded = self.slice.as_ref().and_then(|slice| {
-                let layer = slice.layers.get(self.preview_index)?;
-                slice::preview_rgba(&layer.rle, slice.width, slice.height, 1400, &layer.islands)
-                    .ok()
-            });
-            if let Some((w, h, rgba)) = decoded {
-                let image =
-                    egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &rgba);
+        if !self.ensure_preview_plate() {
+            ui.label("Could not decode that layer.");
+            return;
+        }
+        let (src_w, src_h) = {
+            let plate = self.preview_plate.as_ref().expect("plate");
+            (plate.width, plate.height)
+        };
+        let avail = ui.available_size();
+        let toolbar_h = ui.spacing().interact_size.y + 8.0;
+        let image_h = (avail.y - toolbar_h).max(32.0);
+        let ppp = ui.ctx().pixels_per_point();
+        let tw = ((avail.x * ppp).round() as u32).clamp(1, 4096);
+        let th = ((image_h * ppp).round() as u32).clamp(1, 4096);
+        let fit = slice::preview_fit_zoom(src_w, src_h, tw, th);
+        let mut zoom = if self.preview_zoom > 0.0 {
+            self.preview_zoom
+        } else {
+            fit
+        };
+        let mut center = if self.preview_zoom > 0.0 {
+            self.preview_center
+        } else {
+            [src_w as f32 * 0.5, src_h as f32 * 0.5]
+        };
+        ui.horizontal(|ui| {
+            if ui
+                .button("Fit")
+                .on_hover_text("Show the whole plate")
+                .clicked()
+            {
+                self.preview_zoom = 0.0;
+                zoom = fit;
+                center = [src_w as f32 * 0.5, src_h as f32 * 0.5];
+            }
+            if ui
+                .button("1:1")
+                .on_hover_text("One printer pixel per screen pixel")
+                .clicked()
+            {
+                if self.preview_zoom <= 0.0 {
+                    center = [src_w as f32 * 0.5, src_h as f32 * 0.5];
+                }
+                zoom = 1.0;
+                self.preview_zoom = 1.0;
+            }
+            if ui.button("+").on_hover_text("Zoom in").clicked() {
+                zoom *= 1.25;
+                self.preview_zoom = zoom;
+            }
+            if ui.button("−").on_hover_text("Zoom out").clicked() {
+                zoom /= 1.25;
+                self.preview_zoom = zoom;
+            }
+            ui.label(format!("{:.0}%", zoom * 100.0))
+                .on_hover_text("100% is one printer pixel per screen pixel");
+            ui.label(
+                egui::RichText::new("Scroll zooms at the pointer. Drag pans.")
+                    .weak()
+                    .small(),
+            );
+        });
+        zoom = slice::clamp_preview_zoom(zoom, fit);
+        center = slice::clamp_preview_center(center, zoom, src_w, src_h, tw, th);
+        let size = egui::vec2(avail.x.max(1.0), image_h);
+        let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click_and_drag());
+        if response.double_clicked() {
+            self.preview_zoom = 0.0;
+            zoom = fit;
+            center = [src_w as f32 * 0.5, src_h as f32 * 0.5];
+            center = slice::clamp_preview_center(center, zoom, src_w, src_h, tw, th);
+        }
+        if response.dragged() {
+            let delta = response.drag_delta();
+            center[0] -= delta.x * ppp / zoom;
+            center[1] -= delta.y * ppp / zoom;
+            self.preview_zoom = zoom;
+        }
+        if response.hovered() {
+            let (scroll, pinch) = ui.input(|i| (i.smooth_scroll_delta.y, i.zoom_delta()));
+            let mut factor = pinch;
+            if scroll.abs() > 0.0 {
+                factor *= (scroll * 0.0016).exp();
+            }
+            if (factor - 1.0).abs() > 0.001 {
+                if let Some(pos) = response.hover_pos().or(ui.input(|i| i.pointer.hover_pos())) {
+                    let tx = (pos.x - rect.left()) * ppp;
+                    let ty = (pos.y - rect.top()) * ppp;
+                    let src = slice::source_at(center, zoom, tw, th, tx, ty);
+                    zoom = slice::clamp_preview_zoom(zoom * factor, fit);
+                    center = slice::center_keeping(src, zoom, tw, th, tx, ty);
+                    self.preview_zoom = zoom;
+                }
+            }
+        }
+        if response.dragged() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+        } else {
+            response.clone().on_hover_cursor(egui::CursorIcon::Grab);
+        }
+        center = slice::clamp_preview_center(center, zoom, src_w, src_h, tw, th);
+        if self.preview_zoom > 0.0 {
+            if fit <= 1.0 && zoom <= fit * 1.02 {
+                self.preview_zoom = 0.0;
+            } else {
+                self.preview_zoom = zoom;
+                self.preview_center = center;
+            }
+        }
+        let stamp = PreviewStamp {
+            gen: self.slice_gen,
+            layer: self.preview_index,
+            width: tw,
+            height: th,
+            zoom: zoom.to_bits(),
+            cx: center[0].to_bits(),
+            cy: center[1].to_bits(),
+        };
+        let stale = self.preview_stamp.as_ref().is_none_or(|old| {
+            old.gen != stamp.gen
+                || old.layer != stamp.layer
+                || old.width != stamp.width
+                || old.height != stamp.height
+                || old.zoom != stamp.zoom
+                || old.cx != stamp.cx
+                || old.cy != stamp.cy
+        });
+        if stale {
+            if let Some(plate) = self.preview_plate.take() {
+                slice::preview_window(
+                    &plate.gray,
+                    plate.width,
+                    plate.height,
+                    tw,
+                    th,
+                    center,
+                    zoom,
+                    &plate.islands,
+                    &mut self.preview_pixels,
+                );
+                let image = egui::ColorImage::from_rgba_unmultiplied(
+                    [tw as usize, th as usize],
+                    &self.preview_pixels,
+                );
                 self.preview_tex = Some(ui.ctx().load_texture(
                     "layer-preview",
                     image,
-                    egui::TextureOptions::LINEAR,
+                    egui::TextureOptions::NEAREST,
                 ));
-                self.preview_for = Some(self.preview_index);
+                self.preview_stamp = Some(stamp);
+                self.preview_plate = Some(plate);
             }
         }
         if let Some(tex) = &self.preview_tex {
-            let size = ui.available_size();
-            let aspect = tex.aspect_ratio();
-            let mut w = size.x;
-            let mut h = w / aspect;
-            if h > size.y {
-                h = size.y;
-                w = h * aspect;
-            }
-            ui.image((tex.id(), egui::vec2(w.max(1.0), h.max(1.0))));
+            ui.painter().image(
+                tex.id(),
+                rect,
+                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                egui::Color32::WHITE,
+            );
         }
+    }
+
+    fn ensure_preview_plate(&mut self) -> bool {
+        let index = self.preview_index;
+        let gen = self.slice_gen;
+        if self
+            .preview_plate
+            .as_ref()
+            .is_some_and(|plate| plate.gen == gen && plate.layer == index)
+        {
+            return true;
+        }
+        let Some(slice) = &self.slice else {
+            self.preview_plate = None;
+            return false;
+        };
+        let Some(layer) = slice.layers.get(index) else {
+            return false;
+        };
+        let Ok(gray) = slice::decode_rle(&layer.rle, slice.width, slice.height) else {
+            return false;
+        };
+        let plate = PreviewPlate {
+            gen,
+            layer: index,
+            width: slice.width,
+            height: slice.height,
+            gray,
+            islands: layer.islands.clone(),
+        };
+        self.preview_plate = Some(plate);
+        self.preview_stamp = None;
+        true
     }
 }
 

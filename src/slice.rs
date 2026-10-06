@@ -2427,6 +2427,185 @@ pub fn preview_rgba(
     Ok((dw, dh, rgba))
 }
 
+/// How many screen pixels one printer pixel gets when the whole plate fits.
+pub fn preview_fit_zoom(src_w: u32, src_h: u32, out_w: u32, out_h: u32) -> f32 {
+    if src_w == 0 || src_h == 0 || out_w == 0 || out_h == 0 {
+        return 1.0;
+    }
+    (out_w as f32 / src_w as f32)
+        .min(out_h as f32 / src_h as f32)
+        .max(1e-4)
+}
+
+/// Keep a zoom that can still show the whole plate, and can still reach one
+/// printer pixel per screen pixel.
+pub fn clamp_preview_zoom(zoom: f32, fit: f32) -> f32 {
+    let fit = fit.max(1e-4);
+    zoom.clamp(fit.min(1.0), 32.0_f32.max(fit))
+}
+
+/// Source-pixel position under a point in the preview image.
+/// `tx` and `ty` are texture pixels, origin at the top left.
+pub fn source_at(
+    center: [f32; 2],
+    zoom: f32,
+    out_w: u32,
+    out_h: u32,
+    tx: f32,
+    ty: f32,
+) -> [f32; 2] {
+    let zoom = zoom.max(1e-4);
+    [
+        center[0] + (tx - out_w as f32 * 0.5) / zoom,
+        center[1] + (ty - out_h as f32 * 0.5) / zoom,
+    ]
+}
+
+/// Center that keeps `src` under the same preview point after a zoom change.
+pub fn center_keeping(
+    src: [f32; 2],
+    zoom: f32,
+    out_w: u32,
+    out_h: u32,
+    tx: f32,
+    ty: f32,
+) -> [f32; 2] {
+    let zoom = zoom.max(1e-4);
+    [
+        src[0] - (tx - out_w as f32 * 0.5) / zoom,
+        src[1] - (ty - out_h as f32 * 0.5) / zoom,
+    ]
+}
+
+/// Stop the plate sliding out of the window. A view larger than the plate
+/// stays centered on it.
+pub fn clamp_preview_center(
+    center: [f32; 2],
+    zoom: f32,
+    src_w: u32,
+    src_h: u32,
+    out_w: u32,
+    out_h: u32,
+) -> [f32; 2] {
+    let zoom = zoom.max(1e-4);
+    let half_x = out_w as f32 * 0.5 / zoom;
+    let half_y = out_h as f32 * 0.5 / zoom;
+    let cx = if half_x * 2.0 >= src_w as f32 {
+        src_w as f32 * 0.5
+    } else {
+        center[0].clamp(half_x, src_w as f32 - half_x)
+    };
+    let cy = if half_y * 2.0 >= src_h as f32 {
+        src_h as f32 * 0.5
+    } else {
+        center[1].clamp(half_y, src_h as f32 - half_y)
+    };
+    [cx, cy]
+}
+
+/// Draw the visible window of a decoded layer.
+///
+/// `zoom` is screen pixels per printer pixel, and `center` is the printer
+/// pixel in the middle of the window. Below 1:1 a texel covers several
+/// printer pixels and keeps any exposed one, so a thin gap is not dropped
+/// the way a single point sample drops it. At 1:1 and closer, each texel is
+/// the printer pixel under it.
+pub fn preview_window(
+    src: &[u8],
+    src_w: u32,
+    src_h: u32,
+    out_w: u32,
+    out_h: u32,
+    center: [f32; 2],
+    zoom: f32,
+    islands: &[Island],
+    out: &mut Vec<u8>,
+) {
+    let n = (out_w as usize)
+        .saturating_mul(out_h as usize)
+        .saturating_mul(4);
+    out.clear();
+    out.resize(n, 0);
+    if src_w == 0
+        || src_h == 0
+        || out_w == 0
+        || out_h == 0
+        || src.len() < (src_w as usize) * (src_h as usize)
+    {
+        return;
+    }
+    let zoom = zoom.max(1e-4);
+    let sw = src_w as i32;
+    let sh = src_h as i32;
+    for y in 0..out_h {
+        let sy0 = center[1] + (y as f32 - out_h as f32 * 0.5) / zoom;
+        let sy1 = sy0 + 1.0 / zoom;
+        for x in 0..out_w {
+            let sx0 = center[0] + (x as f32 - out_w as f32 * 0.5) / zoom;
+            let sx1 = sx0 + 1.0 / zoom;
+            let (v, ix, iy) = preview_cover(src, sw, sh, sx0, sy0, sx1, sy1);
+            let mut r = v;
+            let mut g = v;
+            let mut b = v;
+            if v > 0 {
+                for island in islands {
+                    if ix >= island.bbox[0]
+                        && iy >= island.bbox[1]
+                        && ix <= island.bbox[2]
+                        && iy <= island.bbox[3]
+                    {
+                        r = 230;
+                        g = 70;
+                        b = 60;
+                        break;
+                    }
+                }
+            }
+            let o = ((y as usize) * (out_w as usize) + x as usize) * 4;
+            out[o] = r;
+            out[o + 1] = g;
+            out[o + 2] = b;
+            out[o + 3] = 255;
+        }
+    }
+}
+
+/// Brightest printer pixel in the half-open source rectangle.
+/// A texel that covers one pixel or less reads that pixel, so zooming in
+/// does not smear a gap shut.
+fn preview_cover(src: &[u8], w: i32, h: i32, x0: f32, y0: f32, x1: f32, y1: f32) -> (u8, i32, i32) {
+    let (x0, x1) = if x1 < x0 { (x1, x0) } else { (x0, x1) };
+    let (y0, y1) = if y1 < y0 { (y1, y0) } else { (y0, y1) };
+    if x1 - x0 <= 1.001 && y1 - y0 <= 1.001 {
+        let ix = (x0 + (x1 - x0) * 0.5).floor() as i32;
+        let iy = (y0 + (y1 - y0) * 0.5).floor() as i32;
+        if ix < 0 || iy < 0 || ix >= w || iy >= h {
+            return (0, ix, iy);
+        }
+        let v = src[(iy as usize) * (w as usize) + ix as usize];
+        return (v, ix, iy);
+    }
+    let xa = (x0.floor() as i32).max(0);
+    let ya = (y0.floor() as i32).max(0);
+    let xb = (x1.ceil() as i32).min(w);
+    let yb = (y1.ceil() as i32).min(h);
+    let mut best = 0u8;
+    let mut bx = xa;
+    let mut by = ya;
+    for y in ya..yb {
+        let row = (y as usize) * (w as usize);
+        for x in xa..xb {
+            let v = src[row + x as usize];
+            if v >= best {
+                best = v;
+                bx = x;
+                by = y;
+            }
+        }
+    }
+    (best, bx, by)
+}
+
 /// The sliced layer as a plate-aligned image. Empty pixels are transparent.
 /// World millimetres go through the same mirror and rotation as the file,
 /// so a white pixel sits on the model that produced it.
@@ -3207,5 +3386,47 @@ mod tests {
             255,
             "the solid around the speckle was erased"
         );
+    }
+
+    #[test]
+    fn a_zoomed_out_preview_keeps_a_single_white_pixel() {
+        let mut src = vec![0u8; 8 * 8];
+        src[1 * 8 + 1] = 255;
+        let mut out = Vec::new();
+        preview_window(&src, 8, 8, 2, 2, [4.0, 4.0], 0.25, &[], &mut out);
+        assert_eq!(
+            &out[0..4],
+            &[255, 255, 255, 255],
+            "the lone pixel was dropped"
+        );
+        assert_eq!(out[4], 0, "a texel past that pixel turned white");
+    }
+
+    #[test]
+    fn a_one_to_one_preview_does_not_bleed_into_the_next_pixel() {
+        let mut src = vec![0u8; 8 * 8];
+        src[1 * 8 + 1] = 255;
+        let mut out = Vec::new();
+        preview_window(&src, 8, 8, 8, 8, [4.0, 4.0], 1.0, &[], &mut out);
+        let at = |x: u32, y: u32| out[((y * 8 + x) * 4) as usize];
+        assert_eq!(at(1, 1), 255);
+        assert_eq!(at(2, 1), 0);
+        assert_eq!(at(1, 2), 0);
+    }
+
+    #[test]
+    fn zooming_keeps_the_printer_pixel_under_the_pointer() {
+        let center = [100.0, 80.0];
+        let zoom = 0.5;
+        let tx = 40.0;
+        let ty = 70.0;
+        let src = source_at(center, zoom, 200, 100, tx, ty);
+        let next = center_keeping(src, 2.0, 200, 100, tx, ty);
+        let again = source_at(next, 2.0, 200, 100, tx, ty);
+        assert!((again[0] - src[0]).abs() < 1e-3);
+        assert!((again[1] - src[1]).abs() < 1e-3);
+        let parked = clamp_preview_center([-500.0, 4_000.0], 1.0, 200, 100, 40, 20);
+        assert!(parked[0] >= 20.0 && parked[0] <= 180.0);
+        assert!(parked[1] >= 10.0 && parked[1] <= 90.0);
     }
 }
