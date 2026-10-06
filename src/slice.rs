@@ -2070,6 +2070,30 @@ pub fn decode_rle(rle: &[u8], width: u32, height: u32) -> Result<Vec<u8>, String
     Ok(pixels)
 }
 
+/// One point per column: the lowest island in a cell.
+/// A floating blob is an island on many layers. A support wants the first one.
+pub fn island_contacts(
+    islands: impl IntoIterator<Item = (f32, f32, f32)>,
+    cell_mm: f32,
+) -> Vec<(f32, f32, f32)> {
+    let cell = cell_mm.max(0.2);
+    let mut map: HashMap<(i32, i32), (f32, f32, f32)> = HashMap::new();
+    for (x, y, z) in islands {
+        let key = ((x / cell).round() as i32, (y / cell).round() as i32);
+        map.entry(key)
+            .and_modify(|old| {
+                if z < old.2 {
+                    *old = (x, y, z);
+                }
+            })
+            .or_insert((x, y, z));
+    }
+    let mut out: Vec<(f32, f32, f32)> = map.into_values().collect();
+    out.sort_by(|a, b| a.2.total_cmp(&b.2).then(a.0.total_cmp(&b.0)));
+    out.truncate(500);
+    out
+}
+
 /// Downsample a decoded full-plate gray image. `island_boxes` tints matches red.
 pub fn preview_rgba(
     rle: &[u8],
@@ -2657,5 +2681,14 @@ mod tests {
             (got - extra).abs() < 2.0,
             "rest added {got}s, expected about {extra}"
         );
+    }
+
+    #[test]
+    fn island_contacts_keep_the_lowest_of_a_column() {
+        let marks = island_contacts([(1.0, 1.0, 5.0), (1.1, 0.9, 2.0), (8.0, 8.0, 4.0)], 0.8);
+        assert_eq!(marks.len(), 2);
+        let low = marks.iter().find(|point| point.0 < 3.0).unwrap();
+        assert!((low.2 - 2.0).abs() < 0.01, "lowest z {}", low.2);
+        assert!(marks.windows(2).all(|pair| pair[0].2 <= pair[1].2));
     }
 }

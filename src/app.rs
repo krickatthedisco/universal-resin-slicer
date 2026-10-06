@@ -160,6 +160,11 @@ pub struct AmberApp {
     job: Option<Job>,
     slice: Option<Slice>,
     slice_gen: u64,
+    /// Lowest island of each column from the last slice, while the models stay put.
+    island_marks: Vec<(f32, f32, f32)>,
+    island_stamp: u64,
+    island_gen: u64,
+    island_drawn: u64,
     preview_index: usize,
     preview_for: Option<usize>,
     preview_tex: Option<egui::TextureHandle>,
@@ -301,6 +306,10 @@ impl AmberApp {
             job: None,
             slice: None,
             slice_gen: 0,
+            island_marks: Vec::new(),
+            island_stamp: 0,
+            island_gen: 0,
+            island_drawn: 0,
             preview_index: 0,
             preview_for: None,
             preview_tex: None,
@@ -385,6 +394,24 @@ impl AmberApp {
                 self.status = line;
                 if !slice.warnings.is_empty() {
                     self.status = format!("{} · {}", self.status, slice.warnings.join(" "));
+                }
+                self.island_marks = slice::island_contacts(
+                    slice.layers.iter().flat_map(|layer| {
+                        layer
+                            .islands
+                            .iter()
+                            .map(|island| (island.x_mm, island.y_mm, island.z_mm))
+                    }),
+                    0.8,
+                );
+                self.island_stamp = self.model_stamp();
+                self.island_gen = self.island_gen.wrapping_add(1);
+                if !self.island_marks.is_empty() {
+                    self.status = format!(
+                        "{} · {} red island marks on the plate",
+                        self.status,
+                        self.island_marks.len()
+                    );
                 }
                 self.slice = Some(slice);
                 self.slice_gen = generation;
@@ -724,6 +751,7 @@ impl eframe::App for AmberApp {
             self.gesture = false;
             self.stroke_saved = false;
         }
+        self.sync_islands();
         for file in ctx.input(|i| i.raw.dropped_files.clone()) {
             self.import_path(file.path().to_path_buf());
         }
@@ -731,6 +759,7 @@ impl eframe::App for AmberApp {
             || self.frame.is_none()
             || self.measure_drawn != self.measure_gen
             || self.view_drawn != self.view_rev
+            || self.island_drawn != self.island_gen
         {
             let mut frame = self.view_cache.frame(
                 &self.doc,
@@ -740,16 +769,20 @@ impl eframe::App for AmberApp {
                 &self.hidden_models,
             );
             self.paint_measure(&mut frame);
+            self.paint_islands(&mut frame);
             frame.line_gen = frame
                 .line_gen
                 .wrapping_mul(31)
                 .wrapping_add(self.measure_gen)
                 .wrapping_mul(31)
-                .wrapping_add(self.view_rev);
+                .wrapping_add(self.view_rev)
+                .wrapping_mul(31)
+                .wrapping_add(self.island_gen);
             self.frame = Some(frame);
             self.draw_gen = self.doc.changed;
             self.measure_drawn = self.measure_gen;
             self.view_drawn = self.view_rev;
+            self.island_drawn = self.island_gen;
         }
 
         egui::Panel::top("menu").show(ui, |ui| self.menu(ui));
@@ -2010,6 +2043,12 @@ impl AmberApp {
     fn support_ui(&mut self, ui: &mut egui::Ui) {
         ui.heading("Support");
         ui.label("Click an underside to plant a tip. Click a tip to select it, then drag it to a new spot. Every control here applies only to the selected model.");
+        if !self.island_marks.is_empty() && self.model_stamp() == self.island_stamp {
+            ui.label(format!(
+                "{} red marks are islands from the last slice. Click one to plant a support. They stay until a model moves.",
+                self.island_marks.len()
+            ));
+        }
         ui.checkbox(&mut self.erase_supports, "Erase tips");
         if self.erase_supports {
             let _ = drag_f32(
@@ -2855,6 +2894,118 @@ impl AmberApp {
         }
     }
 
+    fn model_stamp(&self) -> u64 {
+        let mut hash = self.doc.objects.len() as u64;
+        for obj in &self.doc.objects {
+            let nums = [
+                obj.id,
+                obj.mesh_rev,
+                obj.position.x.to_bits() as u64,
+                obj.position.y.to_bits() as u64,
+                obj.position.z.to_bits() as u64,
+                obj.rotation_deg.x.to_bits() as u64,
+                obj.rotation_deg.y.to_bits() as u64,
+                obj.rotation_deg.z.to_bits() as u64,
+                obj.scale.x.to_bits() as u64,
+                obj.scale.y.to_bits() as u64,
+                obj.scale.z.to_bits() as u64,
+            ];
+            for n in nums {
+                hash = hash.wrapping_mul(0x9E37_79B1).wrapping_add(n);
+            }
+        }
+        hash
+    }
+
+    fn sync_islands(&mut self) {
+        if self.island_marks.is_empty() {
+            return;
+        }
+        if self.model_stamp() != self.island_stamp {
+            self.island_marks.clear();
+            self.island_gen = self.island_gen.wrapping_add(1);
+        }
+    }
+
+    fn paint_islands(&self, frame: &mut PlateFrame) {
+        if self.model_stamp() != self.island_stamp {
+            return;
+        }
+        let color = [0.90, 0.22, 0.18];
+        for &(x, y, z) in &self.island_marks {
+            let arm = 0.7;
+            frame.add_line(
+                Vec3::new(x - arm, y, z),
+                Vec3::new(x + arm, y, z),
+                color,
+            );
+            frame.add_line(
+                Vec3::new(x, y - arm, z),
+                Vec3::new(x, y + arm, z),
+                color,
+            );
+            frame.add_line(Vec3::new(x, y, z), Vec3::new(x, y, z + 1.4), color);
+        }
+    }
+
+    fn island_near(&self, origin: Vec3, dir: Vec3) -> Option<Vec3> {
+        if self.model_stamp() != self.island_stamp {
+            return None;
+        }
+        let limit = self.tip_pick_mm();
+        let mut best: Option<(f32, Vec3)> = None;
+        for &(x, y, z) in &self.island_marks {
+            let tip = Vec3::new(x, y, z);
+            let along = (tip - origin).dot(dir);
+            if along < 0.0 {
+                continue;
+            }
+            let dist = (tip - (origin + dir * along)).length();
+            if dist <= limit && best.map(|(old, _)| dist < old).unwrap_or(true) {
+                best = Some((dist, tip));
+            }
+        }
+        best.map(|(_, point)| point)
+    }
+
+    fn model_under(&self, point: Vec3) -> Option<u64> {
+        let contains = |id: u64| {
+            self.doc
+                .object(id)
+                .and_then(Document::display_bounds)
+                .is_some_and(|(min, max)| {
+                    point.x >= min.x - 1.5
+                        && point.x <= max.x + 1.5
+                        && point.y >= min.y - 1.5
+                        && point.y <= max.y + 1.5
+                        && point.z >= min.z - 1.0
+                        && point.z <= max.z + 1.5
+                })
+        };
+        if let Some(id) = self.doc.edit_target() {
+            if contains(id) {
+                return Some(id);
+            }
+        }
+        self.doc
+            .objects
+            .iter()
+            .find(|obj| contains(obj.id))
+            .map(|obj| obj.id)
+    }
+
+    fn plant_mark(&mut self, point: Vec3) {
+        let Some(id) = self.model_under(point) else {
+            self.status = "That island mark is not on a model.".into();
+            return;
+        };
+        self.doc.add_support_at(point, id);
+        self.invalidate_slice();
+        self.status =
+            "Planted a support on that island. The other red marks stay until a model moves or you slice again."
+                .into();
+    }
+
     fn tip_pick_mm(&self) -> f32 {
         (self.camera.distance * 0.02).clamp(1.2, 8.0)
     }
@@ -2976,7 +3127,7 @@ impl AmberApp {
                 ui.separator();
                 ui.label("Simple is the short path. Workshop is every control: rafts, rest times, compensation, and the rest.");
                 ui.label("Right-click a model for the same edits. Right-drag orbits, and you can swing under the bed. The bed turns clear so you can click an underside.");
-                ui.label("View → Cut the view hides the model above a height, so you can click the surface that is left and place a support there. The checkbox beside a model hides it in the view. It still prints. Tips only draws the contact points.");
+                ui.label("View → Cut the view hides the model above a height, so you can click the surface that is left and place a support there. The checkbox beside a model hides it in the view. It still prints. Tips only draws the contact points. After a slice, red marks on the plate are islands. Click one with Support to plant a tip there.");
                 ui.separator();
                 ui.label("Ctrl+O open    Ctrl+Z undo    Ctrl+D duplicate    Delete remove");
                 ui.label("Ctrl+Enter slice    Ctrl+S save    F1 this page");
@@ -3226,6 +3377,8 @@ impl AmberApp {
                     self.doc.touch_xform();
                     self.status =
                         "Tip selected. Drag it to move the contact. Delete removes it.".into();
+                } else if let Some(point) = self.island_near(origin, dir) {
+                    self.plant_mark(point);
                 } else if let Some((id, point, _)) = self.visible_hit(origin, dir) {
                     self.doc.add_support_at(point, id);
                     self.invalidate_slice();
@@ -3271,6 +3424,7 @@ impl AmberApp {
     }
 
     fn preview(&mut self, ui: &mut egui::Ui) {
+        let mark_note = !self.island_marks.is_empty() && self.model_stamp() == self.island_stamp;
         let Some(slice) = &self.slice else {
             ui.label("Slice the plate to see layers. Islands show up in red.");
             return;
@@ -3288,6 +3442,9 @@ impl AmberApp {
                 self.status = "Copied the print summary.".into();
             }
         });
+        if mark_note {
+            ui.label("Red marks on the plate (Prepare) are these islands. Support, then click a mark.");
+        }
         let (caption, seals) = {
             let layer = &slice.layers[self.preview_index];
             (
