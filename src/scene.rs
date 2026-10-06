@@ -5,12 +5,13 @@ use crate::slice::{Drain, Hollow, Solid};
 use crate::supports::{self, Support, SupportStyle};
 use anyhow::Result;
 use glam::{EulerRot, Mat4, Quat, Vec3};
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::Path;
 
 /// Support and raft settings that belong to one model. Changing them does
 /// not reshape the supports on any other model.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct ModelSupport {
     pub preset: usize,
     pub style: SupportStyle,
@@ -46,7 +47,7 @@ pub struct Object {
     pub bounds_max: [f32; 3],
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct DrainHole {
     pub id: u64,
     pub origin: Vec3,
@@ -268,6 +269,39 @@ impl Document {
         self.center_object(id);
         self.drop_object(id);
         Ok(id)
+    }
+
+    /// Replace the plate with a saved one. Undo history starts over.
+    pub fn load_plate(
+        &mut self,
+        mut objects: Vec<Object>,
+        supports: Vec<Support>,
+        drains: Vec<DrainHole>,
+    ) {
+        let mut next = 1u64;
+        for obj in &mut objects {
+            cache_bounds(obj);
+            obj.mesh_rev = obj.mesh_rev.max(1);
+            next = next.max(obj.id.saturating_add(1));
+        }
+        for support in &supports {
+            next = next.max(support.id.saturating_add(1));
+        }
+        for drain in &drains {
+            next = next.max(drain.id.saturating_add(1));
+        }
+        self.objects = objects;
+        self.supports = supports;
+        self.drains = drains;
+        self.selection = if self.objects.len() == 1 {
+            Selection::Object(self.objects[0].id)
+        } else {
+            Selection::None
+        };
+        self.undo.clear();
+        self.redo.clear();
+        self.next_id = next;
+        self.touch();
     }
 
     pub fn object(&self, id: u64) -> Option<&Object> {

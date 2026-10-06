@@ -8,6 +8,7 @@ pub mod catalog;
 pub mod cli;
 pub mod community;
 pub mod mesh;
+pub mod plate;
 pub mod pm3m;
 pub mod printer;
 pub mod resins;

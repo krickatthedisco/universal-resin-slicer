@@ -149,7 +149,7 @@ impl SupportStyle {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct Support {
     pub id: u64,
     /// Model this pillar was grown for. Later edits stay on that model.

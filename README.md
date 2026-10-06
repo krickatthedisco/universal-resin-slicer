@@ -39,7 +39,7 @@ Amber is not affiliated with Anycubic or Elegoo. A resin row is copied from a ma
 
 ## What the window does
 
-- Import STL (binary or ASCII), OBJ, and 3MF. Drop files on the plate. The status line says the next step, from opening a model through saving the file. Ctrl+Z undoes. Ctrl+Y redo puts that edit back.
+- Import STL (binary or ASCII), OBJ, and 3MF. Drop files on the plate. File → Save plate writes an `.amber` file with the models, supports, holes, printer, and resin settings. Open plate, or drop that file, puts them back. Ctrl+Shift+S saves it again. Ctrl+S still writes the sliced file the printer reads. The status line says the next step, from opening a model through saving the file. Ctrl+Z undoes. Ctrl+Y redo puts that edit back.
 - Printer list with search. Picking a printer sets the plate, the pixel size, and that machine's lift defaults. It does not invent an exposure.
 - Resin list with search. It starts filtered to resins that have a published profile for the printer you picked; uncheck that to see the whole library. A dot means this printer has a published starting point. Elegoo rows are the 2023-12-11 official sheet (Mars, Saturn, and Jupiter, including color). Anycubic rows are the Photon M3 Max store guide from November 2023. Other bottles are named so you can find them, without a guessed cure time.
 - A Measure tool: click two points and read the distance. Recent files stay in the File menu. Models can be renamed in the list.

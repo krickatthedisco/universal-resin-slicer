@@ -3,6 +3,7 @@
 use crate::catalog;
 use crate::community;
 use crate::mesh::{calibration_cube, overhang_bridge};
+use crate::plate::{self, PlateData};
 use crate::pm3m::write_pm3m;
 use crate::printer::{Machine, PrintSettings};
 use crate::resins::{self, Resin, ResinProfile};
@@ -183,6 +184,8 @@ pub struct AmberApp {
     cut_z: f32,
     workshop: bool,
     recent: Vec<String>,
+    /// Last `.amber` plate, so Save can overwrite it.
+    plate_path: Option<PathBuf>,
     /// 0 home, 1 printer, 2 resin. Only the Simple view uses it.
     simple_page: u8,
     help_open: bool,
@@ -328,6 +331,7 @@ impl AmberApp {
             cut_z: 10.0,
             workshop,
             recent,
+            plate_path: None,
             simple_page: 0,
             help_open: false,
             measure_a: None,
@@ -562,6 +566,14 @@ impl AmberApp {
     }
 
     fn import_path(&mut self, path: PathBuf) {
+        if path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("amber"))
+        {
+            self.open_plate_file(path);
+            return;
+        }
         match self.doc.import(&path) {
             Ok(id) => {
                 self.doc
@@ -574,6 +586,103 @@ impl AmberApp {
                 self.view = View::Prepare;
             }
             Err(err) => self.status = err.to_string(),
+        }
+    }
+
+    fn plate_data(&self) -> PlateData {
+        PlateData {
+            machine_id: self.machine.id.to_string(),
+            rotate_180: self.machine.rotate_180,
+            mirror_x: self.machine.mirror_x,
+            mirror_y: self.machine.mirror_y,
+            settings: self.settings.clone(),
+            objects: self.doc.objects.clone(),
+            supports: self.doc.supports.clone(),
+            drains: self.doc.drains.clone(),
+        }
+    }
+
+    fn save_plate(&mut self, ask: bool) {
+        let path = if ask || self.plate_path.is_none() {
+            let name = self
+                .plate_path
+                .as_ref()
+                .and_then(|path| path.file_name())
+                .and_then(|name| name.to_str())
+                .unwrap_or("plate.amber")
+                .to_string();
+            let Some(path) = rfd::FileDialog::new()
+                .set_file_name(name)
+                .add_filter("Amber plate", &["amber"])
+                .save_file()
+            else {
+                return;
+            };
+            with_amber_extension(path)
+        } else {
+            self.plate_path.clone().unwrap_or_else(|| PathBuf::from("plate.amber"))
+        };
+        match plate::write_plate(&path, &self.plate_data()) {
+            Ok(()) => {
+                self.plate_path = Some(path.clone());
+                self.remember_recent(&path);
+                self.status = format!(
+                    "Saved the plate to {}. Open it later with File → Open plate.",
+                    path.display()
+                );
+            }
+            Err(err) => self.status = err.to_string(),
+        }
+    }
+
+    fn open_plate_dialog(&mut self) {
+        if let Some(path) = rfd::FileDialog::new()
+            .add_filter("Amber plate", &["amber"])
+            .pick_file()
+        {
+            self.open_plate_file(path);
+        }
+    }
+
+    fn open_plate_file(&mut self, path: PathBuf) {
+        let data = match plate::read_plate(&path) {
+            Ok(data) => data,
+            Err(err) => {
+                self.status = err.to_string();
+                return;
+            }
+        };
+        let count = data.objects.len();
+        let supports = data.supports.len();
+        if let Some(profile) = catalog::find(&data.machine_id) {
+            let rotate = data.rotate_180;
+            let mirror_x = data.mirror_x;
+            let mirror_y = data.mirror_y;
+            self.machine = Machine::from_profile(profile);
+            self.machine.rotate_180 = rotate;
+            self.machine.mirror_x = mirror_x;
+            self.machine.mirror_y = mirror_y;
+        } else {
+            self.status = format!(
+                "Opened the models. Printer {} is not in this list, so the printer stays {}.",
+                data.machine_id, self.machine.name
+            );
+        }
+        self.settings = data.settings;
+        self.doc
+            .load_plate(data.objects, data.supports, data.drains);
+        self.export_name = default_export_name(&self.doc, self.machine.extension);
+        self.camera = Camera::looking_at_plate(self.plate());
+        self.invalidate_slice();
+        self.plate_path = Some(path.clone());
+        self.remember_recent(&path);
+        self.view = View::Prepare;
+        self.simple_page = 0;
+        if catalog::find(&data.machine_id).is_some() {
+            self.status = format!(
+                "Opened {} · {count} models · {supports} supports. Slice again before you print.",
+                path.display()
+            );
         }
     }
 
@@ -618,7 +727,12 @@ impl AmberApp {
         let duplicate = ctx.input(|i| i.key_pressed(egui::Key::D) && i.modifiers.command);
         let open = ctx.input(|i| i.key_pressed(egui::Key::O) && i.modifiers.command);
         let slice_now = ctx.input(|i| i.key_pressed(egui::Key::Enter) && i.modifiers.command);
-        let save = ctx.input(|i| i.key_pressed(egui::Key::S) && i.modifiers.command);
+        let save_plate = ctx.input(|i| {
+            i.key_pressed(egui::Key::S) && i.modifiers.command && i.modifiers.shift
+        });
+        let save = ctx.input(|i| {
+            i.key_pressed(egui::Key::S) && i.modifiers.command && !i.modifiers.shift
+        });
         let help = ctx.input(|i| i.key_pressed(egui::Key::F1));
         let fit = ctx.input(|i| i.key_pressed(egui::Key::F));
         if help {
@@ -632,6 +746,9 @@ impl AmberApp {
         }
         if slice_now && self.job.is_none() {
             self.start_slice(false);
+        }
+        if save_plate && self.job.is_none() {
+            self.save_plate(false);
         }
         if save && self.job.is_none() {
             self.export_print(false);
@@ -815,6 +932,14 @@ impl AmberApp {
             ui.menu_button("File", |ui| {
                 if ui.button("Open STL, OBJ, or 3MF…").clicked() {
                     self.open_dialog();
+                    ui.close();
+                }
+                if ui.button("Open plate…").clicked() {
+                    self.open_plate_dialog();
+                    ui.close();
+                }
+                if ui.button("Save plate…").clicked() {
+                    self.save_plate(true);
                     ui.close();
                 }
                 if !self.recent.is_empty() {
@@ -1269,6 +1394,10 @@ impl AmberApp {
         ui.label("File name on the USB stick");
         ui.text_edit_singleline(&mut self.export_name);
         ui.label("Keep it short. The Photon skips a very long name.");
+        if ui.button("Save this plate…").clicked() {
+            self.save_plate(true);
+        }
+        ui.label("That keeps the models and supports. It is not the file the printer reads.");
         let slicing = self.job.is_some();
         let save = egui::Button::new("Slice and save…").fill(egui::Color32::from_rgb(224, 122, 47));
         if ui.add_enabled(!slicing, save).clicked() {
@@ -3184,12 +3313,14 @@ impl AmberApp {
                 ui.label("3. If the model is hollow, punch a hole at the bottom so resin can drain.");
                 ui.label("4. If a part floats or has a steep underside, add supports. They lift the model off the bed.");
                 ui.label("5. Slice and save. Copy that file onto a USB stick and print it from the printer.");
+                ui.label("File → Save plate keeps the models, supports, and holes in an .amber file. Ctrl+Shift+S saves it again. That is not the file the printer reads.");
                 ui.separator();
                 ui.label("Simple is the short path. Workshop is every control: rafts, rest times, compensation, and the rest.");
                 ui.label("Right-click a model for the same edits. Right-drag orbits, and you can swing under the bed. The bed turns clear so you can click an underside.");
                 ui.label("View → Cut the view hides the model above a height, so you can click the surface that is left and place a support there. The checkbox beside a model hides it in the view. It still prints. Tips only draws the contact points. After a slice, red marks on the plate are islands. Click one with Support to plant a tip there.");
                 ui.separator();
-                ui.label("Ctrl+O open    Ctrl+Z undo    Ctrl+Y redo    Ctrl+D duplicate    Delete remove");
+                ui.label("Ctrl+O open    Ctrl+Shift+S save the plate    Ctrl+S save the sliced file");
+                ui.label("Ctrl+Z undo    Ctrl+Y redo    Ctrl+D duplicate    Delete remove");
                 ui.label("Ctrl+Enter slice    Ctrl+S save    F1 this page");
                 ui.label("On the plate, the arrow keys nudge the model by 1 mm (Shift is 0.1 mm). F fits the camera. In the layer view, the arrows step through layers.");
                 ui.separator();
@@ -3707,6 +3838,18 @@ fn sanitize_filename(name: &str, ext: &str) -> String {
         stem = "print".into();
     }
     format!("{stem}.{ext}")
+}
+
+fn with_amber_extension(path: PathBuf) -> PathBuf {
+    if path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("amber"))
+    {
+        path
+    } else {
+        path.with_extension("amber")
+    }
 }
 
 fn default_export_name(doc: &Document, ext: &str) -> String {
