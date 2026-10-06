@@ -1,8 +1,8 @@
-//! Built-in shapes and calibration pieces.
+//! Built-in shapes.
 //!
 //! Primitives are generated here. #3DBenchy is the original public-domain
-//! STL. The exposure tests are Amber's own models. AmeraLabs Town and the
-//! Cones of Calibration are not bundled; their pages are linked from the menu.
+//! STL. Exposure tests such as AmeraLabs Town and the Cones of Calibration
+//! are not bundled; their pages are linked from the menu.
 
 use crate::mesh::{box_mesh, mesh_from_stl_bytes, Mesh};
 
@@ -191,135 +191,6 @@ pub fn drain_cup() -> Mesh {
     mesh
 }
 
-/// Towers, an arch, and a thin fin. Amber's own exposure city, not a copy
-/// of anyone else's calibration town.
-pub fn exposure_city() -> Mesh {
-    let mut mesh = box_mesh([0.0, 0.0, 0.0], [28.0, 16.0, 1.6]);
-    let towers = [
-        (2.0_f32, 3.2_f32, 10.0_f32),
-        (6.2, 2.2, 8.5),
-        (9.4, 1.4, 7.0),
-        (11.8, 0.9, 6.0),
-        (13.6, 0.55, 5.0),
-        (15.0, 0.32, 4.2),
-    ];
-    for (x, w, h) in towers {
-        mesh.append(&box_mesh([x, 10.5, 1.6], [x + w, 14.4, 1.6 + h]));
-    }
-    mesh.append(&box_mesh([18.0, 2.0, 1.6], [20.2, 6.4, 8.0]));
-    mesh.append(&box_mesh([25.2, 2.0, 1.6], [27.2, 6.4, 8.0]));
-    mesh.append(&box_mesh([18.0, 2.0, 8.0], [27.2, 6.4, 9.6]));
-    mesh.append(&box_mesh([2.0, 2.2, 1.6], [2.45, 8.5, 7.5]));
-    seat(&mut mesh);
-    mesh
-}
-
-/// Posts from thick to hairline, so the thinnest one that survives is the limit.
-pub fn pin_card() -> Mesh {
-    let mut mesh = box_mesh([0.0, 0.0, 0.0], [30.0, 10.0, 1.4]);
-    let pins = [1.8_f32, 1.2, 0.8, 0.5, 0.3];
-    for (i, diam) in pins.iter().enumerate() {
-        let mut pin = cylinder(diam * 0.5, 7.0);
-        pin.translate([4.0 + i as f32 * 5.2, 5.0, 1.4]);
-        mesh.append(&pin);
-    }
-    seat(&mut mesh);
-    mesh
-}
-
-/// Slots from wide to narrow. The smallest one that stays open is the limit.
-pub fn hole_card() -> Mesh {
-    let slots = [2.2_f32, 1.5, 1.0, 0.6, 0.35];
-    let gap = 1.8_f32;
-    let margin = 2.2_f32;
-    let depth = 6.0_f32;
-    let rail = 2.0_f32;
-    let h = 2.4_f32;
-    let span = margin * 2.0 + slots.iter().sum::<f32>() + gap * (slots.len() - 1) as f32;
-    let mut mesh = Mesh::empty();
-    mesh.append(&box_mesh([0.0, 0.0, 0.0], [span, rail, h]));
-    mesh.append(&box_mesh(
-        [0.0, rail + depth, 0.0],
-        [span, rail * 2.0 + depth, h],
-    ));
-    mesh.append(&box_mesh([0.0, rail, 0.0], [margin, rail + depth, h]));
-    let mut x = margin;
-    for (i, width) in slots.iter().enumerate() {
-        x += width;
-        if i + 1 != slots.len() {
-            mesh.append(&box_mesh([x, rail, 0.0], [x + gap, rail + depth, h]));
-            x += gap;
-        }
-    }
-    mesh.append(&box_mesh([x, rail, 0.0], [x + margin, rail + depth, h]));
-    seat(&mut mesh);
-    mesh
-}
-
-/// Overhangs at 30°, 45°, 60°, and 75° from vertical.
-pub fn slope_card() -> Mesh {
-    let mut mesh = Mesh::empty();
-    let angles = [30.0_f32, 45.0, 60.0, 75.0];
-    for (i, angle) in angles.iter().enumerate() {
-        let mut block = slope_wedge(*angle, 6.0, 8.0);
-        block.translate([i as f32 * 8.0, 0.0, 0.0]);
-        mesh.append(&block);
-    }
-    seat(&mut mesh);
-    mesh
-}
-
-fn slope_wedge(angle_from_vertical: f32, width: f32, height: f32) -> Mesh {
-    let run = height * angle_from_vertical.to_radians().tan();
-    let foot = 1.5_f32;
-    let y_lip = foot + run;
-    let p = [
-        [0.0, 0.0, 0.0],
-        [width, 0.0, 0.0],
-        [width, y_lip, 0.0],
-        [0.0, y_lip, 0.0],
-        [0.0, 0.0, height],
-        [width, 0.0, height],
-    ];
-    let mut mesh = Mesh::empty();
-    push_tri(&mut mesh, p[0], p[2], p[1]);
-    push_tri(&mut mesh, p[0], p[3], p[2]);
-    push_tri(&mut mesh, p[0], p[5], p[4]);
-    push_tri(&mut mesh, p[0], p[1], p[5]);
-    push_tri(&mut mesh, p[0], p[4], p[3]);
-    push_tri(&mut mesh, p[1], p[2], p[5]);
-    push_tri(&mut mesh, p[4], p[5], p[2]);
-    push_tri(&mut mesh, p[4], p[2], p[3]);
-    mesh
-}
-
-/// A raised digit, 1 through 8, sitting on the bed. Used to mark a RERF zone.
-pub fn digit_mesh(n: u8) -> Mesh {
-    let rows: [&str; 5] = match n {
-        1 => [".#.", "##.", ".#.", ".#.", "###"],
-        2 => ["###", "..#", "###", "#..", "###"],
-        3 => ["###", "..#", "###", "..#", "###"],
-        4 => ["#.#", "#.#", "###", "..#", "..#"],
-        5 => ["###", "#..", "###", "..#", "###"],
-        6 => ["#..", "#..", "###", "#.#", "###"],
-        7 => ["###", "..#", "..#", "..#", "..#"],
-        _ => ["###", "#.#", "###", "#.#", "###"],
-    };
-    let pitch = 1.55_f32;
-    let pix = 1.25_f32;
-    let mut mesh = Mesh::empty();
-    for (row, pattern) in rows.iter().enumerate() {
-        for (col, ch) in pattern.chars().enumerate() {
-            if ch == '#' {
-                let x = col as f32 * pitch;
-                let y = (4 - row) as f32 * pitch;
-                mesh.append(&box_mesh([x, y, 0.0], [x + pix, y + pitch * 0.8, 0.8]));
-            }
-        }
-    }
-    mesh
-}
-
 pub fn seat(mesh: &mut Mesh) {
     let Some((min, max)) = mesh.bounds() else {
         return;
@@ -436,7 +307,7 @@ mod tests {
 
     #[test]
     fn primitives_are_closed_and_sit_on_the_bed() {
-        let made: [(&str, Mesh); 18] = [
+        let made: [(&str, Mesh); 13] = [
             ("cube", cube(10.0)),
             ("sphere", sphere(8.0)),
             ("hemisphere", hemisphere(8.0)),
@@ -450,11 +321,6 @@ mod tests {
             ("hex", hex_prism(8.0, 10.0)),
             ("slab", slab(20.0, 12.0, 2.0)),
             ("cup", drain_cup()),
-            ("city", exposure_city()),
-            ("pins", pin_card()),
-            ("holes", hole_card()),
-            ("slopes", slope_card()),
-            ("digit", digit_mesh(8)),
         ];
         for (name, mesh) in made {
             positive(name, &mesh);

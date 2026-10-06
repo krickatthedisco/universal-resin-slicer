@@ -969,12 +969,12 @@ impl AmberApp {
                 let exposure = self.settings.exposure_s;
                 self.status = if anycubic {
                     format!(
-                        "Placed {} copies. Zone 1 is the left column and uses the normal exposure ({exposure:.2} s). Save as R_E_R_F so the printer steps the time, often by 0.25 s. Check this machine's manual.{scale}",
+                        "Placed {} copies in a 4 by 2 grid, each one centered in its box. Zone 1 is the front-left box and uses the normal exposure ({exposure:.2} s). Save as R_E_R_F so the printer steps the time, often by 0.25 s. Rotate 180° can swap which corner that is. Check this machine's manual.{scale}",
                         spread.count
                     )
                 } else {
                     format!(
-                        "Placed {} copies across the plate, one per zone. {} exposes every zone the same ({exposure:.2} s). The grid is the usual 8-column test.{scale}",
+                        "Placed {} copies in a 4 by 2 grid, each one centered in its box. {} exposes every zone the same ({exposure:.2} s).{scale}",
                         spread.count, self.machine.name
                     )
                 };
@@ -1309,39 +1309,35 @@ impl AmberApp {
                         }
                     }
                 });
-                ui.menu_button("Add a RERF model", |ui| {
-                    ui.label("Amber's own exposure tests. Right-click a model to lay out the printer's RERF grid.");
+                ui.menu_button("Calibration models", |ui| {
+                    ui.label("These pages have the real exposure tests. Amber does not ship the files.");
                     if ui
-                        .button("Exposure city")
-                        .on_hover_text("Towers, an arch, and a thin fin. Not the AmeraLabs town.")
+                        .button("AmeraLabs Town…")
+                        .on_hover_text("Download the town, then right-click it and choose Arrange on the RERF grid.")
                         .clicked()
                     {
-                        self.add_shape("Exposure city", shapes::exposure_city());
-                        ui.close();
-                    }
-                    if ui.button("Pin card").clicked() {
-                        self.add_shape("Pin card", shapes::pin_card());
-                        ui.close();
-                    }
-                    if ui.button("Hole card").clicked() {
-                        self.add_shape("Hole card", shapes::hole_card());
-                        ui.close();
-                    }
-                    if ui.button("Slope card").clicked() {
-                        self.add_shape("Slope card", shapes::slope_card());
-                        ui.close();
-                    }
-                    ui.separator();
-                    ui.label("Not bundled. Their licenses do not allow shipping the file.");
-                    if ui.button("AmeraLabs Town…").clicked() {
                         ui.ctx().open_url(egui::OpenUrl::new_tab(
                             "https://ameralabs.com/blog/town-calibration-part/",
                         ));
                         ui.close();
                     }
-                    if ui.button("Cones of Calibration…").clicked() {
+                    if ui
+                        .button("Cones of Calibration…")
+                        .on_hover_text("Tableflip Foundry. The download page is the license.")
+                        .clicked()
+                    {
                         ui.ctx().open_url(egui::OpenUrl::new_tab(
                             "https://www.tableflipfoundry.com/3d-printing/the-cones-of-calibration-v3/",
+                        ));
+                        ui.close();
+                    }
+                    if ui
+                        .button("Photonsters XP2 matrix…")
+                        .on_hover_text("The Validation Matrix STL is on the GitHub release. That repository has no license that lets Amber ship the file.")
+                        .clicked()
+                    {
+                        ui.ctx().open_url(egui::OpenUrl::new_tab(
+                            "https://github.com/Photonsters/Resin-exposure-finder-v2/releases",
                         ));
                         ui.close();
                     }

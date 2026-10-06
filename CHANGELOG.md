@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.3
+
+- File → Calibration models opens AmeraLabs Town, the Cones of Calibration, and the Photonsters XP2 matrix. Amber's own city, pin, hole, and slope cards are gone.
+- Right-click → Arrange on the RERF grid puts eight copies in a 4 by 2 grid, each one centered in its box. The copies are the model only. No digits are added.
+
 ## 0.2.2
 
 - Split a model into objects or into parts, assemble several models into one object, and mark a volume as negative so it cuts only its siblings. Union, subtract, and intersect bake two meshes into one. Shift-click picks the second model. Undo puts the plate back.

@@ -1828,8 +1828,8 @@ impl Document {
         Ok(())
     }
 
-    /// Copy the model into each column of this printer's RERF grid.
-    /// A digit is baked into the front of each copy so the zones stay labelled.
+    /// Copy the model into the eight boxes of a 4 by 2 RERF grid.
+    /// Each copy is centered in its box. Nothing extra is added to the mesh.
     pub fn spread_on_rerf(
         &mut self,
         id: u64,
@@ -1865,11 +1865,6 @@ impl Document {
                 v[1] = slot.center_y + (v[1] - center[1]) * fit;
                 v[2] = (v[2] - center[2]) * fit;
             }
-            let mut digit = crate::shapes::digit_mesh(slot.index as u8);
-            let (dmin, dmax) = digit.bounds().unwrap_or(([0.0; 3], [1.0; 3]));
-            let dw = dmax[0] - dmin[0];
-            digit.translate([slot.center_x - dw * 0.5 - dmin[0], 1.2 - dmin[1], -dmin[2]]);
-            placed.append(&digit);
             let name = format!("{base} {}", slot.index);
             if i == 0 {
                 if let Some(piece) = self.object_mut(id) {
@@ -2041,31 +2036,36 @@ struct RerfSlot {
     depth: f32,
 }
 
-/// Eight columns across the plate, fewer when a column would be under 12 mm.
+/// Four columns and two rows. Zone 1 is the front-left box (low X, low Y),
+/// then left to right, front row then back row. A model is fit inside its
+/// box with a small margin so it does not cross into the next exposure.
 fn rerf_slots(plate_x: f32, plate_y: f32) -> Vec<RerfSlot> {
-    if plate_x < 24.0 || plate_y < 16.0 {
+    const COLS: u32 = 4;
+    const ROWS: u32 = 2;
+    if plate_x < 48.0 || plate_y < 24.0 {
         return Vec::new();
     }
-    let mut columns = 8u32;
-    while columns > 2 && plate_x / (columns as f32) < 12.0 {
-        columns -= 1;
-    }
-    let cell = plate_x / columns as f32;
-    let digit_band = 9.0_f32.min(plate_y * 0.34);
-    let y0 = digit_band;
-    let y1 = plate_y - 1.0;
-    if y1 - y0 < 6.0 {
+    let cell_w = plate_x / COLS as f32;
+    let cell_h = plate_y / ROWS as f32;
+    if cell_w < 12.0 || cell_h < 12.0 {
         return Vec::new();
     }
-    (0..columns)
-        .map(|i| RerfSlot {
-            index: (i + 1) as u8,
-            center_x: (i as f32 + 0.5) * cell,
-            center_y: (y0 + y1) * 0.5,
-            width: (cell - 1.6).max(1.0),
-            depth: (y1 - y0 - 1.0).max(1.0),
-        })
-        .collect()
+    let margin = 2.0_f32.min(cell_w * 0.08).min(cell_h * 0.08);
+    let mut slots = Vec::with_capacity((COLS * ROWS) as usize);
+    let mut index = 1u8;
+    for row in 0..ROWS {
+        for col in 0..COLS {
+            slots.push(RerfSlot {
+                index,
+                center_x: (col as f32 + 0.5) * cell_w,
+                center_y: (row as f32 + 0.5) * cell_h,
+                width: (cell_w - margin * 2.0).max(1.0),
+                depth: (cell_h - margin * 2.0).max(1.0),
+            });
+            index += 1;
+        }
+    }
+    slots
 }
 
 fn cache_bounds(obj: &mut Object) {
@@ -2529,28 +2529,47 @@ mod tests {
     }
 
     #[test]
-    fn rerf_puts_one_copy_in_each_column() {
+    fn rerf_centers_one_copy_in_each_box() {
         let mut doc = Document::new();
         let id = doc.add_mesh("pin".into(), box_mesh([0.0, 0.0, 0.0], [8.0, 8.0, 4.0]));
         let spread = doc.spread_on_rerf(id, 160.0, 80.0, 100.0).unwrap();
         assert_eq!(spread.count, 8);
         assert_eq!(doc.objects.len(), 8);
         assert!((spread.scale - 1.0).abs() < 1e-3);
-        let mut xs: Vec<f32> = doc
-            .objects
-            .iter()
-            .map(|obj| {
-                let (min, max) = Document::world_bounds(obj).unwrap();
-                (min.x + max.x) * 0.5
-            })
-            .collect();
-        xs.sort_by(|a, b| a.total_cmp(b));
-        let step = xs[1] - xs[0];
-        assert!((step - 20.0).abs() < 1.5, "step {step}");
-        for window in xs.windows(2) {
-            assert!(window[1] - window[0] > 10.0);
+        let mut seen = [[false; 4]; 2];
+        for obj in &doc.objects {
+            assert_eq!(obj.mesh.triangle_count(), 12, "a digit was added");
+            let (min, max) = Document::world_bounds(obj).unwrap();
+            let cx = (min.x + max.x) * 0.5;
+            let cy = (min.y + max.y) * 0.5;
+            let col = (cx / 40.0 - 0.5).round();
+            let row = (cy / 40.0 - 0.5).round();
+            assert!((0.0..4.0).contains(&col), "col {col}");
+            assert!((0.0..2.0).contains(&row), "row {row}");
+            assert!((cx - (col + 0.5) * 40.0).abs() < 0.05, "cx {cx}");
+            assert!((cy - (row + 0.5) * 40.0).abs() < 0.05, "cy {cy}");
+            assert!((max.x - min.x - 8.0).abs() < 0.05);
+            assert!((max.y - min.y - 8.0).abs() < 0.05);
+            assert!((max.z - min.z - 4.0).abs() < 0.05);
+            assert!(min.z.abs() < 0.05);
+            seen[row as usize][col as usize] = true;
         }
+        assert!(seen.iter().flatten().all(|filled| *filled));
+        let zone1 = doc.objects.iter().find(|obj| obj.name == "pin 1").unwrap();
+        let (min, max) = Document::world_bounds(zone1).unwrap();
+        assert!(((min.x + max.x) * 0.5 - 20.0).abs() < 0.05);
+        assert!(((min.y + max.y) * 0.5 - 20.0).abs() < 0.05);
         assert!(doc.undo());
         assert_eq!(doc.objects.len(), 1);
+
+        let mut wide = Document::new();
+        let big = wide.add_mesh("slab".into(), box_mesh([0.0, 0.0, 0.0], [100.0, 20.0, 4.0]));
+        let scaled = wide.spread_on_rerf(big, 160.0, 80.0, 100.0).unwrap();
+        assert!(scaled.scale < 0.5, "scale {}", scaled.scale);
+        for obj in &wide.objects {
+            let (min, max) = Document::world_bounds(obj).unwrap();
+            assert!(max.x - min.x < 40.0, "crossed a column");
+            assert!(max.y - min.y < 40.0, "crossed a row");
+        }
     }
 }
