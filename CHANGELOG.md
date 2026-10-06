@@ -9,6 +9,7 @@ Amber is a desktop resin slicer. The first printer it was built around is the An
 - Hollow with a wall and caps. The inside stays empty. Drain holes have a diameter and a depth.
 - Tree supports, manual supports from under the bed, island supports, braces, and a skate raft whose lip overhangs so a scraper can get under it.
 - Cut the view on a height so a custom support can be clicked onto the surface that is left. Hide a model, or show only contact points, necks, trunks, feet, branches, braces, or the raft. Hiding something only changes the view. The slice still includes it.
+- Drag a selected tip onto a new spot on that model. Erase tips removes every contact within a radius, and one undo puts the stroke back.
 - Rest before the cure and rest after the lift, counted once and stored in the file's light-off.
 - Fill enclosed voids heals speckles and accidental pockets, and leaves a model you hollowed empty.
 - Anti-alias, optional image blur, XY offset, elephant foot, and shrink compensation.

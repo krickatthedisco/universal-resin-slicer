@@ -187,6 +187,11 @@ pub struct AmberApp {
     measure_drawn: u64,
     /// Round a dragged move to whole millimetres.
     snap_mm: bool,
+    /// Support tool: remove tips near the click instead of planting one.
+    erase_supports: bool,
+    erase_mm: f32,
+    /// True after this drag has already stored one undo snapshot.
+    stroke_saved: bool,
     plate_view: PlateView,
     /// Models left out of the plate view. They still slice.
     hidden_models: HashSet<u64>,
@@ -321,6 +326,9 @@ impl AmberApp {
             measure_gen: 0,
             measure_drawn: 0,
             snap_mm: false,
+            erase_supports: false,
+            erase_mm: 3.0,
+            stroke_saved: false,
             plate_view,
             hidden_models: HashSet::new(),
             view_rev: 0,
@@ -714,6 +722,7 @@ impl eframe::App for AmberApp {
         self.handle_keys(&ctx);
         if !ctx.input(|i| i.pointer.primary_down() || i.pointer.secondary_down()) {
             self.gesture = false;
+            self.stroke_saved = false;
         }
         for file in ctx.input(|i| i.raw.dropped_files.clone()) {
             self.import_path(file.path().to_path_buf());
@@ -965,7 +974,7 @@ impl AmberApp {
             (
                 Tool::Support,
                 "Support",
-                "Click an underside to plant a support. Cut the view to reach a surface that was hidden above. Orbit under the bed and the plate turns clear.",
+                "Click an underside to plant a support. Drag a tip to move it. Cut the view to reach a hidden surface. Orbit under the bed and the plate turns clear.",
             ),
             (
                 Tool::Measure,
@@ -2000,7 +2009,20 @@ impl AmberApp {
 
     fn support_ui(&mut self, ui: &mut egui::Ui) {
         ui.heading("Support");
-        ui.label("Tips branch into a shared trunk. Click an underside to add one by hand. Every control here applies only to the selected model.");
+        ui.label("Click an underside to plant a tip. Click a tip to select it, then drag it to a new spot. Every control here applies only to the selected model.");
+        ui.checkbox(&mut self.erase_supports, "Erase tips");
+        if self.erase_supports {
+            let _ = drag_f32(
+                ui,
+                "Erase radius",
+                &mut self.erase_mm,
+                0.05,
+                0.4,
+                20.0,
+                "mm",
+            );
+            ui.label("Click or drag across tips to remove them. Undo puts them back.");
+        }
         self.section_controls(ui);
         ui.add_space(4.0);
         self.support_visibility(ui);
@@ -2648,6 +2670,9 @@ impl AmberApp {
         {
             self.drag_transform(&response);
         }
+        if response.dragged_by(egui::PointerButton::Primary) && self.tool == Tool::Support {
+            self.drag_support(&response);
+        }
         if response.clicked_by(egui::PointerButton::Secondary) {
             self.open_part_menu(&response);
         }
@@ -2827,6 +2852,102 @@ impl AmberApp {
             self.doc.touch_xform();
             self.part_menu = Some(pointer);
             self.part_menu_fresh = true;
+        }
+    }
+
+    fn tip_pick_mm(&self) -> f32 {
+        (self.camera.distance * 0.02).clamp(1.2, 8.0)
+    }
+
+    fn pointer_ray(&self, response: &egui::Response) -> Option<(Vec3, Vec3)> {
+        let pointer = response.interact_pointer_pos()?;
+        let rel_x = (pointer.x - response.rect.left()) / response.rect.width().max(1.0);
+        let rel_y = (pointer.y - response.rect.top()) / response.rect.height().max(1.0);
+        let aspect = (response.rect.width() / response.rect.height().max(1.0)).clamp(0.2, 5.0);
+        Some(self.camera.ray(rel_x, rel_y, aspect))
+    }
+
+    fn drag_support(&mut self, response: &egui::Response) {
+        let Some((origin, dir)) = self.pointer_ray(response) else {
+            return;
+        };
+        if self.erase_supports {
+            if response.drag_started() {
+                self.gesture = true;
+            }
+            self.erase_at(origin, dir, !self.stroke_saved);
+            return;
+        }
+        if response.drag_started() && !self.gesture {
+            if let Some(id) = self.doc.support_near_ray(origin, dir, self.tip_pick_mm()) {
+                self.doc.selection = Selection::Support(id);
+                self.doc.remember_supports();
+                self.gesture = true;
+            }
+        }
+        if !self.gesture {
+            return;
+        }
+        let Selection::Support(id) = self.doc.selection else {
+            return;
+        };
+        let Some((hit_id, point, _)) = self.visible_hit(origin, dir) else {
+            return;
+        };
+        let owner = self
+            .doc
+            .supports
+            .iter()
+            .find(|s| s.id == id)
+            .map(|s| s.object_id);
+        if owner == Some(hit_id) && self.doc.relocate_support(id, point) {
+            self.invalidate_slice();
+        }
+    }
+
+    fn erase_at(&mut self, origin: Vec3, dir: Vec3, record_undo: bool) {
+        let hit = self.visible_hit(origin, dir);
+        let object_id = self.doc.edit_target().or_else(|| hit.map(|(id, _, _)| id));
+        let Some(object_id) = object_id else {
+            self.status = "Select a model, then erase tips on that model.".into();
+            return;
+        };
+        let point = hit.map(|(_, point, _)| point).or_else(|| {
+            let id =
+                self.doc
+                    .support_near_ray(origin, dir, self.erase_mm.max(self.tip_pick_mm()))?;
+            self.doc
+                .supports
+                .iter()
+                .find(|s| s.id == id)
+                .map(|s| Vec3::new(s.x, s.y, s.z_top))
+        });
+        let Some(point) = point else {
+            return;
+        };
+        let limit = self.erase_mm.max(0.0);
+        let pending = self
+            .doc
+            .supports
+            .iter()
+            .filter(|support| {
+                support.object_id == object_id
+                    && (Vec3::new(support.x, support.y, support.z_top) - point).length() <= limit
+            })
+            .count();
+        if pending == 0 {
+            return;
+        }
+        if record_undo {
+            self.doc.remember_supports();
+            self.stroke_saved = true;
+        }
+        let removed = self
+            .doc
+            .erase_supports_near(object_id, point, self.erase_mm);
+        if removed > 0 {
+            self.invalidate_slice();
+            self.status = format!("Removed {removed} tips. Undo puts them back.");
         }
     }
 
@@ -3097,7 +3218,15 @@ impl AmberApp {
         let (origin, dir) = self.camera.ray(rel_x, rel_y, aspect);
         match self.tool {
             Tool::Support => {
-                if let Some((id, point, _)) = self.visible_hit(origin, dir) {
+                if self.erase_supports {
+                    self.erase_at(origin, dir, true);
+                } else if let Some(id) = self.doc.support_near_ray(origin, dir, self.tip_pick_mm())
+                {
+                    self.doc.selection = Selection::Support(id);
+                    self.doc.touch_xform();
+                    self.status =
+                        "Tip selected. Drag it to move the contact. Delete removes it.".into();
+                } else if let Some((id, point, _)) = self.visible_hit(origin, dir) {
                     self.doc.add_support_at(point, id);
                     self.invalidate_slice();
                 }

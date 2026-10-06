@@ -894,6 +894,89 @@ impl Document {
         true
     }
 
+    /// Remember the support list once, so a drag can move many times and still undo in one step.
+    pub fn remember_supports(&mut self) {
+        self.undo.push(Undo::Supports {
+            list: self.supports.clone(),
+            lifted: Vec::new(),
+        });
+        if self.undo.len() > 40 {
+            self.undo.remove(0);
+        }
+    }
+
+    /// The support tip closest to the ray, when it is within `radius` millimetres.
+    pub fn support_near_ray(&self, origin: Vec3, dir: Vec3, radius: f32) -> Option<u64> {
+        let mut best: Option<(f32, u64)> = None;
+        let limit = radius.max(0.0) * radius.max(0.0);
+        for support in &self.supports {
+            let tip = Vec3::new(support.x, support.y, support.z_top);
+            let along = (tip - origin).dot(dir);
+            if along < 0.0 {
+                continue;
+            }
+            let closest = origin + dir * along;
+            let dist2 = (tip - closest).length_squared();
+            if dist2 <= limit && best.map(|(old, _)| dist2 < old).unwrap_or(true) {
+                best = Some((dist2, support.id));
+            }
+        }
+        best.map(|(_, id)| id)
+    }
+
+    /// Move one tip onto a new point on its own model. The caller records undo.
+    pub fn relocate_support(&mut self, id: u64, point: Vec3) -> bool {
+        let Some(current) = self.supports.iter().find(|s| s.id == id).copied() else {
+            return false;
+        };
+        let Some(obj) = self.object(current.object_id) else {
+            return false;
+        };
+        let platform_only = obj.support.platform_only;
+        let world = Self::world_mesh(obj);
+        let mut next = supports::manual_support(
+            point.x,
+            point.y,
+            point.z,
+            &world.vertices,
+            &world.indices,
+            platform_only,
+            id,
+        );
+        next.object_id = current.object_id;
+        if let Some(slot) = self.supports.iter_mut().find(|s| s.id == id) {
+            *slot = next;
+        }
+        self.selection = Selection::Support(id);
+        self.touch();
+        true
+    }
+
+    /// Remove tips on one model that sit within `radius` of `point`.
+    /// Returns how many were removed. The caller records undo.
+    pub fn erase_supports_near(&mut self, object_id: u64, point: Vec3, radius: f32) -> usize {
+        let limit = radius.max(0.0) * radius.max(0.0);
+        let before = self.supports.len();
+        self.supports.retain(|support| {
+            if support.object_id != object_id {
+                return true;
+            }
+            let tip = Vec3::new(support.x, support.y, support.z_top);
+            (tip - point).length_squared() > limit
+        });
+        let removed = before - self.supports.len();
+        if removed == 0 {
+            return 0;
+        }
+        if let Selection::Support(id) = self.selection {
+            if !self.supports.iter().any(|s| s.id == id) {
+                self.selection = Selection::Object(object_id);
+            }
+        }
+        self.touch();
+        removed
+    }
+
     pub fn add_support_at(&mut self, point: Vec3, object_id: u64) {
         let Some(obj) = self.object(object_id) else {
             return;
@@ -1404,6 +1487,29 @@ mod tests {
         assert!(doc.clear_supports());
         assert!(doc.supports.iter().all(|s| s.object_id == b));
         assert_eq!(doc.supports.len(), b_count);
+    }
+
+    #[test]
+    fn a_tip_can_move_and_a_nearby_tip_can_be_erased() {
+        let mut doc = Document::new();
+        let id = doc.add_mesh("box".into(), box_mesh([0.0, 0.0, 0.0], [20.0, 20.0, 10.0]));
+        doc.add_support_at(Vec3::new(4.0, 4.0, 10.0), id);
+        doc.add_support_at(Vec3::new(16.0, 4.0, 10.0), id);
+        let first = doc.supports[0].id;
+        let origin = Vec3::new(4.0, 4.0, 30.0);
+        let dir = Vec3::new(0.0, 0.0, -1.0);
+        assert_eq!(doc.support_near_ray(origin, dir, 2.0), Some(first));
+        assert!(doc.relocate_support(first, Vec3::new(6.0, 5.0, 10.0)));
+        let moved = doc.supports.iter().find(|s| s.id == first).unwrap();
+        assert!((moved.x - 6.0).abs() < 0.05, "x {}", moved.x);
+        assert_eq!(moved.object_id, id);
+        doc.remember_supports();
+        let removed = doc.erase_supports_near(id, Vec3::new(6.0, 5.0, 10.0), 2.0);
+        assert_eq!(removed, 1);
+        assert_eq!(doc.supports.len(), 1);
+        assert!(doc.supports.iter().all(|s| s.object_id == id));
+        doc.undo();
+        assert_eq!(doc.supports.len(), 2);
     }
 
     #[test]
