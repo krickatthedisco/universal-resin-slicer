@@ -1,6 +1,6 @@
 [package]
 name = "amber"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Amber, a desktop resin slicer"
 license = "MIT"
@@ -8,7 +8,7 @@ rust-version = "1.85"
 
 [dependencies]
 anyhow = "1"
-eframe = { version = "0.36", default-features = false, features = ["glow", "persistence", "default_fonts", "x11"] }
+eframe = { version = "0.36", default-features = false, features = ["glow", "persistence", "default_fonts", "x11", "links"] }
 egui_glow = "0.36"
 glam = { version = "0.30", features = ["serde"] }
 glow = "0.17"

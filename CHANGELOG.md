@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.2.0
+
+- Prepare cuts the model with two handles: one at the top of the part, and one that comes up from the bottom. Each cut is capped the way a model viewer caps a clip plane, one solid face with the holes left open. The stack of thin strips that drew dark bands across the cut is gone.
+- The Hole tool previews the punch under the pointer. The hole can follow the surface or the screen. Outer and inner diameters, the stub outside the surface, and the depth into the model are set in the Punch panel. Keep Hole saves the removed resin as its own model, set beside the part, so it can be printed and glued back in.
+- Support pillars default to a hexagon. Round and square are in the same menu. The diameter is flat to flat.
+- Simple view can show every support piece again after showing only the contact points.
+- A layer where two supports overlap stays solid instead of leaving a one-layer line between them.
+- Export defaults to the file the selected printer reads: Photon Workshop v516, unencrypted CTB, Prusa SL1, or a PNG layer zip. The file-format menu can write any of those four.
+- Help → Buy me a coffee opens https://buymeacoffee.com/krickatthedisco. The same link is on How to print.
+
 ## 0.1.0
 
 Amber is a desktop resin slicer. The first printer it was built around is the Anycubic Photon M3 Max. It also knows the plate and pixel grid of the other machines in the UVtools list, writes a Photon Workshop v516 file when that is the machine's format, and writes an open `.sl1` for every machine.
@@ -20,9 +30,3 @@ Amber is a desktop resin slicer. The first printer it was built around is the An
 - Redo (Ctrl+Y) puts an undone edit back, including a move, a delete, and a cut. A new edit clears that. The status line says the next step: open a model, punch a hole, add supports, slice, or save.
 - Save plate writes an `.amber` file: the models, where they sit, their supports and holes, and the printer and resin settings. Open plate puts that job back. Ctrl+Shift+S saves it again.
 - Duplicate, copy across the bed, and fill the bed take the supports and the drain holes with each copy. Undo removes that copy's tips and holes.
-- Prepare cuts the model with two handles: one at the top of the part, and one that comes up from the bottom. Each cut is a solid opaque face of the mesh, matched to the outline, instead of a translucent layer picture.
-- The Hole tool previews the punch under the pointer. The hole can follow the surface or the screen. Outer and inner diameters, the stub outside the surface, and the depth into the model are set in the Punch panel. Keep Hole saves the removed resin as its own model, set beside the part, so it can be printed and glued back in.
-- Support pillars default to a hexagon. Round and square are in the same menu. The diameter is flat to flat.
-- Simple view can show every support piece again after showing only the contact points.
-- A layer where two supports overlap stays solid instead of leaving a one-layer line between them.
-- Export defaults to the file the selected printer reads: Photon Workshop v516, unencrypted CTB, Prusa SL1, or a PNG layer zip. The file-format menu can write any of those four.

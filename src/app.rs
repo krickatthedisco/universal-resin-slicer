@@ -1167,6 +1167,12 @@ impl AmberApp {
                     self.help_open = true;
                     ui.close();
                 }
+                if ui.button("Buy me a coffee").clicked() {
+                    ui.ctx().open_url(egui::OpenUrl::new_tab(
+                        "https://buymeacoffee.com/krickatthedisco",
+                    ));
+                    ui.close();
+                }
             });
             ui.separator();
             if ui.selectable_label(!self.workshop, "Simple").clicked() {
@@ -3765,13 +3771,26 @@ impl AmberApp {
                 ui.separator();
                 ui.label("Simple is the short path. Workshop is every control: rafts, rest times, compensation, and the rest.");
                 ui.label("Right-click a model for the same edits. Right-drag orbits, and you can swing under the bed. The bed turns clear so you can click an underside.");
-                ui.label("The bar on the right of Prepare cuts the model. The top handle starts at the top of the part so you can drag down through it, and the bottom handle cuts up from the base. Each cut is a solid face of the model. View → Cut the view is the same pair of heights. The checkbox beside a model hides it in the view. It still prints. Tips only draws the contact points. After a slice, red marks on the plate are islands. Click one with Support to plant a tip there.");
+                ui.label("The bar on the right of Prepare cuts the model. The top handle starts at the top of the part so you can drag down through it, and the bottom handle cuts up from the base. Each cut is one solid face, the way a model viewer caps a clip, so the opening stays smooth. View → Cut the view is the same pair of heights. The checkbox beside a model hides it in the view. It still prints. Tips only draws the contact points. After a slice, red marks on the plate are islands. Click one with Support to plant a tip there.");
                 ui.label("The Hole tool draws the punch under the pointer. Perpendicular to the model follows the surface. Perpendicular to the screen follows the camera. Keep Hole saves the removed resin as its own model, set beside the part, so you can print it and glue it back.");
                 ui.separator();
                 ui.label("Ctrl+O open    Ctrl+Shift+S save the plate    Ctrl+S save the sliced file");
                 ui.label("Ctrl+Z undo    Ctrl+Y redo    Ctrl+D duplicate    Delete remove");
                 ui.label("Ctrl+Enter slice    Ctrl+S save    F1 this page");
                 ui.label("On the plate, the arrow keys nudge the selected model by 1 mm (Shift is 0.1 mm). A selected tip moves the same way and stays on the model. F fits the camera. In the layer view, the arrows step through layers.");
+                ui.separator();
+                ui.label("Amber is free. If it saves you a print, you can buy Tyler a coffee.");
+                let coffee = egui::Button::new(
+                    egui::RichText::new("Buy me a coffee")
+                        .color(egui::Color32::BLACK)
+                        .strong(),
+                )
+                .fill(egui::Color32::from_rgb(255, 221, 0));
+                if ui.add(coffee).clicked() {
+                    ui.ctx().open_url(egui::OpenUrl::new_tab(
+                        "https://buymeacoffee.com/krickatthedisco",
+                    ));
+                }
                 ui.separator();
                 ui.label(format!(
                     "Amber {}  ·  built for the Anycubic Photon M3 Max, and the other printers in the list.",
@@ -4422,6 +4441,9 @@ pub fn run() -> eframe::Result {
         // last one, so you can see through the shell. 24 bits is what the
         // glow 3D sample and the slicer viewports use.
         depth_buffer: 24,
+        // The cut cap uses the stencil buffer, the same way a model viewer
+        // fills a clip plane. egui does not read it.
+        stencil_buffer: 8,
         // Left at 0 so a machine without multisample still opens the window.
         multisampling: 0,
         ..Default::default()

@@ -83,9 +83,6 @@ pub struct PlateFrame {
     pub line_gen: u64,
     pub objects: Vec<ObjectFrame>,
     pub rafts: Vec<RaftFrame>,
-    /// Opaque cut faces, in the same vertex layout as `world`.
-    pub caps: Arc<Vec<f32>>,
-    pub cap_gen: u64,
 }
 
 #[derive(Clone)]
@@ -95,6 +92,9 @@ pub struct ObjectFrame {
     pub model: Mat4,
     pub color: [f32; 3],
     pub local: Arc<Vec<f32>>,
+    /// World Z of the mesh bounds. A cut outside this range draws no cap.
+    pub z_min: f32,
+    pub z_max: f32,
 }
 
 #[derive(Clone)]
@@ -193,7 +193,6 @@ pub struct ViewCache {
     bed: Arc<Vec<f32>>,
     grid_lines: Vec<f32>,
     locals: HashMap<(u64, u64), Arc<Vec<f32>>>,
-    caps: HashMap<u64, Arc<Vec<f32>>>,
 }
 
 impl ViewCache {
@@ -204,7 +203,6 @@ impl ViewCache {
             bed: Arc::new(Vec::new()),
             grid_lines: Vec::new(),
             locals: HashMap::new(),
-            caps: HashMap::new(),
         }
     }
 
@@ -313,12 +311,17 @@ impl ViewCache {
                 self.locals.insert(local_key, buf.clone());
                 buf
             };
+            let (z_min, z_max) = Document::display_bounds(obj)
+                .map(|(min, max)| (min.z, max.z))
+                .unwrap_or((1.0, 0.0));
             objects.push(ObjectFrame {
                 id: obj.id,
                 mesh_rev: obj.mesh_rev,
                 model: Document::matrix(obj),
                 color,
                 local,
+                z_min,
+                z_max,
             });
             if selected {
                 if let Some((min, max)) = Document::display_bounds(obj) {
@@ -327,7 +330,7 @@ impl ViewCache {
             }
         }
         self.locals.retain(|key, _| live_locals.contains(key));
-        let (caps, cap_gen) = if view.section {
+        if view.section {
             let mut lo = view.section_lo;
             let mut hi = view.section_z;
             if lo > hi {
@@ -341,10 +344,7 @@ impl ViewCache {
                     self.plane_lines(&mut lines, plate, lo, [0.45, 0.62, 0.82]);
                 }
             }
-            self.cut_caps(doc, hidden, &objects, lo, hi)
-        } else {
-            (Arc::new(Vec::new()), 0)
-        };
+        }
         PlateFrame {
             world_gen,
             world: self.world.clone(),
@@ -353,8 +353,6 @@ impl ViewCache {
             line_gen: doc.changed,
             objects,
             rafts: Vec::new(),
-            caps,
-            cap_gen,
         }
     }
 
@@ -369,60 +367,6 @@ impl ViewCache {
         for i in 0..4 {
             push_line(lines, corners[i], corners[(i + 1) % 4], color);
         }
-    }
-
-    /// Solid faces where the upper and lower cuts pass through each model.
-    fn cut_caps(
-        &mut self,
-        doc: &Document,
-        hidden: &HashSet<u64>,
-        objects: &[ObjectFrame],
-        lo: f32,
-        hi: f32,
-    ) -> (Arc<Vec<f32>>, u64) {
-        let gap = (hi - lo).max(0.0);
-        let bias = (gap * 0.12).clamp(0.015, 0.06);
-        let mut combined = Vec::new();
-        let mut gen = 0u64;
-        let mut live = HashSet::new();
-        for obj in &doc.objects {
-            if hidden.contains(&obj.id) {
-                continue;
-            }
-            let Some((min, max)) = Document::display_bounds(obj) else {
-                continue;
-            };
-            let color = objects
-                .iter()
-                .find(|frame| frame.id == obj.id)
-                .map(|frame| frame.color)
-                .unwrap_or([0.76, 0.64, 0.46]);
-            let planes = [(hi, hi - bias), (lo, lo + bias)];
-            for (plane, draw_z) in planes {
-                if plane <= min.z + 0.03 || plane >= max.z - 0.03 {
-                    continue;
-                }
-                let key = cap_stamp(obj, plane, draw_z, color);
-                live.insert(key);
-                let tris = if let Some(buf) = self.caps.get(&key) {
-                    buf.clone()
-                } else {
-                    let world = Document::world_mesh(obj);
-                    let mesh =
-                        crate::slice::solid_section(&world.vertices, &world.indices, plane, draw_z);
-                    let buf = Arc::new(colored_tris(&mesh, color));
-                    self.caps.insert(key, buf.clone());
-                    buf
-                };
-                gen = gen
-                    .wrapping_mul(131)
-                    .wrapping_add(key)
-                    .wrapping_add(tris.len() as u64);
-                combined.extend_from_slice(&tris);
-            }
-        }
-        self.caps.retain(|key, _| live.contains(key));
-        (Arc::new(combined), gen)
     }
 }
 
@@ -441,29 +385,6 @@ fn model_span(doc: &Document, hidden: &HashSet<u64>) -> Option<(f32, f32)> {
         }
     }
     any.then_some((lo, hi))
-}
-
-fn cap_stamp(obj: &crate::scene::Object, plane: f32, draw_z: f32, color: [f32; 3]) -> u64 {
-    let mut h = obj.id.wrapping_mul(0x9E37_79B1).wrapping_add(obj.mesh_rev);
-    for n in [
-        quant(plane) as u64,
-        quant(draw_z) as u64,
-        quant(obj.position.x) as u64,
-        quant(obj.position.y) as u64,
-        quant(obj.position.z) as u64,
-        quant(obj.rotation_deg.x) as u64,
-        quant(obj.rotation_deg.y) as u64,
-        quant(obj.rotation_deg.z) as u64,
-        (obj.scale.x * 1000.0).round() as u64,
-        (obj.scale.y * 1000.0).round() as u64,
-        (obj.scale.z * 1000.0).round() as u64,
-        (color[0] * 255.0) as u64,
-        (color[1] * 255.0) as u64,
-        (color[2] * 255.0) as u64,
-    ] {
-        h = h.wrapping_mul(131).wrapping_add(n);
-    }
-    h
 }
 
 impl PlateFrame {
@@ -554,6 +475,18 @@ fn safe_normal(n: [f32; 3]) -> [f32; 3] {
     } else {
         [n[0] / len, n[1] / len, n[2] / len]
     }
+}
+
+fn cap_quad_verts() -> Vec<f32> {
+    let s = 20_000.0;
+    let n = [0.0, 0.0, 1.0];
+    let c = [1.0, 1.0, 1.0];
+    let corners = [[-s, -s, 0.0], [s, -s, 0.0], [s, s, 0.0], [-s, s, 0.0]];
+    let mut tris = Vec::new();
+    for id in [0, 1, 2, 0, 2, 3] {
+        push_vert(&mut tris, corners[id], n, c);
+    }
+    tris
 }
 
 fn push_vert(buf: &mut Vec<f32>, p: [f32; 3], n: [f32; 3], c: [f32; 3]) {
@@ -777,6 +710,8 @@ struct ObjectGpu {
     batches: Vec<Batch>,
     model: Mat4,
     color: [f32; 3],
+    z_min: f32,
+    z_max: f32,
 }
 
 struct RaftGpu {
@@ -824,8 +759,9 @@ pub struct Renderer {
     sheet_tex: glow::Texture,
     sheet_key: u64,
     ghost: MeshGpu,
-    caps: MeshGpu,
-    cap_gen: u64,
+    /// One huge quad on Z = 0. A cut draws it where the stencil says the
+    /// model was sliced, so the face is a single polygon instead of strips.
+    cap_quad: MeshGpu,
 }
 
 impl Renderer {
@@ -857,6 +793,10 @@ impl Renderer {
             let sheet_vao = gl.create_vertex_array().map_err(|e| e.to_string())?;
             let sheet_vbo = gl.create_buffer().map_err(|e| e.to_string())?;
             let sheet_tex = gl.create_texture().map_err(|e| e.to_string())?;
+            let mut cap_quad = MeshGpu {
+                batches: Vec::new(),
+            };
+            upload_mesh(gl, &mut cap_quad.batches, &cap_quad_verts());
             Ok(Self {
                 program,
                 line_program,
@@ -884,10 +824,7 @@ impl Renderer {
                 ghost: MeshGpu {
                     batches: Vec::new(),
                 },
-                caps: MeshGpu {
-                    batches: Vec::new(),
-                },
-                cap_gen: u64::MAX,
+                cap_quad,
             })
         }
     }
@@ -914,10 +851,6 @@ impl Renderer {
         }
         self.sync_objects(gl, frame);
         self.sync_rafts(gl, frame);
-        if frame.cap_gen != self.cap_gen {
-            upload_mesh(gl, &mut self.caps.batches, &frame.caps);
-            self.cap_gen = frame.cap_gen;
-        }
     }
 
     fn sync_objects(&mut self, gl: &glow::Context, frame: &PlateFrame) {
@@ -934,6 +867,8 @@ impl Renderer {
                 }
                 gpu.model = obj.model;
                 gpu.color = obj.color;
+                gpu.z_min = obj.z_min;
+                gpu.z_max = obj.z_max;
                 next.push(gpu);
             } else {
                 let mut batches = Vec::new();
@@ -944,6 +879,8 @@ impl Renderer {
                     batches,
                     model: obj.model,
                     color: obj.color,
+                    z_min: obj.z_min,
+                    z_max: obj.z_max,
                 });
             }
         }
@@ -1003,9 +940,11 @@ impl Renderer {
             gl.depth_func(glow::LEQUAL);
             gl.depth_mask(true);
             gl.clear_depth_f32(1.0);
+            gl.clear_stencil(0);
             gl.front_face(glow::CCW);
+            gl.disable(glow::POLYGON_OFFSET_FILL);
             gl.clear_color(0.11, 0.12, 0.14, 1.0);
-            gl.clear(glow::COLOR_BUFFER_BIT | glow::DEPTH_BUFFER_BIT);
+            gl.clear(glow::COLOR_BUFFER_BIT | glow::DEPTH_BUFFER_BIT | glow::STENCIL_BUFFER_BIT);
             gl.use_program(Some(self.program));
             gl.uniform_3_f32(self.locs.light.as_ref(), 0.35, -0.25, 0.90);
             gl.uniform_3_f32(self.locs.fill.as_ref(), -0.4, 0.6, 0.2);
@@ -1055,20 +994,9 @@ impl Renderer {
             }
             gl.uniform_1_f32(self.locs.show_overhang.as_ref(), 0.0);
             gl.uniform_1_f32(self.locs.clip_on.as_ref(), 0.0);
-            // Pull the cut face toward the camera just enough to cover the
-            // clipped edge of the shell without a flicker.
-            gl.enable(glow::POLYGON_OFFSET_FILL);
-            gl.polygon_offset(-1.0, -1.5);
-            self.draw_solid(
-                gl,
-                &self.caps.batches,
-                Mat4::IDENTITY,
-                [1.0, 1.0, 1.0],
-                0.0,
-                1.0,
-                vp,
-            );
-            gl.disable(glow::POLYGON_OFFSET_FILL);
+            if let Some((lo, hi)) = clip {
+                self.draw_section_caps(gl, lo, hi, vp);
+            }
             if !ghost.is_empty() {
                 upload_mesh(gl, &mut self.ghost.batches, ghost);
                 gl.enable(glow::BLEND);
@@ -1125,6 +1053,68 @@ impl Renderer {
             gl.draw_arrays(glow::LINES, 0, self.line_verts);
             gl.bind_vertex_array(None);
             gl.disable(glow::DEPTH_TEST);
+            gl.disable(glow::STENCIL_TEST);
+            gl.disable(glow::CULL_FACE);
+            gl.color_mask(true, true, true, true);
+        }
+    }
+
+    /// Fill each cut the way a model viewer does (three.js clipping stencil).
+    ///
+    /// Back faces increment the stencil and front faces decrement it, with
+    /// color and depth writes off, clipped to that one plane. A closed mesh
+    /// leaves a non-zero stencil only on the cross-section, and a hole stays
+    /// zero. One quad is drawn there, so the face has no strip edges to band.
+    fn draw_section_caps(&self, gl: &glow::Context, clip_lo: f32, clip_hi: f32, vp: Mat4) {
+        unsafe {
+            let planes = [(-1.0e6, clip_hi, clip_hi), (clip_lo, 1.0e6, clip_lo)];
+            gl.enable(glow::STENCIL_TEST);
+            gl.stencil_mask(0xff);
+            for obj in &self.objects {
+                for (lo, hi, z) in planes {
+                    if z <= obj.z_min + 0.03 || z >= obj.z_max - 0.03 {
+                        continue;
+                    }
+                    gl.clear_stencil(0);
+                    gl.clear(glow::STENCIL_BUFFER_BIT);
+                    gl.color_mask(false, false, false, false);
+                    gl.depth_mask(false);
+                    gl.disable(glow::DEPTH_TEST);
+                    gl.enable(glow::CULL_FACE);
+                    gl.stencil_func(glow::ALWAYS, 0, 0xff);
+                    gl.uniform_1_f32(self.locs.clip_on.as_ref(), 1.0);
+                    gl.uniform_1_f32(self.locs.clip_lo.as_ref(), lo);
+                    gl.uniform_1_f32(self.locs.clip_z.as_ref(), hi);
+                    gl.uniform_1_f32(self.locs.show_overhang.as_ref(), 0.0);
+
+                    gl.cull_face(glow::FRONT);
+                    gl.stencil_op(glow::INCR_WRAP, glow::INCR_WRAP, glow::INCR_WRAP);
+                    self.draw_solid(gl, &obj.batches, obj.model, obj.color, 1.0, 1.0, vp);
+
+                    gl.cull_face(glow::BACK);
+                    gl.stencil_op(glow::DECR_WRAP, glow::DECR_WRAP, glow::DECR_WRAP);
+                    self.draw_solid(gl, &obj.batches, obj.model, obj.color, 1.0, 1.0, vp);
+
+                    gl.color_mask(true, true, true, true);
+                    gl.depth_mask(true);
+                    gl.enable(glow::DEPTH_TEST);
+                    gl.depth_func(glow::LEQUAL);
+                    gl.disable(glow::CULL_FACE);
+                    gl.uniform_1_f32(self.locs.clip_on.as_ref(), 0.0);
+                    gl.stencil_func(glow::NOTEQUAL, 0, 0xff);
+                    gl.stencil_op(glow::KEEP, glow::KEEP, glow::KEEP);
+                    let model = Mat4::from_translation(Vec3::new(0.0, 0.0, z));
+                    self.draw_solid(gl, &self.cap_quad.batches, model, obj.color, 1.0, 1.0, vp);
+                }
+            }
+            gl.disable(glow::STENCIL_TEST);
+            gl.disable(glow::CULL_FACE);
+            gl.color_mask(true, true, true, true);
+            gl.depth_mask(true);
+            gl.enable(glow::DEPTH_TEST);
+            gl.stencil_op(glow::KEEP, glow::KEEP, glow::KEEP);
+            gl.stencil_func(glow::ALWAYS, 0, 0xff);
+            gl.uniform_1_f32(self.locs.clip_on.as_ref(), 0.0);
         }
     }
 
@@ -1242,7 +1232,7 @@ impl Renderer {
                 drop_batches(gl, &raft.batches);
             }
             drop_batches(gl, &self.ghost.batches);
-            drop_batches(gl, &self.caps.batches);
+            drop_batches(gl, &self.cap_quad.batches);
             gl.delete_vertex_array(self.line_vao);
             gl.delete_buffer(self.line_vbo);
         }
